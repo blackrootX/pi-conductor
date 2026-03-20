@@ -63,6 +63,19 @@ export {
 } from "./discovery";
 
 // ============================================================================
+// Phase 3: Workflow Runtime
+// ============================================================================
+
+// Workflow types and presets
+export * from "./workflow";
+
+// Runtime components
+export * from "./runtime";
+
+// Extension commands
+export * from "./extension/commands";
+
+// ============================================================================
 // Legacy Phase 1 APIs (still available for backward compatibility)
 // ============================================================================
 
