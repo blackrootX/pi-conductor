@@ -32,7 +32,11 @@ export function buildChildSessionContext(
   const dependencyOutputs = collectDependencyOutputs(step, dependencyResults, allSteps);
 
   // Build the system prompt
-  const systemPrompt = buildSystemPrompt(step.agent.name, step.agent.description);
+  const systemPrompt = buildSystemPrompt(
+    step.agent.systemPrompt,
+    step.agent.name,
+    step.agent.description
+  );
 
   // Build the task prompt
   const taskPrompt = buildTaskPrompt(
@@ -56,7 +60,15 @@ export function buildChildSessionContext(
 /**
  * Build the system prompt for a child session.
  */
-function buildSystemPrompt(agentName: string, agentDescription?: string): string {
+function buildSystemPrompt(
+  agentSystemPrompt: string | undefined,
+  agentName: string,
+  agentDescription?: string
+): string {
+  if (agentSystemPrompt?.trim()) {
+    return agentSystemPrompt.trim();
+  }
+
   const parts: string[] = [];
 
   parts.push(`You are ${agentName}.`);

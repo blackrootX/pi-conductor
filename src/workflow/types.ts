@@ -3,6 +3,24 @@
 import type { AgentSpec } from "../types";
 
 // ============================================================================
+// Workflow Steps
+// ============================================================================
+
+export type StepTarget =
+  | { agentId: string }
+  | { role: string }
+  | { capability: string };
+
+export interface WorkflowStep {
+  id: string;
+  title: string;
+  prompt: string;
+  dependsOn?: string[];
+}
+
+export type UnresolvedWorkflowStep = WorkflowStep & StepTarget;
+
+// ============================================================================
 // Workflow Definition
 // ============================================================================
 
@@ -10,7 +28,7 @@ export interface WorkflowSpec {
   id: string;
   name: string;
   description?: string;
-  steps: WorkflowStep[];
+  steps: UnresolvedWorkflowStep[];
   policy?: WorkflowPolicy;
   synthesis?: WorkflowSynthesisConfig;
 }
@@ -30,24 +48,6 @@ export interface WorkflowSynthesisConfig {
 }
 
 export type SynthesisStrategy = "lead" | "all" | "concise";
-
-// ============================================================================
-// Workflow Steps
-// ============================================================================
-
-export type StepTarget =
-  | { agentId: string }
-  | { role: string }
-  | { capability: string };
-
-export interface WorkflowStep {
-  id: string;
-  title: string;
-  prompt: string;
-  dependsOn?: string[];
-}
-
-export type UnresolvedWorkflowStep = WorkflowStep & StepTarget;
 
 export interface ResolvedWorkflowStep {
   id: string;

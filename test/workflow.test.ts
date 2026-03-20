@@ -91,8 +91,8 @@ describe("Workflow Presets", () => {
     expect(workflow.name).toBe("Custom Test");
     expect(workflow.description).toBe("A custom workflow");
     expect(workflow.steps).toHaveLength(1);
-    expect(workflow.policy.maxParallelism).toBe(2);
-    expect(workflow.synthesis.strategy).toBe("all");
+    expect(workflow.policy?.maxParallelism).toBe(2);
+    expect(workflow.synthesis?.strategy).toBe("all");
   });
 });
 
@@ -290,8 +290,8 @@ describe("Synthesizer", () => {
       synthesis: { strategy: "lead" },
     });
     const results = {
-      step1: { stepId: "step1", agentId: "a", agentName: "A", sessionId: "s", status: "completed" as const, summary: "First step", artifact: { type: "text" as const, value: "First output" }, startedAt: "2024-01-01T00:00:00Z" },
-      step2: { stepId: "step2", agentId: "b", agentName: "B", sessionId: "t", status: "completed" as const, summary: "Second step", artifact: { type: "text" as const, value: "Second output" }, startedAt: "2024-01-01T00:01:00Z" },
+      step1: { stepId: "step1", stepTitle: "Step 1", agentId: "a", agentName: "A", sessionId: "s", status: "completed" as const, summary: "First step", artifact: { type: "text" as const, value: "First output" }, startedAt: "2024-01-01T00:00:00Z" },
+      step2: { stepId: "step2", stepTitle: "Step 2", agentId: "b", agentName: "B", sessionId: "t", status: "completed" as const, summary: "Second step", artifact: { type: "text" as const, value: "Second output" }, startedAt: "2024-01-01T00:01:00Z" },
     };
 
     const resolved = { spec: workflow, steps: [], policy: { maxParallelism: 1, onStepFailure: "abort" as const }, synthesis: { strategy: "lead" as const } };
@@ -311,7 +311,7 @@ describe("Synthesizer", () => {
       synthesis: { strategy: "all" },
     });
     const results = {
-      step1: { stepId: "step1", agentId: "a", agentName: "A", sessionId: "s", status: "completed" as const, summary: "First", artifact: { type: "text" as const, value: "First" }, startedAt: "2024-01-01T00:00:00Z" },
+      step1: { stepId: "step1", stepTitle: "Step 1", agentId: "a", agentName: "A", sessionId: "s", status: "completed" as const, summary: "First", artifact: { type: "text" as const, value: "First" }, startedAt: "2024-01-01T00:00:00Z" },
     };
 
     const resolved = { spec: allWorkflow, steps: [], policy: { maxParallelism: 1, onStepFailure: "abort" as const }, synthesis: { strategy: "all" as const } };

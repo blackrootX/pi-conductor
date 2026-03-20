@@ -67,7 +67,38 @@ export {
 // ============================================================================
 
 // Workflow types and presets
-export * from "./workflow";
+export {
+  PLAN_IMPLEMENT_REVIEW,
+  PARALLEL_AUDIT,
+  IMPLEMENT_AND_REVIEW,
+  RESEARCH_AND_WRITE,
+  QUICK_REVIEW,
+  WORKFLOW_PRESETS,
+  getPreset,
+  listPresets,
+  createCustomWorkflow,
+} from "./workflow/presets";
+export {
+  resolveWorkflow,
+  formatResolutionErrors,
+} from "./workflow/resolver";
+export type {
+  WorkflowSpec,
+  WorkflowPolicy,
+  StepFailurePolicy,
+  WorkflowSynthesisConfig,
+  SynthesisStrategy,
+  StepTarget,
+  WorkflowStep,
+  UnresolvedWorkflowStep,
+  ResolvedWorkflowStep,
+  StepResultEnvelope,
+  StepStatus,
+  StepArtifact,
+  WorkflowRunResult,
+  WorkflowRunStatus,
+  ResolvedWorkflow,
+} from "./workflow/types";
 
 // Runtime components
 export * from "./runtime";

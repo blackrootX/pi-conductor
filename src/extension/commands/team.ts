@@ -17,6 +17,8 @@ export interface TeamCommandOptions {
   show?: string;
   /** Verbose output */
   verbose?: boolean;
+  /** Show help */
+  help?: boolean;
 }
 
 /**
@@ -26,6 +28,11 @@ export async function executeTeamCommand(
   options: TeamCommandOptions,
   registry: AgentRegistry
 ): Promise<void> {
+  if (options.help) {
+    console.log(getHelpText());
+    return;
+  }
+
   // Handle list option
   if (options.list) {
     listWorkflows();
@@ -40,9 +47,7 @@ export async function executeTeamCommand(
 
   // Validate task
   if (!options.task) {
-    console.error("Error: --task is required");
-    console.error("Usage: /team --task 'your task' [--workflow-id <id>]");
-    process.exit(1);
+    throw new Error("Usage: /team --task 'your task' [--workflow-id <id>]");
   }
 
   // Determine workflow
@@ -52,11 +57,8 @@ export async function executeTeamCommand(
     workflow = getPreset(options.workflowId);
 
     if (!workflow) {
-      console.error(`Error: Unknown workflow: ${options.workflowId}`);
-      console.error("");
-      console.error("Available workflows:");
-      listWorkflows();
-      process.exit(1);
+      const available = listPresets().map((preset) => preset.id).join(", ");
+      throw new Error(`Unknown workflow: ${options.workflowId}. Available workflows: ${available}`);
     }
   } else {
     // Auto-select based on task keywords
@@ -108,7 +110,7 @@ export async function executeTeamCommand(
 
   // Exit with error code if failed
   if (result.status === "failed") {
-    process.exit(1);
+    throw new Error(result.error || "Workflow execution failed");
   }
 }
 
@@ -137,8 +139,7 @@ function showWorkflow(workflowId: string): void {
   const workflow = getPreset(workflowId);
 
   if (!workflow) {
-    console.error(`Error: Unknown workflow: ${workflowId}`);
-    process.exit(1);
+    throw new Error(`Unknown workflow: ${workflowId}`);
   }
 
   console.log(`\n# ${workflow.name}`);
@@ -254,8 +255,8 @@ export function parseTeamCommandArgs(args: string[]): TeamCommandOptions {
         break;
       case "--help":
       case "-h":
-        printHelp();
-        process.exit(0);
+        options.help = true;
+        break;
       default:
         if (!arg.startsWith("-")) {
           // Positional argument - treat as task
@@ -270,8 +271,8 @@ export function parseTeamCommandArgs(args: string[]): TeamCommandOptions {
 /**
  * Print help for /team command.
  */
-function printHelp(): void {
-  console.log(`
+function getHelpText(): string {
+  return `
 /team - Run multi-agent workflows
 
 Usage:
@@ -290,5 +291,5 @@ Examples:
   /team --show plan-implement-review
   /team --task 'Add user authentication' --workflow-id implement-and-review
   /team 'Fix the login bug'
-`);
+`;
 }
