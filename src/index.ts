@@ -1,20 +1,76 @@
-// src/index.ts - Main entry point for agent parsing, normalization, and resolution
+// src/index.ts - Main entry point for pi-conductor
+//
+// Phase 1: Parse, normalize, and load agents
+// Phase 2: Discover, merge, resolve with AgentRegistry
+//
+// This file re-exports all public APIs from the package.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
+// Re-export Phase 1 modules
+export {
+  parseMarkdown,
+  extractFrontmatter,
+  parseYaml,
+} from "./parser";
+export type { ParsedAgent } from "./parser";
+
+export {
+  normalizeAgent,
+  normalizeId,
+  isValidId,
+  deduplicateStrings,
+  detectDuplicateIds,
+} from "./normalizer";
+export type { AgentSpec, NormalizedAgent, NormalizationResult } from "./normalizer";
+
+export {
+  invalidFrontmatterError,
+  invalidYamlError,
+  missingRequiredFieldError,
+  invalidFieldTypeError,
+  emptyBodyError,
+  invalidIdError,
+  duplicateIdError,
+} from "./errors";
+export type { StructuredError, ErrorCode, AgentSource } from "./errors";
+
+// Re-export Phase 2 types and registry
+export {
+  AgentRegistry,
+  createRegistry,
+  createDefaultRegistry,
+} from "./registry";
+export type {
+  RegistryLoadOptions,
+  RegistryState,
+  DiscoveredFile,
+} from "./registry";
+
+export * from "./types";
+
+// Re-export discovery functions
+export {
+  discoverAgents,
+  discoverAgentsBySource,
+  findAgentFiles,
+  findAgentsMatching,
+  detectDuplicateIdsInSource,
+  normalizeFileToId,
+  getSourcePaths,
+} from "./discovery";
+
+// ============================================================================
+// Legacy Phase 1 APIs (still available for backward compatibility)
+// ============================================================================
+
 import type { AgentSource, StructuredError } from "./errors";
 import { invalidIdError, duplicateIdError } from "./errors";
 import { parseMarkdown } from "./parser";
 import type { AgentSpec } from "./normalizer";
-import {
-  normalizeAgent,
-  normalizeId,
-  isValidId,
-} from "./normalizer";
-
-export { AgentSpec, AgentSource, StructuredError };
+import { normalizeAgent, normalizeId, isValidId } from "./normalizer";
 
 // Source precedence (highest to lowest)
 const SOURCE_PRECEDENCE: readonly AgentSource[] = ["project", "user", "built-in"];
@@ -84,7 +140,7 @@ export async function loadAgentFile(filePath: string, source: AgentSource): Prom
 /**
  * Find all agent files in a directory.
  */
-async function findAgentFiles(dirPath: string): Promise<string[]> {
+async function findAgentFilesLegacy(dirPath: string): Promise<string[]> {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return entries
@@ -102,7 +158,7 @@ async function findAgentFiles(dirPath: string): Promise<string[]> {
 /**
  * Get the agent file paths for a specific source.
  */
-async function getSourcePaths(
+async function getSourcePathsLegacy(
   cwd: string,
   source: AgentSource,
   basePaths: Record<AgentSource, string>
@@ -111,11 +167,11 @@ async function getSourcePaths(
 
   switch (source) {
     case "project":
-      return findAgentFiles(basePath);
+      return findAgentFilesLegacy(basePath);
     case "user":
-      return findAgentFiles(basePath);
+      return findAgentFilesLegacy(basePath);
     case "built-in":
-      return findAgentFiles(basePath);
+      return findAgentFilesLegacy(basePath);
   }
 }
 
@@ -191,7 +247,7 @@ export async function loadAllAgents(options: LoadAllOptions = {}): Promise<LoadA
   };
 
   for (const source of sources) {
-    const filePaths = await getSourcePaths(cwd, source, basePaths);
+    const filePaths = await getSourcePathsLegacy(cwd, source, basePaths);
     const duplicatesInSource = detectDuplicateIdsForSource(filePaths);
     const blockedIds = new Set(duplicatesInSource.map((duplicate) => duplicate.id));
 
@@ -313,7 +369,7 @@ export async function findAgent(
 
   // Check sources in precedence order
   for (const source of SOURCE_PRECEDENCE) {
-    const paths = await getSourcePaths(cwd, source, basePaths);
+    const paths = await getSourcePathsLegacy(cwd, source, basePaths);
 
     for (const filePath of paths) {
       const fileId = normalizeId(path.basename(filePath, ".md"));

@@ -9,7 +9,9 @@ export type ErrorCode =
   | "invalid_field_type"
   | "empty_body"
   | "invalid_id"
-  | "duplicate_id";
+  | "duplicate_id"
+  | "agent_not_found"
+  | "ambiguous_resolution";
 
 export interface StructuredError {
   code: ErrorCode;

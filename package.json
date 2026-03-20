@@ -16,7 +16,10 @@
     ".": "./src/index.ts",
     "./parser": "./src/parser.ts",
     "./normalizer": "./src/normalizer.ts",
-    "./errors": "./src/errors.ts"
+    "./errors": "./src/errors.ts",
+    "./types": "./src/types.ts",
+    "./discovery": "./src/discovery.ts",
+    "./registry": "./src/registry.ts"
   },
   "pi": {
     "extensions": ["./extensions"]
