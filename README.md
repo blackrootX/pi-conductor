@@ -1,20 +1,26 @@
 # pi-conductor
 
-A pi agent package providing multi-agent orchestration with basic commands.
+A pi package for loading, normalizing, and working with pi-style agents.
+
+It currently ships:
+- built-in `planner`, `coder`, and `reviewer` agents
+- a `/hello` command for quickly loading agent frontmatter into the editor
+- Phase 1 agent parsing and normalization utilities
 
 ## Commands
 
 ### `/hello`
 
-Says hello or prefill an agent's frontmatter.
+Use `/hello` by itself for a simple greeting, or pass an agent ID to load that agent's frontmatter into the editor.
 
 ```bash
-/hello              # Says hello
-/hello coder        # Prefills the editor with coder agent's frontmatter
-/hello planner      # Prefills the editor with planner agent's frontmatter
+/hello
+/hello coder
+/hello planner
+/hello reviewer
 ```
 
-Agents are resolved in precedence order: **project → user → built-in**
+Agent lookup follows this precedence order: **project → user → built-in**.
 
 ## Installation
 
@@ -30,18 +36,13 @@ pi install https://github.com/blackrootX/pi-conductor
 
 ## Built-in Agents
 
-### planner
-Analyzes requirements and creates detailed implementation plans.
-
-### coder
-Implements code based on specifications and plans.
-
-### reviewer
-Reviews code and provides constructive feedback.
+- `planner` for planning and task breakdown
+- `coder` for implementation work
+- `reviewer` for code review and feedback
 
 ## Agent Format
 
-Agents are markdown files with YAML frontmatter:
+Agents are standard markdown files with YAML frontmatter and a markdown body used as the system prompt.
 
 ```yaml
 ---
@@ -56,20 +57,10 @@ priority: 10
 System prompt goes here...
 ```
 
-### Supported Frontmatter Fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | ✅ | Agent display name |
-| `description` | string | | Brief description |
-| `role` | string | | Agent role identifier |
-| `tools` | string[] | | Available tools |
-| `model` | string | | Model to use |
-| `capabilities` | string[] | | List of capabilities |
-| `priority` | number | | Agent priority |
-| `readOnly` | boolean | | Read-only agent |
-| `timeoutMs` | number | | Timeout in milliseconds |
-| `tags` | string[] | | Tags for categorization |
+Supported frontmatter fields:
+- Required: `name`
+- Optional: `description`, `tools`, `model`, `role`, `capabilities`, `priority`
+- Optional orchestration metadata: `readOnly`, `timeoutMs`, `tags`
 
 ## License
 
