@@ -15,6 +15,7 @@ import type {
   OverrideRecord,
   DuplicateRecord,
   DiagnosticCode,
+  ResolutionOptions,
 } from "./types";
 
 import { duplicateIdError } from "./errors";
@@ -67,6 +68,7 @@ export class AgentRegistry {
   private _diagnostics: RegistryDiagnostic[] = [];
   private _lastLoaded: number | null = null;
   private _loaded = false;
+  private _loadingPromise: Promise<void> | null = null;
   private _options: RegistryLoadOptions = {};
 
   constructor(options: RegistryLoadOptions = {}) {
@@ -80,6 +82,8 @@ export class AgentRegistry {
   /**
    * Load all agents from configured sources.
    * This is the main initialization method.
+   * Uses _loadingPromise to prevent race conditions when multiple callers
+   * invoke loadAll() or ensureLoaded() concurrently.
    */
   async loadAll(): Promise<void> {
     // Don't reload if already loaded
@@ -87,6 +91,27 @@ export class AgentRegistry {
       return;
     }
 
+    // If a load is already in-flight, wait for it instead of starting a new one
+    if (this._loadingPromise) {
+      await this._loadingPromise;
+      return;
+    }
+
+    // Start the loading process and store the promise
+    this._loadingPromise = this._doLoad();
+
+    try {
+      await this._loadingPromise;
+    } finally {
+      this._loadingPromise = null;
+    }
+  }
+
+  /**
+   * Internal method that performs the actual loading work.
+   * Always called via loadAll() which manages the _loadingPromise.
+   */
+  private async _doLoad(): Promise<void> {
     this.reset();
     this._loaded = true;
     this._lastLoaded = Date.now();
@@ -228,11 +253,22 @@ export class AgentRegistry {
 
   /**
    * Ensure registry is loaded.
+   * Awaits any in-flight loading operation before returning.
    */
   private async ensureLoaded(): Promise<void> {
-    if (!this._loaded) {
-      await this.loadAll();
+    // If loading is in progress, wait for it
+    if (this._loadingPromise) {
+      await this._loadingPromise;
+      return;
     }
+
+    // If already loaded, return immediately
+    if (this._loaded) {
+      return;
+    }
+
+    // Otherwise, start loading
+    await this.loadAll();
   }
 
   // ============================================================================
@@ -309,9 +345,13 @@ export class AgentRegistry {
 
   /**
    * Resolve an agent by role.
-   * Returns the agent with the highest precedence if multiple match.
+   * By default, returns an ambiguity result if multiple agents match.
+   * Use options.allowAmbiguous = true to auto-select the best match.
    */
-  async resolveByRole(role: string): Promise<ResolutionResult> {
+  async resolveByRole(
+    role: string,
+    options?: ResolutionOptions
+  ): Promise<ResolutionResult> {
     await this.ensureLoaded();
 
     const matches: AgentSpec[] = [];
@@ -325,13 +365,29 @@ export class AgentRegistry {
     if (matches.length === 0) {
       return {
         success: false,
+        ambiguous: undefined,
         error: createResolutionError("AGENT_NOT_FOUND_BY_ROLE", {
           role,
         }),
       };
     }
 
-    const winner = resolveBestMatch(matches)!;
+    // Filter by preferred source if specified
+    let candidates = matches;
+    if (options?.preferSource) {
+      const preferred = matches.filter((m) => m.source === options.preferSource);
+      if (preferred.length > 0) {
+        candidates = preferred;
+      }
+    }
+
+    // If multiple candidates remain and we don't allow ambiguity, return ambiguity result
+    if (candidates.length > 1 && !options?.allowAmbiguous) {
+      return this._createAmbiguousResult(candidates, { role });
+    }
+
+    // Auto-select if allowed and needed
+    const winner = resolveBestMatch(candidates)!;
 
     return {
       success: true,
@@ -342,9 +398,13 @@ export class AgentRegistry {
 
   /**
    * Resolve an agent by capability.
-   * Returns the agent with the highest precedence if multiple match.
+   * By default, returns an ambiguity result if multiple agents match.
+   * Use options.allowAmbiguous = true to auto-select the best match.
    */
-  async resolveByCapability(capability: string): Promise<ResolutionResult> {
+  async resolveByCapability(
+    capability: string,
+    options?: ResolutionOptions
+  ): Promise<ResolutionResult> {
     await this.ensureLoaded();
 
     const matches: AgentSpec[] = [];
@@ -359,13 +419,29 @@ export class AgentRegistry {
     if (matches.length === 0) {
       return {
         success: false,
+        ambiguous: undefined,
         error: createResolutionError("AGENT_NOT_FOUND_BY_CAPABILITY", {
           capability,
         }),
       };
     }
 
-    const winner = resolveBestMatch(matches)!;
+    // Filter by preferred source if specified
+    let candidates = matches;
+    if (options?.preferSource) {
+      const preferred = matches.filter((m) => m.source === options.preferSource);
+      if (preferred.length > 0) {
+        candidates = preferred;
+      }
+    }
+
+    // If multiple candidates remain and we don't allow ambiguity, return ambiguity result
+    if (candidates.length > 1 && !options?.allowAmbiguous) {
+      return this._createAmbiguousResult(candidates, { capability });
+    }
+
+    // Auto-select if allowed and needed
+    const winner = resolveBestMatch(candidates)!;
 
     return {
       success: true,
@@ -375,8 +451,39 @@ export class AgentRegistry {
   }
 
   /**
+   * Create an ambiguity result with all matching agents.
+   */
+  private _createAmbiguousResult(
+    matches: AgentSpec[],
+    requested: Partial<ResolutionQuery>
+  ): ResolutionResult {
+    const agentIds = matches.map((m) => m.id);
+
+    // Add diagnostic for the ambiguity
+    this._diagnostics.push({
+      type: "warning",
+      code: "RESOLUTION_AMBIGUOUS",
+      message: `Ambiguous resolution: ${matches.length} agents match the query: ${agentIds.join(", ")}`,
+      agentIds,
+      details: {
+        matchCount: matches.length,
+        matchIds: agentIds,
+      },
+    });
+
+    return {
+      success: false,
+      ambiguous: true,
+      matches,
+      error: createResolutionError("AMBIGUOUS_RESOLUTION", requested),
+    };
+  }
+
+  /**
    * Unified resolution by ID, role, or capability.
    * Resolution order: id > role > capability
+   * By default, returns ambiguity if multiple agents match role/capability criteria.
+   * Use query.options.allowAmbiguous = true to auto-select the best match.
    */
   async resolve(query: ResolutionQuery): Promise<ResolutionResult> {
     await this.ensureLoaded();
@@ -385,13 +492,14 @@ export class AgentRegistry {
     if (!query.id && !query.role && !query.capability) {
       return {
         success: false,
+        ambiguous: undefined,
         error: createResolutionError("INVALID_QUERY", {
           ...query,
         }),
       };
     }
 
-    // Try ID first
+    // Try ID first (ID lookups are always unambiguous)
     if (query.id) {
       const agent = this._agents.get(query.id);
       if (agent) {
@@ -405,16 +513,25 @@ export class AgentRegistry {
 
     // Try role
     if (query.role) {
-      const roleResult = await this.resolveByRole(query.role);
+      const roleResult = await this.resolveByRole(query.role, query.options);
+      // Return immediately on success or ambiguity (don't fall through to capability)
       if (roleResult.success) {
+        return roleResult;
+      }
+      // Only continue if the failure is "not found", not ambiguity
+      if ("ambiguous" in roleResult && roleResult.ambiguous) {
         return roleResult;
       }
     }
 
     // Try capability
     if (query.capability) {
-      const capResult = await this.resolveByCapability(query.capability);
+      const capResult = await this.resolveByCapability(query.capability, query.options);
       if (capResult.success) {
+        return capResult;
+      }
+      // Return ambiguity if present (don't fall through to "not found")
+      if ("ambiguous" in capResult && capResult.ambiguous) {
         return capResult;
       }
     }
@@ -422,6 +539,7 @@ export class AgentRegistry {
     // Not found
     return {
       success: false,
+      ambiguous: undefined,
       error: createResolutionError("AGENT_NOT_FOUND", {
         ...query,
       }),
@@ -429,8 +547,9 @@ export class AgentRegistry {
   }
 
   /**
-   * Resolve by role with deterministic tiebreaker.
-   * If multiple agents match, uses priority, then name, then filePath.
+   * Resolve by role with explicit tiebreaker control.
+   * This method always selects a single winner using the specified tiebreaker.
+   * For ambiguous resolution without auto-selection, use resolveByRole().
    */
   async resolveByRoleWithTiebreaker(
     role: string,
@@ -449,10 +568,25 @@ export class AgentRegistry {
     if (matches.length === 0) {
       return {
         success: false,
+        ambiguous: undefined,
         error: createResolutionError("AGENT_NOT_FOUND_BY_ROLE", {
           role,
         }),
       };
+    }
+
+    // If we have multiple matches, log that we're using tiebreaker to resolve
+    if (matches.length > 1) {
+      this._diagnostics.push({
+        type: "info",
+        code: "RESOLUTION_AMBIGUITY_RESOLVED",
+        message: `Ambiguous resolution for role "${role}" resolved using ${tiebreaker || "default"} tiebreaker`,
+        agentIds: matches.map((m) => m.id),
+        details: {
+          matchCount: matches.length,
+          tiebreaker,
+        },
+      });
     }
 
     const winner = [...matches].sort((a, b) => {

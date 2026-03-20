@@ -14,6 +14,8 @@ export interface ResolutionQuery {
   role?: string;
   /** Find agent by capability (e.g., "task-analysis", "review") */
   capability?: string;
+  /** Options for controlling ambiguity handling */
+  options?: ResolutionOptions;
 }
 
 // ============================================================================
@@ -26,12 +28,20 @@ export interface ResolutionSuccess {
   resolvedBy: "id" | "role" | "capability";
 }
 
-export interface ResolutionFailure {
+export interface ResolutionAmbiguous {
   success: false;
+  ambiguous: true;
+  matches: AgentSpec[];
   error: ResolutionError;
 }
 
-export type ResolutionResult = ResolutionSuccess | ResolutionFailure;
+export interface ResolutionFailure {
+  success: false;
+  ambiguous?: false;
+  error: ResolutionError;
+}
+
+export type ResolutionResult = ResolutionSuccess | ResolutionAmbiguous | ResolutionFailure;
 
 export interface ResolutionError {
   code: ResolutionErrorCode;
@@ -46,6 +56,18 @@ export type ResolutionErrorCode =
   | "AMBIGUOUS_RESOLUTION"
   | "INVALID_QUERY";
 
+/**
+ * Options for controlling ambiguity handling during resolution.
+ */
+export interface ResolutionOptions {
+  /** If true, auto-select the best match when multiple agents match. Default: false */
+  allowAmbiguous?: boolean;
+  /** Tiebreaker to use when multiple agents match and allowAmbiguous is false */
+  tiebreaker?: "priority" | "name" | "filePath";
+  /** Prefer agents from a specific source */
+  preferSource?: AgentSource;
+}
+
 // ============================================================================
 // Registry Diagnostic Types
 // ============================================================================
@@ -57,6 +79,8 @@ export interface RegistryDiagnostic {
   agentId?: string;
   filePath?: string;
   details?: Record<string, unknown>;
+  /** Agent IDs involved in this diagnostic (for ambiguity diagnostics) */
+  agentIds?: string[];
 }
 
 export type DiagnosticCode =
@@ -65,7 +89,8 @@ export type DiagnosticCode =
   | "AGENT_DUPLICATE_SOURCE"
   | "AGENT_MISSING_ROLE"
   | "AGENT_MISSING_CAPABILITIES"
-  | "RESOLUTION_AMBIGUOUS";
+  | "RESOLUTION_AMBIGUOUS"
+  | "RESOLUTION_AMBIGUITY_RESOLVED";
 
 // ============================================================================
 // Registry State Types
