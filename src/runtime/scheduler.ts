@@ -12,18 +12,32 @@ export interface SchedulerOptions {
   maxParallelism?: number;
   /** Behavior on step failure */
   onStepFailure?: "abort" | "continue";
+  /** Workflow timeout in milliseconds */
+  timeout?: number;
+  /** Abort controller for cancellation */
+  abortController?: AbortController;
+  /** Callback when a step becomes pending */
+  onStepPending?: (step: ResolvedWorkflowStep) => void;
+  /** Callback when a step becomes running */
+  onStepRunning?: (step: ResolvedWorkflowStep, sessionId: string) => void;
   /** Callback when a step starts */
-  onStepStart?: (step: ResolvedWorkflowStep) => void;
-  /** Callback when a step completes */
+  onStepStart?: (step: ResolvedWorkflowStep, sessionId: string) => void;
+  /** Callback when a step completes successfully */
   onStepComplete?: (stepId: string, result: StepResultEnvelope) => void;
   /** Callback when a step fails */
   onStepFail?: (stepId: string, error: string) => void;
+  /** Callback when workflow times out */
+  onWorkflowTimeout?: (timeoutMs: number) => void;
+  /** Callback when workflow is cancelled */
+  onWorkflowCancelled?: (reason: string) => void;
 }
 
 export interface SchedulerResult {
   success: boolean;
   results: Record<string, StepResultEnvelope>;
   aborted: boolean;
+  timedOut: boolean;
+  cancelled: boolean;
   failedStepIds: string[];
 }
 
@@ -40,7 +54,11 @@ export class Scheduler {
   private runningSteps: Set<string>;
   private completedSteps: Set<string>;
   private failedSteps: Set<string>;
+  private runningSessionIds: Map<string, string>;
   private userTask: string;
+  private timedOut = false;
+  private cancelled = false;
+  private cancellationReason?: string;
 
   constructor(
     workflow: ResolvedWorkflow,
@@ -61,28 +79,63 @@ export class Scheduler {
     this.runningSteps = new Set();
     this.completedSteps = new Set();
     this.failedSteps = new Set();
+    this.runningSessionIds = new Map();
+
+    // Set up abort controller listener if provided
+    if (this.options.abortController) {
+      this.options.abortController.signal.addEventListener("abort", () => {
+        if (!this.timedOut) {
+          this.cancelled = true;
+          this.cancellationReason = "Workflow execution was cancelled";
+          this.options.onWorkflowCancelled?.(this.cancellationReason);
+          void this.cancelRunningSteps();
+        }
+      });
+    }
   }
 
   /**
    * Execute the workflow according to the schedule.
    */
   async execute(): Promise<SchedulerResult> {
-    while (this.hasWork()) {
-      // Check if we should abort due to failure
-      if (this.shouldAbort()) {
-        break;
-      }
+    const timeout = this.options.timeout;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-      // Run any steps that are ready
-      await this.runReadySteps();
+    // Set up timeout if specified
+    if (timeout) {
+      timeoutId = setTimeout(() => {
+        this.timedOut = true;
+        this.cancellationReason = `Workflow execution timed out after ${timeout}ms`;
+        this.options.onWorkflowTimeout?.(timeout);
+        void this.cancelRunningSteps();
+      }, timeout);
     }
 
-    return {
-      success: this.failedSteps.size === 0,
-      results: this.results,
-      aborted: this.shouldAbort(),
-      failedStepIds: Array.from(this.failedSteps),
-    };
+    try {
+      while (this.hasWork()) {
+        // Check if we should abort due to failure, timeout, or cancellation
+        if (this.shouldAbort()) {
+          await this.cancelRunningSteps();
+          break;
+        }
+
+        // Run any steps that are ready
+        await this.runReadySteps();
+      }
+
+      return {
+        success: this.failedSteps.size === 0 && !this.timedOut && !this.cancelled,
+        results: this.results,
+        aborted: this.shouldAbort() || this.timedOut || this.cancelled,
+        timedOut: this.timedOut,
+        cancelled: this.cancelled,
+        failedStepIds: Array.from(this.failedSteps),
+      };
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
   }
 
   /**
@@ -96,6 +149,11 @@ export class Scheduler {
    * Check if execution should abort.
    */
   private shouldAbort(): boolean {
+    // Abort immediately if timed out or cancelled
+    if (this.timedOut || this.cancelled) {
+      return true;
+    }
+
     if (this.options.onStepFailure === "continue") {
       return false;
     }
@@ -167,7 +225,7 @@ export class Scheduler {
     }
 
     return step.dependsOn.every((depId) => {
-      // Dependency must be completed (not failed)
+      // Dependency must be completed successfully
       return this.completedSteps.has(depId);
     });
   }
@@ -179,37 +237,49 @@ export class Scheduler {
     this.pendingSteps.delete(step.id);
     this.runningSteps.add(step.id);
 
+    // Generate session ID for this step
+    const sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    this.runningSessionIds.set(step.id, sessionId);
+
+    // Emit step:pending event
+    this.options.onStepPending?.(step);
+
     // Set initial pending status
     this.results[step.id] = {
       stepId: step.id,
       stepTitle: step.title,
       agentId: step.agent.id,
       agentName: step.agent.name,
-      sessionId: "",
+      sessionId,
       status: "pending",
       summary: "",
       artifact: { type: "text", value: "" },
       startedAt: new Date().toISOString(),
     };
 
-    this.options.onStepStart?.(step);
+    // Emit step:running event
+    this.options.onStepRunning?.(step, sessionId);
+
+    // Notify step start
+    this.options.onStepStart?.(step, sessionId);
 
     try {
       const result = await this.runner.runStep(
         step,
         this.userTask,
         this.results,
-        this.workflow.steps
+        this.workflow.steps,
+        sessionId
       );
 
       this.results[step.id] = result;
 
-      if (result.status === "completed") {
+      if (result.status === "succeeded") {
         this.completedSteps.add(step.id);
         this.options.onStepComplete?.(step.id, result);
-      } else if (result.status === "failed") {
+      } else if (result.status === "failed" || result.status === "timed_out" || result.status === "cancelled") {
         this.failedSteps.add(step.id);
-        this.options.onStepFail?.(step.id, result.error || "Unknown error");
+        this.options.onStepFail?.(step.id, result.error || `Step ${result.status}`);
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -219,7 +289,7 @@ export class Scheduler {
         stepTitle: step.title,
         agentId: step.agent.id,
         agentName: step.agent.name,
-        sessionId: "",
+        sessionId,
         status: "failed",
         summary: "",
         artifact: { type: "text", value: "" },
@@ -232,7 +302,20 @@ export class Scheduler {
       this.options.onStepFail?.(step.id, errorMessage);
     } finally {
       this.runningSteps.delete(step.id);
+      this.runningSessionIds.delete(step.id);
     }
+  }
+
+  /**
+   * Cancel any currently running steps when the workflow is aborted.
+   */
+  private async cancelRunningSteps(): Promise<void> {
+    if (!this.runner.cancelStep || this.runningSessionIds.size === 0) {
+      return;
+    }
+
+    const sessionIds = Array.from(this.runningSessionIds.values());
+    await Promise.allSettled(sessionIds.map((sessionId) => this.runner.cancelStep!(sessionId)));
   }
 
   /**

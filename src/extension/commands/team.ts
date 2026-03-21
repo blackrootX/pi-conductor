@@ -90,10 +90,12 @@ export async function executeTeamCommand(
         console.log(`  ▶ ${event.stepTitle} (${event.agentName})`);
         break;
       case "step:complete":
-        if (event.status === "completed") {
+        if (event.status === "succeeded") {
           console.log(`  ✓ ${event.summary.slice(0, 60)}${event.summary.length > 60 ? "..." : ""}`);
         } else {
-          console.log(`  ✗ ${event.summary}`);
+          const statusIcon = event.status === "cancelled" ? "⚠" : 
+                            event.status === "timed_out" ? "⏱" : "✗";
+          console.log(`  ${statusIcon} ${event.summary}`);
         }
         break;
       case "workflow:complete":

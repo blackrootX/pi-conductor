@@ -76,7 +76,7 @@ export interface StepResultEnvelope {
   error?: string;
 }
 
-export type StepStatus = "pending" | "running" | "completed" | "failed";
+export type StepStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
 
 export interface StepArtifact {
   type: "text" | "json";
@@ -103,9 +103,11 @@ export interface WorkflowRunResult {
 export type WorkflowRunStatus =
   | "pending"
   | "running"
-  | "completed"
+  | "succeeded"
   | "failed"
-  | "aborted";
+  | "aborted"
+  | "cancelled"
+  | "timed_out";
 
 // ============================================================================
 // Resolved Workflow

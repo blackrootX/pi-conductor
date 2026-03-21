@@ -1,4 +1,4 @@
-// src/runtime/synthesizer.ts - Merge outputs and produce final result
+// src/runtime/synthesizer.ts - Synthesis layer for workflow results
 
 import type {
   ResolvedWorkflow,
@@ -9,189 +9,296 @@ import type {
 export interface SynthesisResult {
   summary: string;
   finalText: string;
-  stepsIncluded: string[];
   strategy: SynthesisStrategy;
+  stepsIncluded: string[];
+  success: boolean;
 }
 
 /**
- * Synthesizer that merges step results into a final output.
+ * Synthesizer combines step results into a final workflow output.
+ * 
+ * Synthesis strategies:
+ * - "lead": Use the result from the first step (default)
+ * - "all": Include all step results
+ * - "concise": Combine all results into a concise summary
  */
 export class Synthesizer {
   /**
-   * Synthesize results from all steps into a final output.
+   * Synthesize workflow results into a final output.
    */
   synthesize(
     workflow: ResolvedWorkflow,
     results: Record<string, StepResultEnvelope>
   ): SynthesisResult {
-    const completedSteps = Object.values(results)
-      .filter((r) => r.status === "completed")
-      .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+    const strategy = workflow.synthesis.strategy;
+    const steps = Object.values(results).sort(
+      (a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime()
+    );
 
-    const strategy = workflow.synthesis.strategy || "lead";
-    const stepsIncluded = completedSteps.map((s) => s.stepId);
+    const successfulSteps = steps.filter((s) => s.status === "succeeded");
+    const failedSteps = steps.filter((s) => s.status === "failed");
 
     let summary: string;
     let finalText: string;
+    let stepsIncluded: string[];
 
     switch (strategy) {
       case "lead":
-        ({ summary, finalText } = this.synthesizeLead(workflow, completedSteps));
+        ({ summary, finalText, stepsIncluded } = this.synthesizeLead(steps));
         break;
       case "all":
-        ({ summary, finalText } = this.synthesizeAll(completedSteps));
+        ({ summary, finalText, stepsIncluded } = this.synthesizeAll(steps));
         break;
       case "concise":
-        ({ summary, finalText } = this.synthesizeConcise(workflow, completedSteps));
+        ({ summary, finalText, stepsIncluded } = this.synthesizeConcise(successfulSteps));
         break;
       default:
-        ({ summary, finalText } = this.synthesizeLead(workflow, completedSteps));
+        ({ summary, finalText, stepsIncluded } = this.synthesizeLead(steps));
     }
 
     return {
       summary,
       finalText,
-      stepsIncluded,
       strategy,
+      stepsIncluded,
+      success: failedSteps.length === 0,
     };
   }
 
   /**
-   * Lead strategy: return the last step's output as the final answer.
-   * Best for: plan → implement → review workflows
+   * Lead strategy: Use the last step's result as the final output.
+   * Good for sequential workflows where the final step has the complete result.
    */
-  private synthesizeLead(
-    workflow: ResolvedWorkflow,
-    results: StepResultEnvelope[]
-  ): { summary: string; finalText: string } {
-    if (results.length === 0) {
+  private synthesizeLead(steps: StepResultEnvelope[]): {
+    summary: string;
+    finalText: string;
+    stepsIncluded: string[];
+  } {
+    if (steps.length === 0) {
       return {
-        summary: "No steps completed successfully.",
-        finalText: "Workflow completed but no results were generated.",
+        summary: "No steps were executed",
+        finalText: "No workflow steps were executed.",
+        stepsIncluded: [],
       };
     }
 
-    // Get the last completed step
-    const leadResult = results[results.length - 1];
+    // Find successful steps in order, use the last one
+    const completedSteps = steps.filter((s) => s.status === "succeeded");
 
-    // If there's a review step, prefer that
-    const reviewStep = results.find((r) =>
-      r.stepId.toLowerCase().includes("review")
-    );
-    const finalResult = reviewStep || leadResult;
+    if (completedSteps.length === 0) {
+      return {
+        summary: `All ${steps.length} step(s) failed`,
+        finalText: this.formatFailedSteps(steps),
+        stepsIncluded: [],
+      };
+    }
 
-    const summary = `Completed ${results.length} steps. Final result from ${finalResult.stepTitle}.`;
+    // Use the last completed step (for sequential workflows, this is the final step)
+    const leadStep = completedSteps[completedSteps.length - 1];
+    const stepsIncluded = [leadStep.stepId];
 
-    const finalText = this.formatStepOutput(finalResult);
+    // Build summary
+    const summaryParts = [`Lead step "${leadStep.stepTitle}" completed`];
 
-    return { summary, finalText };
+    if (completedSteps.length > 1) {
+      summaryParts.push(`(+${completedSteps.length - 1} additional completed step(s))`);
+    }
+
+    const failedCount = steps.filter((s) => s.status === "failed").length;
+    if (failedCount > 0) {
+      summaryParts.push(`(${failedCount} step(s) failed)`);
+    }
+
+    // Build final text
+    const finalText = this.formatStepResult(leadStep);
+
+    return {
+      summary: summaryParts.join(" "),
+      finalText,
+      stepsIncluded,
+    };
   }
 
   /**
-   * All strategy: include output from all steps.
-   * Best for: parallel audit workflows
+   * All strategy: Include all step results in the final output.
+   * Good for parallel workflows where all results are valuable.
    */
-  private synthesizeAll(
-    results: StepResultEnvelope[]
-  ): { summary: string; finalText: string } {
-    if (results.length === 0) {
+  private synthesizeAll(steps: StepResultEnvelope[]): {
+    summary: string;
+    finalText: string;
+    stepsIncluded: string[];
+  } {
+    if (steps.length === 0) {
       return {
-        summary: "No steps completed successfully.",
-        finalText: "Workflow completed but no results were generated.",
+        summary: "No steps were executed",
+        finalText: "No workflow steps were executed.",
+        stepsIncluded: [],
       };
     }
 
+    const completedSteps = steps.filter((s) => s.status === "succeeded");
+    const failedSteps = steps.filter((s) => s.status === "failed");
+    const stepsIncluded = completedSteps.map((s) => s.stepId);
+
     const lines: string[] = [];
 
+    // Summary
     lines.push("# Workflow Results\n");
 
-    for (const result of results) {
-      lines.push(`## ${result.stepTitle}`);
-      lines.push(`**Agent:** ${result.agentName}`);
-      lines.push(`**Status:** ${result.status}`);
-      lines.push("");
-      lines.push(this.formatStepOutput(result));
-      lines.push("");
-      lines.push("---\n");
+    if (completedSteps.length > 0) {
+      lines.push(`## Succeeded (${completedSteps.length})\n`);
+      for (const step of completedSteps) {
+        lines.push(`### ${step.stepTitle}`);
+        lines.push("");
+        lines.push(this.formatStepResult(step));
+        lines.push("");
+      }
     }
 
-    const summary = `Completed ${results.length} steps with all outputs included.`;
+    if (failedSteps.length > 0) {
+      lines.push(`## Failed (${failedSteps.length})\n`);
+      for (const step of failedSteps) {
+        lines.push(`### ${step.stepTitle}`);
+        lines.push(`**Error:** ${step.error || "Unknown error"}`);
+        lines.push("");
+      }
+    }
+
+    const summary = `${completedSteps.length} step(s) succeeded, ${failedSteps.length} failed`;
+    const finalText = lines.join("\n");
 
     return {
       summary,
-      finalText: lines.join("\n"),
+      finalText,
+      stepsIncluded,
     };
   }
 
   /**
-   * Concise strategy: summarize each step briefly.
-   * Best for: parallel audits, quick reviews
+   * Concise strategy: Combine all results into a brief summary.
+   * Good for parallel audit workflows where you want a quick overview.
    */
-  private synthesizeConcise(
-    workflow: ResolvedWorkflow,
-    results: StepResultEnvelope[]
-  ): { summary: string; finalText: string } {
-    if (results.length === 0) {
+  private synthesizeConcise(steps: StepResultEnvelope[]): {
+    summary: string;
+    finalText: string;
+    stepsIncluded: string[];
+  } {
+    if (steps.length === 0) {
       return {
-        summary: "No steps completed successfully.",
-        finalText: "Workflow completed but no results were generated.",
+        summary: "No steps were executed",
+        finalText: "No workflow steps were executed.",
+        stepsIncluded: [],
       };
     }
 
+    const completedSteps = steps.filter((s) => s.status === "succeeded");
+    const failedSteps = steps.filter((s) => s.status === "failed");
+    const stepsIncluded = completedSteps.map((s) => s.stepId);
+
     const lines: string[] = [];
 
+    // Brief summary
     lines.push("# Summary\n");
+    lines.push(`- **Succeeded:** ${completedSteps.length}`);
+    lines.push(`- **Failed:** ${failedSteps.length}`);
+    lines.push("");
 
-    for (const result of results) {
-      lines.push(`- **${result.stepTitle}** (${result.agentName}): ${result.summary}`);
+    // Quick status for each step
+    lines.push("## Status\n");
+    for (const step of steps) {
+      const icon = step.status === "succeeded" ? "✓" : 
+                   step.status === "cancelled" ? "⚠" :
+                   step.status === "timed_out" ? "⏱" : "✗";
+      const title = step.stepTitle;
+      lines.push(`${icon} ${title}`);
+    }
+    lines.push("");
+
+    // Key findings (from completed steps)
+    if (completedSteps.length > 0) {
+      lines.push("## Key Results\n");
+      for (const step of completedSteps) {
+        lines.push(`### ${step.stepTitle}`);
+        // Only show first 200 chars of summary
+        const summaryText = step.summary.length > 200
+          ? step.summary.slice(0, 200) + "..."
+          : step.summary;
+        lines.push(summaryText);
+        lines.push("");
+      }
     }
 
-    // Get the last result for detailed output
-    const lastResult = results[results.length - 1];
+    // Errors if any
+    if (failedSteps.length > 0) {
+      lines.push("## Errors\n");
+      for (const step of failedSteps) {
+        lines.push(`**${step.stepTitle}:** ${step.error || "Unknown error"}`);
+      }
+    }
 
-    lines.push("\n## Details\n");
-    lines.push(this.formatStepOutput(lastResult));
-
-    const summary = `Synthesized results from ${results.length} steps into a concise summary.`;
+    const summary = `${completedSteps.length}/${steps.length} succeeded (concise)`;
+    const finalText = lines.join("\n");
 
     return {
       summary,
-      finalText: lines.join("\n"),
+      finalText,
+      stepsIncluded,
     };
   }
 
   /**
-   * Format a step's output for display.
+   * Format a single step result for display.
    */
-  private formatStepOutput(result: StepResultEnvelope): string {
-    if (result.artifact.type === "json") {
-      return `\`\`\`json\n${JSON.stringify(result.artifact.value, null, 2)}\n\`\`\``;
+  private formatStepResult(step: StepResultEnvelope): string {
+    const lines: string[] = [];
+
+    // Summary section
+    if (step.summary) {
+      lines.push("### Summary");
+      lines.push("");
+      lines.push(step.summary);
+      lines.push("");
     }
 
-    if (typeof result.artifact.value === "string" && result.artifact.value.trim()) {
-      return result.artifact.value;
+    // Artifact section (if present and not empty)
+    if (step.artifact?.value) {
+      lines.push("### Result");
+      lines.push("");
+
+      if (step.artifact.type === "json") {
+        const formatted = typeof step.artifact.value === "string"
+          ? step.artifact.value
+          : JSON.stringify(step.artifact.value, null, 2);
+        lines.push("```json");
+        lines.push(formatted);
+        lines.push("```");
+      } else {
+        const value = typeof step.artifact.value === "string"
+          ? step.artifact.value
+          : JSON.stringify(step.artifact.value, null, 2);
+        lines.push(value);
+      }
+      lines.push("");
     }
 
-    return result.summary || "(No detailed output)";
+    return lines.join("\n");
   }
 
   /**
-   * Format errors for display.
+   * Format failed steps for display.
    */
-  formatErrors(results: Record<string, StepResultEnvelope>): string {
-    const failed = Object.values(results).filter((r) => r.status === "failed");
-
-    if (failed.length === 0) {
-      return "";
-    }
-
+  private formatFailedSteps(steps: StepResultEnvelope[]): string {
     const lines: string[] = [];
-    lines.push("## Errors\n");
 
-    for (const result of failed) {
-      lines.push(`### ${result.stepTitle}`);
-      lines.push(`**Agent:** ${result.agentName}`);
-      lines.push(`**Error:** ${result.error || "Unknown error"}`);
+    lines.push("# Workflow Failed\n");
+    lines.push("");
+
+    for (const step of steps) {
+      lines.push(`## ${step.stepTitle}`);
+      lines.push(`**Status:** ${step.status}`);
+      if (step.error) {
+        lines.push(`**Error:** ${step.error}`);
+      }
       lines.push("");
     }
 
@@ -200,7 +307,7 @@ export class Synthesizer {
 }
 
 /**
- * Create a synthesizer with default settings.
+ * Create a synthesizer instance.
  */
 export function createSynthesizer(): Synthesizer {
   return new Synthesizer();
