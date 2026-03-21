@@ -1,7 +1,10 @@
 // src/extension/commands/workflow.ts - /workflow command implementation
 
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import { listPresets, getPreset } from "../../workflow/presets";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
@@ -12,14 +15,14 @@ import {
 } from "../../runtime/childSessionRunner";
 
 export interface WorkflowCommandOptions {
-  /** List all workflows */
+  /** List configured workflows */
   list?: boolean;
   /** Show a specific workflow */
   show?: string;
-  /** Filter workflows by keyword */
-  filter?: string;
   /** Show help */
   help?: boolean;
+  /** Add a workflow to settings */
+  add?: string;
   /** Run a workflow */
   run?: string;
   /** Task description */
@@ -46,9 +49,14 @@ export async function executeWorkflowCommand(
     return;
   }
 
+  if (options.add) {
+    await addWorkflow(options.add);
+    return;
+  }
+
   // Handle list option
   if (options.list) {
-    listWorkflows(options.filter);
+    await listConfiguredWorkflows();
     return;
   }
 
@@ -67,43 +75,44 @@ export async function executeWorkflowCommand(
     return;
   }
 
-  // Default: list all workflows
-  listWorkflows();
+  if (!registry) {
+    throw new Error("Agent registry is required to run workflows");
+  }
+
+  await promptAndRunWorkflow(options, registry);
 }
 
 /**
- * List available workflows with optional filtering.
+ * List configured workflows.
  */
-function listWorkflows(filter?: string): void {
-  const presets = listPresets();
+async function listConfiguredWorkflows(): Promise<void> {
+  const configured = await getConfiguredWorkflowIds();
 
-  console.log("\nAvailable Workflows:\n");
+  console.log("\nConfigured Workflows:\n");
 
-  const filtered = filter
-    ? presets.filter(
-        (p) =>
-          p.id.includes(filter!) ||
-          p.name.toLowerCase().includes(filter!.toLowerCase()) ||
-          p.description?.toLowerCase().includes(filter!.toLowerCase())
-      )
-    : presets;
-
-  if (filtered.length === 0) {
-    console.log(`  No workflows found${filter ? ` matching "${filter}"` : ""}.`);
+  if (configured.length === 0) {
+    console.log("  No workflows configured.");
+    console.log("  Use '/workflow add <workflow-id>' to add one.");
     console.log("");
     return;
   }
 
-  for (const preset of filtered) {
-    console.log(`  ${preset.id}`);
-    console.log(`    ${preset.name}`);
-    if (preset.description) {
-      console.log(`    ${preset.description}`);
+  for (let i = 0; i < configured.length; i++) {
+    const workflowId = configured[i];
+    const preset = getPreset(workflowId);
+    const label = i === 0 ? " (default)" : "";
+
+    console.log(`  ${i + 1}. ${workflowId}${label}`);
+    if (preset) {
+      console.log(`     ${preset.name}`);
+      if (preset.description) {
+        console.log(`     ${preset.description}`);
+      }
+    } else {
+      console.log("     Unknown workflow ID in settings");
     }
     console.log("");
   }
-
-  console.log(`Total: ${filtered.length} workflow(s)\n`);
 }
 
 /**
@@ -155,6 +164,191 @@ function getStepTargetDescription(step: WorkflowSpec["steps"][0]): string {
   if ("role" in step) return `role: ${(step as { role: string }).role}`;
   if ("capability" in step) return `capability: ${(step as { capability: string }).capability}`;
   return "unknown";
+}
+
+async function promptAndRunWorkflow(
+  options: WorkflowCommandOptions,
+  registry: AgentRegistry
+): Promise<void> {
+  const configured = await getConfiguredWorkflowIds();
+
+  if (configured.length === 0) {
+    console.log("\nNo configured workflows found.");
+    console.log("Use '/workflow add <workflow-id>' to add one.\n");
+    return;
+  }
+
+  console.log("\nConfigured Workflows:\n");
+  for (let i = 0; i < configured.length; i++) {
+    const workflowId = configured[i];
+    const preset = getPreset(workflowId);
+    const label = i === 0 ? " (default)" : "";
+    console.log(`  ${i + 1}. ${workflowId}${label}`);
+    if (preset?.description) {
+      console.log(`     ${preset.description}`);
+    }
+  }
+  console.log("");
+
+  const rl = createInterface({ input, output });
+
+  try {
+    const selection = (await rl.question("Select workflow by number or id: ")).trim();
+    const selectionResult = resolveWorkflowSelection(selection, configured);
+    const workflowId = selectionResult.workflowId;
+
+    if (!workflowId) {
+      const suggestionText = selectionResult.suggestions.length > 0
+        ? ` Did you mean: ${selectionResult.suggestions.join(", ")}?`
+        : "";
+      throw new Error(`Invalid workflow selection.${suggestionText}`);
+    }
+
+    const task = options.task?.trim()
+      ? options.task.trim()
+      : (await rl.question(`Task for ${workflowId}: `)).trim();
+
+    if (!task) {
+      throw new Error("Task is required");
+    }
+
+    await runWorkflow(workflowId, { ...options, task }, registry);
+  } finally {
+    rl.close();
+  }
+}
+
+function resolveWorkflowSelection(
+  selection: string,
+  configured: string[]
+): { workflowId?: string; suggestions: string[] } {
+  if (!selection && configured.length > 0) {
+    return { workflowId: configured[0], suggestions: [] };
+  }
+
+  const numeric = Number(selection);
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= configured.length) {
+    return { workflowId: configured[numeric - 1], suggestions: [] };
+  }
+
+  const exact = configured.find((workflowId) => workflowId === selection);
+  if (exact) {
+    return { workflowId: exact, suggestions: [] };
+  }
+
+  const lowerSelection = selection.toLowerCase();
+
+  const caseInsensitive = configured.find(
+    (workflowId) => workflowId.toLowerCase() === lowerSelection
+  );
+  if (caseInsensitive) {
+    return { workflowId: caseInsensitive, suggestions: [] };
+  }
+
+  const prefixMatches = configured.filter(
+    (workflowId) => workflowId.toLowerCase().startsWith(lowerSelection)
+  );
+  if (prefixMatches.length === 1) {
+    return { workflowId: prefixMatches[0], suggestions: [] };
+  }
+
+  const tokenMatches = configured.filter((workflowId) =>
+    workflowId.toLowerCase().includes(lowerSelection)
+  );
+  if (tokenMatches.length === 1) {
+    return { workflowId: tokenMatches[0], suggestions: [] };
+  }
+
+  return {
+    workflowId: undefined,
+    suggestions: dedupeSuggestions([...prefixMatches, ...tokenMatches]).slice(0, 3),
+  };
+}
+
+async function addWorkflow(workflowId: string): Promise<void> {
+  const normalizedWorkflowId = resolveWorkflowIdForAdd(workflowId);
+  const preset = normalizedWorkflowId ? getPreset(normalizedWorkflowId) : undefined;
+  if (!preset) {
+    const available = listPresets().map((entry) => entry.id).join(", ");
+    throw new Error(`Unknown workflow: ${workflowId}. Available workflows: ${available}`);
+  }
+
+  const settings = await readWorkflowSettings();
+  const configured = settings.conductorWorkflow ?? [];
+
+  if (configured.includes(preset.id)) {
+    console.log(`Workflow already configured: ${preset.id}`);
+    return;
+  }
+
+  settings.conductorWorkflow = [...configured, preset.id];
+  await writeWorkflowSettings(settings);
+
+  console.log(`Added workflow: ${preset.id}`);
+}
+
+function resolveWorkflowIdForAdd(inputId: string): string | undefined {
+  const presets = listPresets();
+  const exact = presets.find((preset) => preset.id === inputId);
+  if (exact) return exact.id;
+
+  const lowerInput = inputId.toLowerCase();
+
+  const caseInsensitive = presets.find(
+    (preset) => preset.id.toLowerCase() === lowerInput
+  );
+  if (caseInsensitive) return caseInsensitive.id;
+
+  const prefixMatches = presets.filter(
+    (preset) => preset.id.toLowerCase().startsWith(lowerInput)
+  );
+  if (prefixMatches.length === 1) return prefixMatches[0].id;
+
+  const containsMatches = presets.filter(
+    (preset) => preset.id.toLowerCase().includes(lowerInput)
+  );
+  if (containsMatches.length === 1) return containsMatches[0].id;
+
+  return undefined;
+}
+
+function dedupeSuggestions(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+interface WorkflowSettings {
+  conductorWorkflow?: string[];
+}
+
+function getSettingsPath(): string {
+  return path.join(os.homedir(), ".pi", "agent", "settings.json");
+}
+
+async function readWorkflowSettings(): Promise<WorkflowSettings> {
+  const settingsPath = getSettingsPath();
+
+  try {
+    const content = await fs.readFile(settingsPath, "utf8");
+    const parsed = JSON.parse(content) as WorkflowSettings;
+    return {
+      conductorWorkflow: Array.isArray(parsed.conductorWorkflow)
+        ? parsed.conductorWorkflow.filter((entry): entry is string => typeof entry === "string")
+        : [],
+    };
+  } catch {
+    return { conductorWorkflow: [] };
+  }
+}
+
+async function writeWorkflowSettings(settings: WorkflowSettings): Promise<void> {
+  const settingsPath = getSettingsPath();
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+}
+
+async function getConfiguredWorkflowIds(): Promise<string[]> {
+  const settings = await readWorkflowSettings();
+  return settings.conductorWorkflow ?? [];
 }
 
 // ============================================================================
@@ -505,6 +699,9 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
     const arg = args[i];
 
     switch (arg) {
+      case "add":
+        options.add = args[++i] || undefined;
+        break;
       case "run":
         options.run = args[++i] || undefined;
         break;
@@ -515,10 +712,6 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "--show":
       case "-s":
         options.show = args[++i] || undefined;
-        break;
-      case "--filter":
-      case "-f":
-        options.filter = args[++i] || undefined;
         break;
       case "--task":
       case "-t":
@@ -544,15 +737,8 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
         break;
       default:
         if (!arg.startsWith("-")) {
-          // Positional argument - treat as filter or workflow id
-          if (!options.filter && !options.show && !options.run) {
-            // Check if it looks like a workflow id
-            const preset = getPreset(arg);
-            if (preset) {
-              options.show = arg;
-            } else {
-              options.filter = arg;
-            }
+          if (!options.show && !options.run && !options.add && !options.task) {
+            options.task = arg;
           }
         }
     }
@@ -571,14 +757,15 @@ function getHelpText(): string {
 Usage:
   /workflow [options]
   /workflow run <id> [options]
+  /workflow add <id>
 
 Subcommands:
   run <id>                Run a workflow with the given ID
+  add <id>                Add a workflow to ~/.pi/agent/settings.json
 
 Options:
-  -l, --list              List all available workflows
+  -l, --list              List configured workflows
   -s, --show <id>         Show details of a specific workflow
-  -f, --filter <keyword>  Filter workflows by keyword
   -t, --task <text>       Task description for workflow execution
   --runner <type>         Runner type: local-process (default) or default
   -v, --verbose           Verbose output
@@ -587,8 +774,15 @@ Options:
   -h, --help              Show this help
 
 Examples:
-  # List all workflows
+  # Add workflows to settings
+  /workflow add plan-implement-review
+  /workflow add quick-review
+
+  # List configured workflows
   /workflow --list
+
+  # Prompt for workflow, then prompt for task
+  /workflow
 
   # Show workflow details
   /workflow --show plan-implement-review
