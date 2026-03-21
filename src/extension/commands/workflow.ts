@@ -185,6 +185,7 @@ async function runWorkflow(
 
   // Determine runner type
   const useLocalProcess = options.runner === "local-process" || !options.runner;
+  const sequential = options.sequential ?? true;
 
   // Determine working directory
   const workingDir = options.workingDir || process.cwd();
@@ -199,9 +200,7 @@ async function runWorkflow(
   console.log("═".repeat(60));
   console.log(`📋 Task: ${options.task}`);
   console.log(`🔧 Runner: ${useLocalProcess ? "local-process" : "default"}`);
-  if (options.sequential) {
-    console.log(`📊 Mode: sequential (maxParallelism=1)`);
-  }
+  console.log(`📊 Mode: ${sequential ? "sequential (maxParallelism=1)" : "workflow default"}`);
   console.log(`📁 Run ID: ${runId}`);
   console.log("");
 
@@ -278,7 +277,7 @@ async function runWorkflow(
           break;
       }
     },
-    { sequential: options.sequential }
+    { sequential }
   );
 
   // Execute workflow
@@ -583,7 +582,7 @@ Options:
   -t, --task <text>       Task description for workflow execution
   --runner <type>         Runner type: local-process (default) or default
   -v, --verbose           Verbose output
-  --sequential            Force sequential execution (maxParallelism=1)
+  --sequential            Explicitly request sequential execution (default)
   -d, --working-dir <dir> Working directory for run artifacts
   -h, --help              Show this help
 
@@ -600,8 +599,8 @@ Examples:
   # Run with verbose output
   /workflow run implement-and-review -t 'Fix the login bug' --verbose
 
-  # Force sequential execution
-  /workflow run plan-implement-review -t 'Build feature' --sequential
+  # Sequential execution is the default for /workflow run
+  /workflow run plan-implement-review -t 'Build feature'
 
 See Also:
   /team - Alternative workflow runner with auto-selection

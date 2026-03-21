@@ -80,7 +80,7 @@ Inspect and execute workflows.
 # Run a workflow (Phase 4)
 /workflow run plan-implement-review --task "Implement user authentication"
 /workflow run implement-and-review -t "Fix the login bug" --verbose
-/workflow run quick-review -t "Review this code" --sequential
+/workflow run quick-review -t "Review this code"
 ```
 
 ## Built-in Workflows
