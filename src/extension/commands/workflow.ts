@@ -3,8 +3,6 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 import { listPresets, getPreset } from "../../workflow/presets";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
@@ -67,8 +65,7 @@ export async function executeWorkflowCommand(
   }
 
   if (options.settings) {
-    await showWorkflowSettings();
-    return;
+    throw new Error("Interactive workflow settings are available through the Pi extension UI. Use /workflow inside Pi.");
   }
 
   if (options.add) {
@@ -105,7 +102,9 @@ export async function executeWorkflowCommand(
     throw new Error("Agent registry is required to run workflows");
   }
 
-  return showWorkflowMenu(options, registry, observer);
+  throw new Error(
+    "Interactive workflow menus are available through the Pi extension UI. Use /workflow inside Pi, or use direct subcommands like /workflow run, /workflow list, /workflow add, or /workflow remove."
+  );
 }
 
 /**
@@ -138,214 +137,6 @@ async function listConfiguredWorkflows(): Promise<void> {
       console.log("     Unknown workflow ID in settings");
     }
     console.log("");
-  }
-}
-
-/**
- * Show the main workflow menu.
- */
-async function showWorkflowMenu(
-  options: WorkflowCommandOptions,
-  registry: AgentRegistry,
-  observer?: WorkflowCommandObserver
-): Promise<WorkflowCommandExecution | void> {
-  const rl = createInterface({ input, output });
-
-  try {
-    while (true) {
-      console.log("\n╔════════════════════════════════════════╗");
-      console.log("║           Workflow Menu                ║");
-      console.log("╠════════════════════════════════════════╣");
-      console.log("║  1. Run workflow                       ║");
-      console.log("║  2. List workflows                    ║");
-      console.log("║  3. Add workflow                       ║");
-      console.log("║  4. Remove workflow                    ║");
-      console.log("║  5. Settings                           ║");
-      console.log("║  0. Exit                              ║");
-      console.log("╚════════════════════════════════════════╝");
-      console.log("");
-
-      const choice = (await rl.question("Select option: ")).trim();
-
-      switch (choice) {
-        case "1":
-          return promptAndRunWorkflow(options, registry, observer);
-        case "2":
-          await listConfiguredWorkflows();
-          break;
-        case "3":
-          const addId = (await rl.question("Enter workflow ID to add: ")).trim();
-          if (addId) {
-            await addWorkflow(addId);
-          }
-          break;
-        case "4":
-          const removeId = (await rl.question("Enter workflow ID to remove: ")).trim();
-          if (removeId) {
-            await removeWorkflow(removeId);
-          }
-          break;
-        case "5":
-          await showWorkflowSettings();
-          break;
-        case "0":
-        case "exit":
-        case "q":
-          console.log("Goodbye!");
-          return;
-        default:
-          console.log("Invalid option. Please try again.");
-      }
-    }
-  } finally {
-    rl.close();
-  }
-}
-
-/**
- * Show workflow settings menu.
- */
-async function showWorkflowSettings(): Promise<void> {
-  const rl = createInterface({ input, output });
-
-  try {
-    const context = await getWorkflowSettingsContext();
-    const settings: EffectiveWorkflowSettings = { ...context.settings };
-    let saveScope: SettingsScope = context.scope;
-
-    while (true) {
-      console.log("\n╔═══════════════════════════════════════════════╗");
-      console.log("║              Workflow Settings               ║");
-      console.log("╠═══════════════════════════════════════════════╣");
-      console.log(`║  1. Multiplexer: ${padRight(settings.conductorWorkflowMultiplexer, 25)}║`);
-      console.log(`║  2. Display:    ${padRight(settings.conductorWorkflowDisplay, 25)}║`);
-      console.log(`║  3. Save scope: ${padRight(saveScope, 25)}║`);
-      console.log("║  4. Configured workflows                    ║");
-      console.log("║  5. Save & Exit                             ║");
-      console.log("║  0. Cancel                                  ║");
-      console.log("╚═══════════════════════════════════════════════╝");
-      console.log("");
-
-      const choice = (await rl.question("Select setting to modify: ")).trim();
-
-      switch (choice) {
-        case "1":
-          settings.conductorWorkflowMultiplexer = await selectMultiplexer(rl);
-          break;
-        case "2":
-          if (settings.conductorWorkflowMultiplexer === "none") {
-            console.log("\n⚠ Display strategy only applies when multiplexer is 'zellij'.");
-          } else {
-            settings.conductorWorkflowDisplay = await selectDisplayStrategy(rl);
-          }
-          break;
-        case "3":
-          saveScope = await selectSettingsScope(rl, saveScope);
-          break;
-        case "4":
-          await listConfiguredWorkflows();
-          break;
-        case "5":
-          await saveWorkflowSettings(settings, saveScope);
-          console.log("\n✓ Settings saved.");
-          return;
-        case "0":
-        case "cancel":
-        case "q":
-          console.log("\nSettings discarded.");
-          return;
-        default:
-          console.log("Invalid option. Please try again.");
-      }
-    }
-  } finally {
-    rl.close();
-  }
-}
-
-function padRight(str: string, length: number): string {
-  return str.padEnd(length);
-}
-
-async function selectMultiplexer(rl: ReturnType<typeof createInterface>): Promise<WorkflowMultiplexer> {
-  console.log("\n╔════════════════════════════════════════╗");
-  console.log("║         Select Multiplexer             ║");
-  console.log("╠════════════════════════════════════════╣");
-  console.log("║  1. none                                ║");
-  console.log("║  2. zellij                               ║");
-  console.log("╚════════════════════════════════════════╝");
-  console.log("");
-
-  while (true) {
-    const choice = (await rl.question("Select multiplexer (1-2): ")).trim();
-    switch (choice) {
-      case "1":
-      case "none":
-        return "none";
-      case "2":
-      case "zellij":
-        // Check if zellij is available
-        const available = await isZellijAvailable();
-        if (!available) {
-          console.log("\n⚠ Zellij is not installed or not in PATH.");
-          console.log("  Falling back to 'none'.");
-          return "none";
-        }
-        return "zellij";
-      default:
-        console.log("Invalid choice. Please enter 1 or 2.");
-    }
-  }
-}
-
-async function selectDisplayStrategy(rl: ReturnType<typeof createInterface>): Promise<WorkflowDisplayStrategy> {
-  console.log("\n╔════════════════════════════════════════╗");
-  console.log("║       Select Display Strategy         ║");
-  console.log("╠════════════════════════════════════════╣");
-  console.log("║  1. main-window                        ║");
-  console.log("║  2. split-pane                        ║");
-  console.log("╚════════════════════════════════════════╝");
-  console.log("");
-
-  while (true) {
-    const choice = (await rl.question("Select display strategy (1-2): ")).trim();
-    switch (choice) {
-      case "1":
-      case "main-window":
-        return "main-window";
-      case "2":
-      case "split-pane":
-        return "split-pane";
-      default:
-        console.log("Invalid choice. Please enter 1 or 2.");
-    }
-  }
-}
-
-async function selectSettingsScope(
-  rl: ReturnType<typeof createInterface>,
-  currentScope: SettingsScope
-): Promise<SettingsScope> {
-  console.log("\n╔════════════════════════════════════════╗");
-  console.log("║          Select Save Scope            ║");
-  console.log("╠════════════════════════════════════════╣");
-  console.log(`║  1. project${currentScope === "project" ? " (current)" : ""}${" ".repeat(currentScope === "project" ? 20 : 30)}║`);
-  console.log(`║  2. user${currentScope === "user" ? " (current)" : ""}${" ".repeat(currentScope === "user" ? 23 : 33)}║`);
-  console.log("╚════════════════════════════════════════╝");
-  console.log("");
-
-  while (true) {
-    const choice = (await rl.question("Save to scope (1-2): ")).trim();
-    switch (choice) {
-      case "1":
-      case "project":
-        return "project";
-      case "2":
-      case "user":
-        return "user";
-      default:
-        console.log("Invalid choice. Please enter 1 or 2.");
-    }
   }
 }
 
@@ -429,59 +220,6 @@ function getStepTargetDescription(step: WorkflowSpec["steps"][0]): string {
   if ("role" in step) return `role: ${(step as { role: string }).role}`;
   if ("capability" in step) return `capability: ${(step as { capability: string }).capability}`;
   return "unknown";
-}
-
-async function promptAndRunWorkflow(
-  options: WorkflowCommandOptions,
-  registry: AgentRegistry,
-  observer?: WorkflowCommandObserver
-): Promise<WorkflowCommandExecution | void> {
-  const configured = await getConfiguredWorkflowIds();
-
-  if (configured.length === 0) {
-    console.log("\nNo configured workflows found.");
-    console.log("Use '/workflow add <workflow-id>' to add one.\n");
-    return;
-  }
-
-  console.log("\nConfigured Workflows:\n");
-  for (let i = 0; i < configured.length; i++) {
-    const workflowId = configured[i];
-    const preset = getPreset(workflowId);
-    const label = i === 0 ? " (default)" : "";
-    console.log(`  ${i + 1}. ${workflowId}${label}`);
-    if (preset?.description) {
-      console.log(`     ${preset.description}`);
-    }
-  }
-  console.log("");
-
-  const rl = createInterface({ input, output });
-
-  try {
-    const selection = (await rl.question("Select workflow by number or id: ")).trim();
-    const selectionResult = resolveWorkflowSelection(selection, configured);
-    const workflowId = selectionResult.workflowId;
-
-    if (!workflowId) {
-      const suggestionText = selectionResult.suggestions.length > 0
-        ? ` Did you mean: ${selectionResult.suggestions.join(", ")}?`
-        : "";
-      throw new Error(`Invalid workflow selection.${suggestionText}`);
-    }
-
-    const task = options.task?.trim()
-      ? options.task.trim()
-      : (await rl.question(`Task for ${workflowId}: `)).trim();
-
-    if (!task) {
-      throw new Error("Task is required");
-    }
-
-    return runWorkflow(workflowId, { ...options, task }, registry, observer);
-  } finally {
-    rl.close();
-  }
 }
 
 function resolveWorkflowSelection(
@@ -573,7 +311,7 @@ async function removeWorkflow(workflowId: string): Promise<void> {
   console.log(`Removed workflow: ${normalizedWorkflowId}`);
 }
 
-function resolveWorkflowIdForAdd(inputId: string): string | undefined {
+export function resolveWorkflowIdForAdd(inputId: string): string | undefined {
   const presets = listPresets();
   const exact = presets.find((preset) => preset.id === inputId);
   if (exact) return exact.id;
@@ -602,17 +340,17 @@ function dedupeSuggestions(values: string[]): string[] {
   return Array.from(new Set(values));
 }
 
-interface WorkflowSettings {
+export interface WorkflowSettings {
   conductorWorkflow?: string[];
   conductorWorkflowMultiplexer?: WorkflowMultiplexer;
   conductorWorkflowDisplay?: WorkflowDisplayStrategy;
 }
 
-type WorkflowMultiplexer = "none" | "zellij";
-type WorkflowDisplayStrategy = "main-window" | "split-pane";
-type SettingsScope = "project" | "user";
+export type WorkflowMultiplexer = "none" | "zellij";
+export type WorkflowDisplayStrategy = "main-window" | "split-pane";
+export type SettingsScope = "project" | "user";
 
-interface EffectiveWorkflowSettings {
+export interface EffectiveWorkflowSettings {
   conductorWorkflow: string[];
   conductorWorkflowMultiplexer: WorkflowMultiplexer;
   conductorWorkflowDisplay: WorkflowDisplayStrategy;
@@ -690,7 +428,7 @@ async function getEffectiveWorkflowSettings(cwd = process.cwd()): Promise<Effect
   };
 }
 
-async function getWorkflowSettingsContext(
+export async function getWorkflowSettingsContext(
   cwd = process.cwd()
 ): Promise<{ settings: EffectiveWorkflowSettings; scope: SettingsScope }> {
   const projectSettings = await readWorkflowSettingsFromFile(getProjectSettingsPath(cwd));
@@ -716,7 +454,7 @@ async function getWorkflowSettingsContext(
   };
 }
 
-async function writeWorkflowSettings(
+export async function writeWorkflowSettings(
   settings: WorkflowSettings,
   scope: "project" | "user" = "project",
   cwd = process.cwd()
@@ -733,7 +471,7 @@ async function getConfiguredWorkflowIds(): Promise<string[]> {
   return settings.conductorWorkflow ?? [];
 }
 
-async function getConfiguredWorkflows(): Promise<Array<{ id: string; name: string; description?: string }>> {
+export async function getConfiguredWorkflows(): Promise<Array<{ id: string; name: string; description?: string }>> {
   const ids = await getConfiguredWorkflowIds();
   return ids.map((id) => {
     const preset = getPreset(id);

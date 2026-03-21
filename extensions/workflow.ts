@@ -4,13 +4,22 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-cod
 import { Text } from "@mariozechner/pi-tui";
 import {
   executeWorkflowCommand,
+  getConfiguredWorkflows,
+  getWorkflowSettingsContext,
   parseWorkflowCommandArgs,
+  resolveWorkflowIdForAdd,
   type WorkflowCommandExecution,
   type WorkflowCommandObserver,
+  type EffectiveWorkflowSettings,
+  type SettingsScope,
+  type WorkflowDisplayStrategy,
+  type WorkflowMultiplexer,
+  writeWorkflowSettings,
 } from "../src/extension/commands/workflow";
 import { createDefaultRegistry } from "../src/registry";
 import { formatWorkflowResult, type ProgressEvent } from "../src/runtime/orchestrator";
 import type { StepResultEnvelope, WorkflowRunResult } from "../src/workflow/types";
+import { listPresets } from "../src/workflow/presets";
 
 type WorkflowMessageDetails =
   | {
@@ -52,6 +61,7 @@ export default function (pi: ExtensionAPI) {
     description: "Inspect and run multi-agent workflows",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parsedArgs = parseWorkflowCommandArgs(args.split(/\s+/).filter(Boolean));
+      const trimmedArgs = args.trim();
 
       // Create registry for agent resolution
       const registry = await createDefaultRegistry(ctx.cwd);
@@ -84,7 +94,14 @@ export default function (pi: ExtensionAPI) {
 
       // Execute the workflow command
       try {
-        const execution = await executeWorkflowCommand(parsedArgs, registry, observer);
+        let execution: WorkflowCommandExecution | void;
+
+        if (shouldUseNativeWorkflowUi(parsedArgs, trimmedArgs)) {
+          execution = await runNativeWorkflowUi(pi, ctx, parsedArgs, registry, observer);
+        } else {
+          execution = await executeWorkflowCommand(parsedArgs, registry, observer);
+        }
+
         finalizeWorkflowUi(ctx, progressState, execution);
       } catch (error) {
         ctx.ui.setStatus("workflow", undefined);
@@ -98,6 +115,231 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+}
+
+function shouldUseNativeWorkflowUi(
+  parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>,
+  rawArgs: string
+): boolean {
+  if (parsedArgs.help || parsedArgs.list || parsedArgs.show || parsedArgs.add || parsedArgs.remove || parsedArgs.run) {
+    return false;
+  }
+
+  if (parsedArgs.settings || rawArgs === "settings") {
+    return true;
+  }
+
+  return true;
+}
+
+async function runNativeWorkflowUi(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>,
+  registry: Awaited<ReturnType<typeof createDefaultRegistry>>,
+  observer: WorkflowCommandObserver
+): Promise<WorkflowCommandExecution | void> {
+  if (parsedArgs.settings || parsedArgs.task === "settings") {
+    await runNativeWorkflowSettings(ctx);
+    return;
+  }
+
+  if (parsedArgs.task?.trim()) {
+    return promptAndRunWorkflowFromPiUi(parsedArgs.task.trim(), ctx, registry, observer, parsedArgs);
+  }
+
+  const choice = await ctx.ui.select("Workflow", [
+    "Run workflow",
+    "List workflows",
+    "Add workflow",
+    "Remove workflow",
+    "Settings",
+  ]);
+
+  if (!choice) {
+    ctx.ui.notify("Workflow menu cancelled", "info");
+    return;
+  }
+
+  switch (choice) {
+    case "Run workflow":
+      return promptAndRunWorkflowFromPiUi(undefined, ctx, registry, observer, parsedArgs);
+    case "List workflows":
+      await showConfiguredWorkflowsInPi(ctx);
+      return;
+    case "Add workflow":
+      await addWorkflowFromPiUi(ctx);
+      return;
+    case "Remove workflow":
+      await removeWorkflowFromPiUi(ctx);
+      return;
+    case "Settings":
+      await runNativeWorkflowSettings(ctx);
+      return;
+    default:
+      return;
+  }
+}
+
+async function promptAndRunWorkflowFromPiUi(
+  initialTask: string | undefined,
+  ctx: ExtensionCommandContext,
+  registry: Awaited<ReturnType<typeof createDefaultRegistry>>,
+  observer: WorkflowCommandObserver,
+  parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>
+): Promise<WorkflowCommandExecution | void> {
+  const workflows = await getConfiguredWorkflows();
+  if (workflows.length === 0) {
+    throw new Error("No configured workflows found. Use /workflow add <workflow-id> to add one.");
+  }
+
+  const options = workflows.map((workflow) =>
+    workflow.description ? `${workflow.id} - ${workflow.description}` : workflow.id
+  );
+  const selected = await pickFromList(ctx, "Select workflow", options);
+  if (!selected) {
+    return;
+  }
+
+  const workflow = workflows[options.indexOf(selected)];
+  const task = initialTask ?? await promptForTask(ctx, workflow.id);
+  if (!task) {
+    return;
+  }
+
+  return executeWorkflowCommand(
+    { ...parsedArgs, run: workflow.id, task },
+    registry,
+    observer
+  ) as Promise<WorkflowCommandExecution | void>;
+}
+
+async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promise<void> {
+  const workflows = await getConfiguredWorkflows();
+  if (workflows.length === 0) {
+    ctx.ui.notify("No configured workflows found", "info");
+    return;
+  }
+
+  ctx.ui.setWidget("workflow-config", workflows.map((workflow, index) =>
+    `${index + 1}. ${workflow.id}${workflow.description ? ` - ${workflow.description}` : ""}`
+  ));
+  ctx.ui.notify(`Loaded ${workflows.length} configured workflow(s)`, "info");
+}
+
+async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
+  const presets = listPresets();
+  const configured = new Set((await getConfiguredWorkflows()).map((workflow) => workflow.id));
+  const candidates = presets
+    .filter((preset) => !configured.has(preset.id))
+    .map((preset) => preset.description ? `${preset.id} - ${preset.description}` : preset.id);
+
+  if (candidates.length === 0) {
+    ctx.ui.notify("All known workflows are already configured", "info");
+    return;
+  }
+
+  const selected = await ctx.ui.select("Add workflow", candidates);
+  if (!selected) {
+    return;
+  }
+
+  const workflowId = selected.split(" - ")[0];
+  await executeWorkflowCommand({ add: workflowId });
+  ctx.ui.notify(`Added workflow: ${workflowId}`, "info");
+}
+
+async function removeWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
+  const workflows = await getConfiguredWorkflows();
+  if (workflows.length === 0) {
+    ctx.ui.notify("No configured workflows to remove", "info");
+    return;
+  }
+
+  const selected = await ctx.ui.select(
+    "Remove workflow",
+    workflows.map((workflow) => workflow.description ? `${workflow.id} - ${workflow.description}` : workflow.id)
+  );
+  if (!selected) {
+    return;
+  }
+
+  const workflowId = selected.split(" - ")[0];
+  await executeWorkflowCommand({ remove: workflowId });
+  ctx.ui.notify(`Removed workflow: ${workflowId}`, "info");
+}
+
+async function runNativeWorkflowSettings(ctx: ExtensionCommandContext): Promise<void> {
+  const context = await getWorkflowSettingsContext(ctx.cwd);
+  const settings: EffectiveWorkflowSettings = { ...context.settings };
+  let scope: SettingsScope = context.scope;
+
+  while (true) {
+    const choice = await ctx.ui.select("Workflow settings", [
+      `Multiplexer: ${settings.conductorWorkflowMultiplexer}`,
+      `Display: ${settings.conductorWorkflowDisplay}`,
+      `Save scope: ${scope}`,
+      "Save",
+    ]);
+
+    if (!choice) {
+      ctx.ui.notify("Settings cancelled", "info");
+      return;
+    }
+
+    if (choice.startsWith("Multiplexer:")) {
+      const selected = await ctx.ui.select("Select multiplexer", ["none", "zellij"]);
+      if (selected) {
+        settings.conductorWorkflowMultiplexer = selected as WorkflowMultiplexer;
+      }
+      continue;
+    }
+
+    if (choice.startsWith("Display:")) {
+      if (settings.conductorWorkflowMultiplexer === "none") {
+        ctx.ui.notify("Display is only used when multiplexer is zellij", "warning");
+        continue;
+      }
+      const selected = await ctx.ui.select("Select display strategy", ["main-window", "split-pane"]);
+      if (selected) {
+        settings.conductorWorkflowDisplay = selected as WorkflowDisplayStrategy;
+      }
+      continue;
+    }
+
+    if (choice.startsWith("Save scope:")) {
+      const selected = await ctx.ui.select("Save settings to", ["project", "user"]);
+      if (selected) {
+        scope = selected as SettingsScope;
+      }
+      continue;
+    }
+
+    await writeWorkflowSettings({
+      conductorWorkflow: settings.conductorWorkflow,
+      conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer,
+      conductorWorkflowDisplay: settings.conductorWorkflowDisplay,
+    }, scope, ctx.cwd);
+    ctx.ui.notify(`Workflow settings saved to ${scope} settings`, "info");
+    return;
+  }
+}
+
+async function pickFromList(
+  ctx: ExtensionCommandContext,
+  title: string,
+  items: string[]
+): Promise<string | undefined> {
+  return items.length === 0 ? undefined : ctx.ui.select(title, items);
+}
+
+async function promptForTask(
+  ctx: ExtensionCommandContext,
+  workflowId: string
+): Promise<string | undefined> {
+  const value = await ctx.ui.input(`Task for ${workflowId}:`, "Describe the work");
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 interface WorkflowProgressState {
