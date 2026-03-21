@@ -20,6 +20,13 @@ A pi package for multi-agent orchestration with agent discovery, resolution, and
 - DAG-based scheduling (sequential + parallel execution)
 - Synthesize results from multiple agents
 
+### Phase 4: Sequential Workflow Execution
+- Execute workflows via `/workflow run` command
+- Use LocalProcessRunner for real execution
+- Sequential execution by default (maxParallelism=1)
+- Clean CLI output with step start/complete logs
+- Persist run artifacts (step results, logs, final output)
+
 ## Built-in Agents
 
 - `planner` - planning and task breakdown
@@ -59,11 +66,21 @@ Run multi-agent workflows.
 
 ### `/workflow`
 
-Inspect available workflows.
+Inspect and execute workflows.
 
 ```bash
-/workflow list
-/workflow show <workflow-id>
+# List available workflows
+/workflow --list
+/workflow -l
+
+# Show workflow details
+/workflow --show plan-implement-review
+/workflow -s parallel-audit
+
+# Run a workflow (Phase 4)
+/workflow run plan-implement-review --task "Implement user authentication"
+/workflow run implement-and-review -t "Fix the login bug" --verbose
+/workflow run quick-review -t "Review this code" --sequential
 ```
 
 ## Built-in Workflows
@@ -138,13 +155,17 @@ const result = await registry.resolveByCapability('code-review');
 ```typescript
 import {
   createOrchestrator,
-  DefaultSessionRunner,
+  LocalProcessRunner,
   PLAN_IMPLEMENT_REVIEW,
   createCustomWorkflow,
 } from 'pi-conductor';
 
-// Using a preset
-const orchestrator = createOrchestrator(registry, new DefaultSessionRunner());
+// Using a preset with LocalProcessRunner (default)
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const orchestrator = createOrchestrator(
+  registry as any,
+  new LocalProcessRunner({ workingDir: process.cwd() })
+);
 const result = await orchestrator.execute(PLAN_IMPLEMENT_REVIEW, userTask);
 
 // Creating custom workflows
@@ -159,6 +180,14 @@ const workflow = createCustomWorkflow('my-workflow', 'My Workflow', {
 });
 
 const result = await orchestrator.execute(workflow, 'User task');
+
+// Force sequential execution
+const orchestrator2 = createOrchestrator(
+  registry as any,
+  new LocalProcessRunner(),
+  undefined, // progress callback
+  { sequential: true }
+);
 ```
 
 ## Installation

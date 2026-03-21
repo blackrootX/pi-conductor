@@ -24,6 +24,8 @@ export interface OrchestratorOptions {
   timeout?: number;
   /** Abort controller for cancellation */
   abortController?: AbortController;
+  /** Force sequential execution (maxParallelism=1) */
+  sequential?: boolean;
 }
 
 export interface OrchestratorProgressCallback {
@@ -52,6 +54,7 @@ export class WorkflowOrchestrator {
   private onProgress?: OrchestratorProgressCallback;
   private timeout?: number;
   private abortController?: AbortController;
+  private sequential?: boolean;
 
   constructor(options: OrchestratorOptions) {
     this.registry = options.registry;
@@ -59,6 +62,7 @@ export class WorkflowOrchestrator {
     this.onProgress = options.onProgress;
     this.timeout = options.timeout;
     this.abortController = options.abortController;
+    this.sequential = options.sequential;
   }
 
   /**
@@ -116,6 +120,8 @@ export class WorkflowOrchestrator {
       {
         timeout: this.timeout,
         abortController: this.abortController,
+        // Force sequential execution if requested
+        maxParallelism: this.sequential ? 1 : undefined,
         onStepPending: (step) => {
           this.onProgress?.({
             type: "step:pending",
@@ -246,12 +252,20 @@ export class WorkflowOrchestrator {
 export function createOrchestrator(
   registry: AgentRegistry,
   runner: SessionRunner,
-  onProgress?: OrchestratorProgressCallback
+  onProgress?: OrchestratorProgressCallback,
+  options?: {
+    timeout?: number;
+    abortController?: AbortController;
+    sequential?: boolean;
+  }
 ): WorkflowOrchestrator {
   return new WorkflowOrchestrator({
     registry,
     runner,
     onProgress,
+    timeout: options?.timeout,
+    abortController: options?.abortController,
+    sequential: options?.sequential,
   });
 }
 

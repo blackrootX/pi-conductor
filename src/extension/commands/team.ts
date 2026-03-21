@@ -4,7 +4,10 @@ import type { AgentRegistry } from "../../registry";
 import type { WorkflowSpec } from "../../workflow/types";
 import { listPresets, getPreset, WORKFLOW_PRESETS } from "../../workflow/presets";
 import { createOrchestrator, formatWorkflowResult } from "../../runtime/orchestrator";
-import { DefaultSessionRunner } from "../../runtime/childSessionRunner";
+import {
+  DefaultSessionRunner,
+  LocalProcessRunner,
+} from "../../runtime/childSessionRunner";
 
 export interface TeamCommandOptions {
   /** Task description */
@@ -19,6 +22,10 @@ export interface TeamCommandOptions {
   verbose?: boolean;
   /** Show help */
   help?: boolean;
+  /** Runner type */
+  runner?: "local-process" | "default";
+  /** Force sequential execution (maxParallelism=1) */
+  sequential?: boolean;
 }
 
 /**
@@ -74,35 +81,49 @@ export async function executeTeamCommand(
   console.log(`📋 Task: ${options.task}`);
   console.log("");
 
-  const runner = new DefaultSessionRunner({
-    onStatusChange: (stepId, status) => {
-      if (status === "running") {
-        process.stdout.write(`  ⏳ Running step...`);
+  const runner =
+    options.runner === "default"
+      ? new DefaultSessionRunner({
+          onStatusChange: (stepId, status) => {
+            if (status === "running") {
+              process.stdout.write(`  ⏳ Running step...`);
+            }
+          },
+        })
+      : new LocalProcessRunner({
+          onStatusChange: (stepId, status) => {
+            if (status === "running") {
+              process.stdout.write(`  ⏳ Running step...`);
+            }
+          },
+        });
+
+  const orchestrator = createOrchestrator(
+    registry,
+    runner,
+    (event) => {
+      switch (event.type) {
+        case "workflow:start":
+          break;
+        case "step:start":
+          console.log(`  ▶ ${event.stepTitle} (${event.agentName})`);
+          break;
+        case "step:complete":
+          if (event.status === "succeeded") {
+            console.log(`  ✓ ${event.summary.slice(0, 60)}${event.summary.length > 60 ? "..." : ""}`);
+          } else {
+            const statusIcon = event.status === "cancelled" ? "⚠" : 
+                              event.status === "timed_out" ? "⏱" : "✗";
+            console.log(`  ${statusIcon} ${event.summary}`);
+          }
+          break;
+        case "workflow:complete":
+          console.log("");
+          break;
       }
     },
-  });
-
-  const orchestrator = createOrchestrator(registry, runner, (event) => {
-    switch (event.type) {
-      case "workflow:start":
-        break;
-      case "step:start":
-        console.log(`  ▶ ${event.stepTitle} (${event.agentName})`);
-        break;
-      case "step:complete":
-        if (event.status === "succeeded") {
-          console.log(`  ✓ ${event.summary.slice(0, 60)}${event.summary.length > 60 ? "..." : ""}`);
-        } else {
-          const statusIcon = event.status === "cancelled" ? "⚠" : 
-                            event.status === "timed_out" ? "⏱" : "✗";
-          console.log(`  ${statusIcon} ${event.summary}`);
-        }
-        break;
-      case "workflow:complete":
-        console.log("");
-        break;
-    }
-  });
+    { sequential: options.sequential }
+  );
 
   const result = await orchestrator.execute(workflow!, options.task);
 
@@ -255,6 +276,12 @@ export function parseTeamCommandArgs(args: string[]): TeamCommandOptions {
       case "-v":
         options.verbose = true;
         break;
+      case "--runner":
+        options.runner = (args[++i] || "local-process") as "local-process" | "default";
+        break;
+      case "--sequential":
+        options.sequential = true;
+        break;
       case "--help":
       case "-h":
         options.help = true;
@@ -281,17 +308,23 @@ Usage:
   /team [options]
 
 Options:
-  -t, --task <text>        Task description (required unless --list or --show)
+  -t, --task <text>         Task description (required unless --list or --show)
   -w, --workflow-id <id>    Specific workflow to use
-  -l, --list               List available workflows
-  -s, --show <id>          Show details of a specific workflow
-  -v, --verbose            Verbose output
-  -h, --help               Show this help
+  -l, --list                List available workflows
+  -s, --show <id>           Show details of a specific workflow
+  -v, --verbose             Verbose output
+  --runner <type>           Runner type: local-process (default) or default
+  --sequential              Force sequential execution (maxParallelism=1)
+  -h, --help                Show this help
 
 Examples:
   /team --list
   /team --show plan-implement-review
   /team --task 'Add user authentication' --workflow-id implement-and-review
   /team 'Fix the login bug'
+  /team --task 'Build feature' --sequential
+
+See Also:
+  /workflow - Alternative workflow runner with explicit workflow selection
 `;
 }

@@ -406,6 +406,11 @@ export class LocalProcessRunner implements SessionRunner {
         clearTimeout(timeoutId);
         signal.removeEventListener("abort", abortHandler);
 
+        await Promise.allSettled([
+          fs.writeFile(path.join(sessionDir, "stdout.log"), stdout, "utf8"),
+          fs.writeFile(path.join(sessionDir, "stderr.log"), stderr, "utf8"),
+        ]);
+
         // Check for cancellation
         if (signal.aborted && !killed) {
           killed = true;
