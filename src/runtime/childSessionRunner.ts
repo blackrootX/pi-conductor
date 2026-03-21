@@ -355,14 +355,20 @@ export class LocalProcessRunner implements SessionRunner {
       // Find the pi CLI executable
       const piCliPath = findPiCli();
 
-      const child = spawn(piCliPath, [
+      const commandArgs = [
         "run",
         "--agent", step.agent.id,
         "--system-prompt", systemPromptPath,
         "--task", taskPromptPath,
         "--output", resultPath,
         "--session-id", sessionId,
-      ], {
+      ];
+
+      if (step.agent.model) {
+        commandArgs.push("--model", step.agent.model);
+      }
+
+      const child = spawn(piCliPath, commandArgs, {
         cwd: sessionDir,
         signal: signal,
         env: {
@@ -370,6 +376,7 @@ export class LocalProcessRunner implements SessionRunner {
           PI_WORKFLOW_SESSION_ID: sessionId,
           PI_WORKFLOW_STEP_ID: step.id,
           PI_WORKFLOW_STEP_TITLE: step.title,
+          ...(step.agent.model ? { PI_WORKFLOW_AGENT_MODEL: step.agent.model } : {}),
         },
       });
 

@@ -9,6 +9,7 @@ import { listPresets, getPreset } from "../../workflow/presets";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
 import { createOrchestrator } from "../../runtime/orchestrator";
+import type { ProgressEvent } from "../../runtime/orchestrator";
 import {
   DefaultSessionRunner,
   LocalProcessRunner,
@@ -23,18 +24,33 @@ export interface WorkflowCommandOptions {
   help?: boolean;
   /** Add a workflow to settings */
   add?: string;
+  /** Remove a workflow from settings */
+  remove?: string;
   /** Run a workflow */
   run?: string;
   /** Task description */
   task?: string;
   /** Runner type */
-  runner?: "local-process" | "default";
+  runner?: "local-process" | "default" | "zellij";
   /** Verbose output */
   verbose?: boolean;
   /** Working directory for run artifacts */
   workingDir?: string;
   /** Force sequential execution (maxParallelism=1) */
   sequential?: boolean;
+  /** Open workflow settings menu */
+  settings?: boolean;
+}
+
+export interface WorkflowCommandObserver {
+  onProgress?: (event: ProgressEvent) => void;
+  onResult?: (result: WorkflowRunResult, durationMs: number) => void;
+}
+
+export interface WorkflowCommandExecution {
+  workflowId: string;
+  result: WorkflowRunResult;
+  durationMs: number;
 }
 
 /**
@@ -42,15 +58,26 @@ export interface WorkflowCommandOptions {
  */
 export async function executeWorkflowCommand(
   options: WorkflowCommandOptions,
-  registry?: AgentRegistry
-): Promise<void> {
+  registry?: AgentRegistry,
+  observer?: WorkflowCommandObserver
+): Promise<WorkflowCommandExecution | void> {
   if (options.help) {
     console.log(getHelpText());
     return;
   }
 
+  if (options.settings) {
+    await showWorkflowSettings();
+    return;
+  }
+
   if (options.add) {
     await addWorkflow(options.add);
+    return;
+  }
+
+  if (options.remove) {
+    await removeWorkflow(options.remove);
     return;
   }
 
@@ -71,15 +98,14 @@ export async function executeWorkflowCommand(
     if (!registry) {
       throw new Error("Agent registry is required to run workflows");
     }
-    await runWorkflow(options.run, options, registry);
-    return;
+    return runWorkflow(options.run, options, registry, observer);
   }
 
   if (!registry) {
     throw new Error("Agent registry is required to run workflows");
   }
 
-  await promptAndRunWorkflow(options, registry);
+  return showWorkflowMenu(options, registry, observer);
 }
 
 /**
@@ -112,6 +138,245 @@ async function listConfiguredWorkflows(): Promise<void> {
       console.log("     Unknown workflow ID in settings");
     }
     console.log("");
+  }
+}
+
+/**
+ * Show the main workflow menu.
+ */
+async function showWorkflowMenu(
+  options: WorkflowCommandOptions,
+  registry: AgentRegistry,
+  observer?: WorkflowCommandObserver
+): Promise<WorkflowCommandExecution | void> {
+  const rl = createInterface({ input, output });
+
+  try {
+    while (true) {
+      console.log("\n╔════════════════════════════════════════╗");
+      console.log("║           Workflow Menu                ║");
+      console.log("╠════════════════════════════════════════╣");
+      console.log("║  1. Run workflow                       ║");
+      console.log("║  2. List workflows                    ║");
+      console.log("║  3. Add workflow                       ║");
+      console.log("║  4. Remove workflow                    ║");
+      console.log("║  5. Settings                           ║");
+      console.log("║  0. Exit                              ║");
+      console.log("╚════════════════════════════════════════╝");
+      console.log("");
+
+      const choice = (await rl.question("Select option: ")).trim();
+
+      switch (choice) {
+        case "1":
+          return promptAndRunWorkflow(options, registry, observer);
+        case "2":
+          await listConfiguredWorkflows();
+          break;
+        case "3":
+          const addId = (await rl.question("Enter workflow ID to add: ")).trim();
+          if (addId) {
+            await addWorkflow(addId);
+          }
+          break;
+        case "4":
+          const removeId = (await rl.question("Enter workflow ID to remove: ")).trim();
+          if (removeId) {
+            await removeWorkflow(removeId);
+          }
+          break;
+        case "5":
+          await showWorkflowSettings();
+          break;
+        case "0":
+        case "exit":
+        case "q":
+          console.log("Goodbye!");
+          return;
+        default:
+          console.log("Invalid option. Please try again.");
+      }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Show workflow settings menu.
+ */
+async function showWorkflowSettings(): Promise<void> {
+  const rl = createInterface({ input, output });
+
+  try {
+    const context = await getWorkflowSettingsContext();
+    const settings: EffectiveWorkflowSettings = { ...context.settings };
+    let saveScope: SettingsScope = context.scope;
+
+    while (true) {
+      console.log("\n╔═══════════════════════════════════════════════╗");
+      console.log("║              Workflow Settings               ║");
+      console.log("╠═══════════════════════════════════════════════╣");
+      console.log(`║  1. Multiplexer: ${padRight(settings.conductorWorkflowMultiplexer, 25)}║`);
+      console.log(`║  2. Display:    ${padRight(settings.conductorWorkflowDisplay, 25)}║`);
+      console.log(`║  3. Save scope: ${padRight(saveScope, 25)}║`);
+      console.log("║  4. Configured workflows                    ║");
+      console.log("║  5. Save & Exit                             ║");
+      console.log("║  0. Cancel                                  ║");
+      console.log("╚═══════════════════════════════════════════════╝");
+      console.log("");
+
+      const choice = (await rl.question("Select setting to modify: ")).trim();
+
+      switch (choice) {
+        case "1":
+          settings.conductorWorkflowMultiplexer = await selectMultiplexer(rl);
+          break;
+        case "2":
+          if (settings.conductorWorkflowMultiplexer === "none") {
+            console.log("\n⚠ Display strategy only applies when multiplexer is 'zellij'.");
+          } else {
+            settings.conductorWorkflowDisplay = await selectDisplayStrategy(rl);
+          }
+          break;
+        case "3":
+          saveScope = await selectSettingsScope(rl, saveScope);
+          break;
+        case "4":
+          await listConfiguredWorkflows();
+          break;
+        case "5":
+          await saveWorkflowSettings(settings, saveScope);
+          console.log("\n✓ Settings saved.");
+          return;
+        case "0":
+        case "cancel":
+        case "q":
+          console.log("\nSettings discarded.");
+          return;
+        default:
+          console.log("Invalid option. Please try again.");
+      }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+function padRight(str: string, length: number): string {
+  return str.padEnd(length);
+}
+
+async function selectMultiplexer(rl: ReturnType<typeof createInterface>): Promise<WorkflowMultiplexer> {
+  console.log("\n╔════════════════════════════════════════╗");
+  console.log("║         Select Multiplexer             ║");
+  console.log("╠════════════════════════════════════════╣");
+  console.log("║  1. none                                ║");
+  console.log("║  2. zellij                               ║");
+  console.log("╚════════════════════════════════════════╝");
+  console.log("");
+
+  while (true) {
+    const choice = (await rl.question("Select multiplexer (1-2): ")).trim();
+    switch (choice) {
+      case "1":
+      case "none":
+        return "none";
+      case "2":
+      case "zellij":
+        // Check if zellij is available
+        const available = await isZellijAvailable();
+        if (!available) {
+          console.log("\n⚠ Zellij is not installed or not in PATH.");
+          console.log("  Falling back to 'none'.");
+          return "none";
+        }
+        return "zellij";
+      default:
+        console.log("Invalid choice. Please enter 1 or 2.");
+    }
+  }
+}
+
+async function selectDisplayStrategy(rl: ReturnType<typeof createInterface>): Promise<WorkflowDisplayStrategy> {
+  console.log("\n╔════════════════════════════════════════╗");
+  console.log("║       Select Display Strategy         ║");
+  console.log("╠════════════════════════════════════════╣");
+  console.log("║  1. main-window                        ║");
+  console.log("║  2. split-pane                        ║");
+  console.log("╚════════════════════════════════════════╝");
+  console.log("");
+
+  while (true) {
+    const choice = (await rl.question("Select display strategy (1-2): ")).trim();
+    switch (choice) {
+      case "1":
+      case "main-window":
+        return "main-window";
+      case "2":
+      case "split-pane":
+        return "split-pane";
+      default:
+        console.log("Invalid choice. Please enter 1 or 2.");
+    }
+  }
+}
+
+async function selectSettingsScope(
+  rl: ReturnType<typeof createInterface>,
+  currentScope: SettingsScope
+): Promise<SettingsScope> {
+  console.log("\n╔════════════════════════════════════════╗");
+  console.log("║          Select Save Scope            ║");
+  console.log("╠════════════════════════════════════════╣");
+  console.log(`║  1. project${currentScope === "project" ? " (current)" : ""}${" ".repeat(currentScope === "project" ? 20 : 30)}║`);
+  console.log(`║  2. user${currentScope === "user" ? " (current)" : ""}${" ".repeat(currentScope === "user" ? 23 : 33)}║`);
+  console.log("╚════════════════════════════════════════╝");
+  console.log("");
+
+  while (true) {
+    const choice = (await rl.question("Save to scope (1-2): ")).trim();
+    switch (choice) {
+      case "1":
+      case "project":
+        return "project";
+      case "2":
+      case "user":
+        return "user";
+      default:
+        console.log("Invalid choice. Please enter 1 or 2.");
+    }
+  }
+}
+
+async function saveWorkflowSettings(
+  settings: EffectiveWorkflowSettings,
+  scope: SettingsScope,
+  cwd = process.cwd()
+): Promise<void> {
+  const settingsPath = scope === "project"
+    ? getProjectSettingsPath(cwd)
+    : getUserSettingsPath();
+  const existingSettings = await readRawSettingsFile(settingsPath);
+
+  const newSettings: WorkflowSettings = {
+    ...existingSettings,
+    conductorWorkflow: settings.conductorWorkflow,
+    conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer,
+    conductorWorkflowDisplay: settings.conductorWorkflowDisplay,
+  };
+
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.writeFile(settingsPath, JSON.stringify(newSettings, null, 2) + "\n", "utf8");
+}
+
+async function isZellijAvailable(): Promise<boolean> {
+  const { execSync } = await import("node:child_process");
+  try {
+    execSync("command -v zellij", { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -168,8 +433,9 @@ function getStepTargetDescription(step: WorkflowSpec["steps"][0]): string {
 
 async function promptAndRunWorkflow(
   options: WorkflowCommandOptions,
-  registry: AgentRegistry
-): Promise<void> {
+  registry: AgentRegistry,
+  observer?: WorkflowCommandObserver
+): Promise<WorkflowCommandExecution | void> {
   const configured = await getConfiguredWorkflowIds();
 
   if (configured.length === 0) {
@@ -212,7 +478,7 @@ async function promptAndRunWorkflow(
       throw new Error("Task is required");
     }
 
-    await runWorkflow(workflowId, { ...options, task }, registry);
+    return runWorkflow(workflowId, { ...options, task }, registry, observer);
   } finally {
     rl.close();
   }
@@ -287,6 +553,26 @@ async function addWorkflow(workflowId: string): Promise<void> {
   console.log(`Added workflow: ${preset.id}`);
 }
 
+async function removeWorkflow(workflowId: string): Promise<void> {
+  const normalizedWorkflowId = resolveWorkflowIdForAdd(workflowId);
+  if (!normalizedWorkflowId) {
+    throw new Error(`Unknown workflow: ${workflowId}`);
+  }
+
+  const settings = await readWorkflowSettings();
+  const configured = settings.conductorWorkflow ?? [];
+
+  if (!configured.includes(normalizedWorkflowId)) {
+    console.log(`Workflow not configured: ${normalizedWorkflowId}`);
+    return;
+  }
+
+  settings.conductorWorkflow = configured.filter((id) => id !== normalizedWorkflowId);
+  await writeWorkflowSettings(settings);
+
+  console.log(`Removed workflow: ${normalizedWorkflowId}`);
+}
+
 function resolveWorkflowIdForAdd(inputId: string): string | undefined {
   const presets = listPresets();
   const exact = presets.find((preset) => preset.id === inputId);
@@ -318,30 +604,126 @@ function dedupeSuggestions(values: string[]): string[] {
 
 interface WorkflowSettings {
   conductorWorkflow?: string[];
+  conductorWorkflowMultiplexer?: WorkflowMultiplexer;
+  conductorWorkflowDisplay?: WorkflowDisplayStrategy;
 }
 
-function getSettingsPath(): string {
+type WorkflowMultiplexer = "none" | "zellij";
+type WorkflowDisplayStrategy = "main-window" | "split-pane";
+type SettingsScope = "project" | "user";
+
+interface EffectiveWorkflowSettings {
+  conductorWorkflow: string[];
+  conductorWorkflowMultiplexer: WorkflowMultiplexer;
+  conductorWorkflowDisplay: WorkflowDisplayStrategy;
+}
+
+function getUserSettingsPath(): string {
   return path.join(os.homedir(), ".pi", "agent", "settings.json");
 }
 
-async function readWorkflowSettings(): Promise<WorkflowSettings> {
-  const settingsPath = getSettingsPath();
+function getProjectSettingsPath(cwd = process.cwd()): string {
+  return path.join(cwd, ".pi", "agent", "settings.json");
+}
 
+async function readRawSettingsFile(settingsPath: string): Promise<Record<string, unknown>> {
   try {
     const content = await fs.readFile(settingsPath, "utf8");
-    const parsed = JSON.parse(content) as WorkflowSettings;
-    return {
-      conductorWorkflow: Array.isArray(parsed.conductorWorkflow)
-        ? parsed.conductorWorkflow.filter((entry): entry is string => typeof entry === "string")
-        : [],
-    };
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
   } catch {
-    return { conductorWorkflow: [] };
+    return {};
   }
 }
 
-async function writeWorkflowSettings(settings: WorkflowSettings): Promise<void> {
-  const settingsPath = getSettingsPath();
+async function readWorkflowSettingsFromFile(settingsPath: string): Promise<WorkflowSettings> {
+  const parsed = await readRawSettingsFile(settingsPath);
+  return {
+    conductorWorkflow: Array.isArray(parsed.conductorWorkflow)
+      ? parsed.conductorWorkflow.filter((entry): entry is string => typeof entry === "string")
+      : undefined,
+    conductorWorkflowMultiplexer: parsed.conductorWorkflowMultiplexer === undefined
+      ? undefined
+      : parseMultiplexer(parsed.conductorWorkflowMultiplexer),
+    conductorWorkflowDisplay: parsed.conductorWorkflowDisplay === undefined
+      ? undefined
+      : parseDisplayStrategy(parsed.conductorWorkflowDisplay),
+  };
+}
+
+function parseMultiplexer(value: unknown): WorkflowMultiplexer {
+  if (value === "zellij") return "zellij";
+  return "none";
+}
+
+function parseDisplayStrategy(value: unknown): WorkflowDisplayStrategy {
+  if (value === "split-pane") return "split-pane";
+  return "main-window";
+}
+
+async function readWorkflowSettings(cwd = process.cwd()): Promise<WorkflowSettings> {
+  const projectSettings = await readWorkflowSettingsFromFile(getProjectSettingsPath(cwd));
+
+  const hasProjectSettings = hasExplicitWorkflowSettings(projectSettings);
+
+  if (hasProjectSettings) {
+    return projectSettings;
+  }
+
+  return readWorkflowSettingsFromFile(getUserSettingsPath());
+}
+
+function hasExplicitWorkflowSettings(settings: WorkflowSettings): boolean {
+  return (
+    settings.conductorWorkflow !== undefined ||
+    settings.conductorWorkflowMultiplexer !== undefined ||
+    settings.conductorWorkflowDisplay !== undefined
+  );
+}
+
+async function getEffectiveWorkflowSettings(cwd = process.cwd()): Promise<EffectiveWorkflowSettings> {
+  const settings = await readWorkflowSettings(cwd);
+  return {
+    conductorWorkflow: settings.conductorWorkflow ?? [],
+    conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer ?? "none",
+    conductorWorkflowDisplay: settings.conductorWorkflowDisplay ?? "main-window",
+  };
+}
+
+async function getWorkflowSettingsContext(
+  cwd = process.cwd()
+): Promise<{ settings: EffectiveWorkflowSettings; scope: SettingsScope }> {
+  const projectSettings = await readWorkflowSettingsFromFile(getProjectSettingsPath(cwd));
+  if (hasExplicitWorkflowSettings(projectSettings)) {
+    return {
+      settings: {
+        conductorWorkflow: projectSettings.conductorWorkflow ?? [],
+        conductorWorkflowMultiplexer: projectSettings.conductorWorkflowMultiplexer ?? "none",
+        conductorWorkflowDisplay: projectSettings.conductorWorkflowDisplay ?? "main-window",
+      },
+      scope: "project",
+    };
+  }
+
+  const userSettings = await readWorkflowSettingsFromFile(getUserSettingsPath());
+  return {
+    settings: {
+      conductorWorkflow: userSettings.conductorWorkflow ?? [],
+      conductorWorkflowMultiplexer: userSettings.conductorWorkflowMultiplexer ?? "none",
+      conductorWorkflowDisplay: userSettings.conductorWorkflowDisplay ?? "main-window",
+    },
+    scope: hasExplicitWorkflowSettings(userSettings) ? "user" : "project",
+  };
+}
+
+async function writeWorkflowSettings(
+  settings: WorkflowSettings,
+  scope: "project" | "user" = "project",
+  cwd = process.cwd()
+): Promise<void> {
+  const settingsPath = scope === "project"
+    ? getProjectSettingsPath(cwd)
+    : getUserSettingsPath();
   await fs.mkdir(path.dirname(settingsPath), { recursive: true });
   await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
 }
@@ -349,6 +731,146 @@ async function writeWorkflowSettings(settings: WorkflowSettings): Promise<void> 
 async function getConfiguredWorkflowIds(): Promise<string[]> {
   const settings = await readWorkflowSettings();
   return settings.conductorWorkflow ?? [];
+}
+
+async function getConfiguredWorkflows(): Promise<Array<{ id: string; name: string; description?: string }>> {
+  const ids = await getConfiguredWorkflowIds();
+  return ids.map((id) => {
+    const preset = getPreset(id);
+    return {
+      id,
+      name: preset?.name ?? id,
+      description: preset?.description,
+    };
+  });
+}
+
+// ============================================================================
+// Runner Selection
+// ============================================================================
+
+interface RunnerInfo {
+  runner: import("../../runtime/childSessionRunner").SessionRunner;
+  name: string;
+}
+
+async function determineRunner(
+  cliRunner: WorkflowCommandOptions["runner"],
+  effectiveSettings: EffectiveWorkflowSettings,
+  runDir: string,
+  workingDir: string,
+  options: WorkflowCommandOptions
+): Promise<RunnerInfo> {
+  // Check if explicitly specified via CLI
+  if (cliRunner === "local-process") {
+    return {
+      runner: createLocalProcessRunner(workingDir, options.verbose),
+      name: "local-process",
+    };
+  }
+
+  if (cliRunner === "default") {
+    return {
+      runner: createDefaultSessionRunner(workingDir, options.verbose),
+      name: "default",
+    };
+  }
+
+  // CLI can force zellij mode
+  if (cliRunner === "zellij" || effectiveSettings.conductorWorkflowMultiplexer === "zellij") {
+    return createZellijRunner(
+      effectiveSettings,
+      runDir,
+      workingDir,
+      options.verbose
+    );
+  }
+
+  // Default to local-process
+  return {
+    runner: createLocalProcessRunner(workingDir, options.verbose),
+    name: "local-process",
+  };
+}
+
+function createLocalProcessRunner(workingDir: string, verbose?: boolean) {
+  return new LocalProcessRunner({
+    workingDir,
+    onStatusChange: (stepId, status) => {
+      if (verbose) {
+        console.log(`  [${status}] ${stepId}`);
+      }
+    },
+  });
+}
+
+function createDefaultSessionRunner(workingDir: string, verbose?: boolean) {
+  return new DefaultSessionRunner({
+    workingDir,
+    writeResultsToDisk: true,
+    onStatusChange: (stepId, status) => {
+      if (verbose) {
+        console.log(`  [${status}] ${stepId}`);
+      }
+    },
+  });
+}
+
+async function createZellijRunner(
+  effectiveSettings: EffectiveWorkflowSettings,
+  runDir: string,
+  workingDir: string,
+  verbose?: boolean
+): Promise<RunnerInfo> {
+  const inZellij = Boolean(process.env.ZELLIJ);
+  const zellijAvailable = await isZellijAvailable();
+
+  if (!zellijAvailable) {
+    console.warn("\n⚠ Zellij not available, falling back to local-process runner.");
+    return {
+      runner: createLocalProcessRunner(workingDir, verbose),
+      name: "local-process (zellij unavailable)",
+    };
+  }
+
+  if (inZellij) {
+    console.log("\n🟢 Running inside Zellij session");
+    console.log(`   Display strategy: ${effectiveSettings.conductorWorkflowDisplay}`);
+
+    // Inside Zellij: use current session with configured display strategy
+    const { ZellijRunner } = await import("../../runtime/zellijRunner");
+    return {
+      runner: new ZellijRunner({
+        workingDir,
+        displayStrategy: effectiveSettings.conductorWorkflowDisplay,
+        inZellijSession: true,
+        onStatusChange: (stepId, status) => {
+          if (verbose) {
+            console.log(`  [${status}] ${stepId}`);
+          }
+        },
+      }),
+      name: `zellij (${effectiveSettings.conductorWorkflowDisplay})`,
+    };
+  } else {
+    console.log("\n🔵 Starting detached Zellij session for workflow");
+
+    // Outside Zellij: create detached session
+    const { ZellijRunner } = await import("../../runtime/zellijRunner");
+    return {
+      runner: new ZellijRunner({
+        workingDir,
+        displayStrategy: effectiveSettings.conductorWorkflowDisplay,
+        inZellijSession: false,
+        onStatusChange: (stepId, status) => {
+          if (verbose) {
+            console.log(`  [${status}] ${stepId}`);
+          }
+        },
+      }),
+      name: `zellij (detached ${effectiveSettings.conductorWorkflowDisplay})`,
+    };
+  }
 }
 
 // ============================================================================
@@ -361,8 +883,9 @@ async function getConfiguredWorkflowIds(): Promise<string[]> {
 async function runWorkflow(
   workflowId: string,
   options: WorkflowCommandOptions,
-  registry: AgentRegistry
-): Promise<void> {
+  registry: AgentRegistry,
+  observer?: WorkflowCommandObserver
+): Promise<WorkflowCommandExecution> {
   const workflow = getPreset(workflowId);
 
   if (!workflow) {
@@ -377,8 +900,8 @@ async function runWorkflow(
     throw new Error("Usage: /workflow run <id> --task 'your task'");
   }
 
-  // Determine runner type
-  const useLocalProcess = options.runner === "local-process" || !options.runner;
+  // Get effective settings
+  const effectiveSettings = await getEffectiveWorkflowSettings();
   const sequential = options.sequential ?? true;
 
   // Determine working directory
@@ -388,41 +911,31 @@ async function runWorkflow(
   const runId = `run-${Date.now()}`;
   const runDir = path.join(workingDir, ".pi", "workflows", "runs", runId);
 
+  // Determine runner type from settings and CLI options
+  const runnerInfo = await determineRunner(
+    options.runner,
+    effectiveSettings,
+    runDir,
+    workingDir,
+    options
+  );
+
   // Print workflow start
   console.log("\n" + "═".repeat(60));
   console.log(`🚀 WORKFLOW: ${workflow.name}`);
   console.log("═".repeat(60));
   console.log(`📋 Task: ${options.task}`);
-  console.log(`🔧 Runner: ${useLocalProcess ? "local-process" : "default"}`);
+  console.log(`🔧 Runner: ${runnerInfo.name}`);
   console.log(`📊 Mode: ${sequential ? "sequential (maxParallelism=1)" : "workflow default"}`);
   console.log(`📁 Run ID: ${runId}`);
   console.log("");
 
-  // Create runner
-  const runner = useLocalProcess
-    ? new LocalProcessRunner({
-        workingDir,
-        onStatusChange: (stepId, status) => {
-          if (options.verbose) {
-            console.log(`  [${status}] ${stepId}`);
-          }
-        },
-      })
-    : new DefaultSessionRunner({
-        workingDir,
-        writeResultsToDisk: true,
-        onStatusChange: (stepId, status) => {
-          if (options.verbose) {
-            console.log(`  [${status}] ${stepId}`);
-          }
-        },
-      });
-
   // Create orchestrator with progress callbacks
   const orchestrator = createOrchestrator(
     registry,
-    runner,
+    runnerInfo.runner,
     (event) => {
+      observer?.onProgress?.(event);
       switch (event.type) {
         case "workflow:start":
           console.log("▶ Starting workflow execution...\n");
@@ -488,6 +1001,7 @@ async function runWorkflow(
 
   // Print final result
   printWorkflowResult(result, duration);
+  observer?.onResult?.(result, duration);
 
   // Persist run artifacts
   await persistRunArtifacts(runDir, runId, result, workflow, workingDir);
@@ -496,6 +1010,12 @@ async function runWorkflow(
   if (result.status === "failed" || result.status === "aborted" || result.status === "timed_out") {
     throw new Error(result.error || "Workflow execution failed");
   }
+
+  return {
+    workflowId,
+    result,
+    durationMs: duration,
+  };
 }
 
 /**
@@ -702,6 +1222,9 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "add":
         options.add = args[++i] || undefined;
         break;
+      case "remove":
+        options.remove = args[++i] || undefined;
+        break;
       case "run":
         options.run = args[++i] || undefined;
         break;
@@ -718,7 +1241,7 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
         options.task = args[++i] || undefined;
         break;
       case "--runner":
-        options.runner = (args[++i] || "local-process") as "local-process" | "default";
+        options.runner = (args[++i] || "local-process") as "local-process" | "default" | "zellij";
         break;
       case "--verbose":
       case "-v":
@@ -731,13 +1254,16 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "-d":
         options.workingDir = args[++i] || undefined;
         break;
+      case "--settings":
+        options.settings = true;
+        break;
       case "--help":
       case "-h":
         options.help = true;
         break;
       default:
         if (!arg.startsWith("-")) {
-          if (!options.show && !options.run && !options.add && !options.task) {
+          if (!options.show && !options.run && !options.add && !options.remove && !options.task) {
             options.task = arg;
           }
         }
@@ -758,20 +1284,36 @@ Usage:
   /workflow [options]
   /workflow run <id> [options]
   /workflow add <id>
+  /workflow remove <id>
+
+Interactive Menu:
+  /workflow               Opens interactive menu for workflow management
 
 Subcommands:
   run <id>                Run a workflow with the given ID
-  add <id>                Add a workflow to ~/.pi/agent/settings.json
+  add <id>                Add a workflow to project settings
+  remove <id>             Remove a workflow from project settings
+  settings                Open workflow settings menu
 
 Options:
   -l, --list              List configured workflows
   -s, --show <id>         Show details of a specific workflow
   -t, --task <text>       Task description for workflow execution
-  --runner <type>         Runner type: local-process (default) or default
+  --runner <type>         Runner type: local-process (default), default, or zellij
+  --settings              Open workflow settings menu
   -v, --verbose           Verbose output
   --sequential            Explicitly request sequential execution (default)
   -d, --working-dir <dir> Working directory for run artifacts
   -h, --help              Show this help
+
+Settings:
+  Workflow settings are stored in .pi/agent/settings.json in the project
+  directory (with fallback to ~/.pi/agent/settings.json).
+
+  Supported settings:
+    conductorWorkflow           Array of configured workflow IDs
+    conductorWorkflowMultiplexer  "none" (default) or "zellij"
+    conductorWorkflowDisplay      "main-window" or "split-pane" (zellij only)
 
 Examples:
   # Add workflows to settings
@@ -781,22 +1323,29 @@ Examples:
   # List configured workflows
   /workflow --list
 
-  # Prompt for workflow, then prompt for task
+  # Open interactive menu
   /workflow
+
+  # Open settings menu
+  /workflow settings
 
   # Show workflow details
   /workflow --show plan-implement-review
 
-  # Run a workflow
+  # Run a workflow (uses settings to determine runner)
   /workflow run plan-implement-review --task 'Add user authentication'
 
   # Run with verbose output
   /workflow run implement-and-review -t 'Fix the login bug' --verbose
+
+  # Run in Zellij mode explicitly
+  /workflow run plan-implement-review -t 'Build feature' --runner zellij
 
   # Sequential execution is the default for /workflow run
   /workflow run plan-implement-review -t 'Build feature'
 
 See Also:
   /team - Alternative workflow runner with auto-selection
+  Zellij integration requires 'zellij' to be installed and in PATH.
 `;
 }

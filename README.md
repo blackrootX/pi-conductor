@@ -4,28 +4,35 @@ A pi package for multi-agent orchestration with agent discovery, resolution, and
 
 ## Features
 
-### Phase 1: Agent Parsing
+### Agent Parsing
 - Parse and normalize agent files from markdown with YAML frontmatter
 - Validate required fields and data types
 
-### Phase 2: Agent Registry
+### Agent Registry
 - Discover agents from multiple sources (project, user, built-in)
 - Resolve agents by ID, role, or capability
 - Handle precedence and overrides between sources
 - Track diagnostics and errors
 
-### Phase 3: Workflow Runtime
+### Workflow Runtime
 - Define and execute multi-agent workflows
 - Built-in workflow presets for common patterns
 - DAG-based scheduling (sequential + parallel execution)
 - Synthesize results from multiple agents
 
-### Phase 4: Sequential Workflow Execution
+### Workflow Execution
 - Execute workflows via `/workflow run` command
 - Use LocalProcessRunner for real execution
 - Sequential execution by default (maxParallelism=1)
 - Clean CLI output with step start/complete logs
 - Persist run artifacts (step results, logs, final output)
+
+### Workflow Command
+- Interactive `/workflow` menu for workflow selection and management
+- `/workflow settings` command for configuring workflow preferences
+- Zellij multiplexer support for visible workflow execution
+- Project and user settings with project override precedence
+- Structured workflow updates in the main Pi session via status, widget, and workflow messages
 
 ## Built-in Agents
 
@@ -66,9 +73,12 @@ Run multi-agent workflows.
 
 ### `/workflow`
 
-Inspect and execute workflows.
+Inspect and execute workflows with interactive menu and settings.
 
 ```bash
+# Interactive menu
+/workflow
+
 # List available workflows
 /workflow --list
 /workflow -l
@@ -77,11 +87,26 @@ Inspect and execute workflows.
 /workflow --show plan-implement-review
 /workflow -s parallel-audit
 
-# Run a workflow (Phase 4)
+# Run a workflow
 /workflow run plan-implement-review --task "Implement user authentication"
 /workflow run implement-and-review -t "Fix the login bug" --verbose
 /workflow run quick-review -t "Review this code"
+
+# Manage configured workflows
+/workflow add plan-implement-review
+/workflow remove quick-review
+
+# Open settings menu
+/workflow settings
 ```
+
+When run from Pi with this extension loaded, `/workflow` reports progress in the main Pi UI:
+- footer status updates while steps run
+- a workflow widget showing running and recently completed steps
+- one workflow message per completed step
+- one final workflow result message when the run finishes
+
+If Zellij is enabled, step execution is visible there as well. Zellij shows the live subprocesses; the main Pi session shows structured summaries.
 
 ## Built-in Workflows
 
@@ -92,6 +117,47 @@ Inspect and execute workflows.
 | `implement-and-review` | Simple: implement → review | coder → reviewer |
 | `research-and-write` | Research then write | task-analysis → coder |
 | `quick-review` | Single-agent quick review | reviewer |
+
+## Workflow Settings
+
+Workflow settings are stored in `.pi/agent/settings.json` (project) with fallback to `~/.pi/agent/settings.json` (user).
+
+### Settings File
+
+```json
+{
+  "conductorWorkflow": ["plan-implement-review", "quick-review"],
+  "conductorWorkflowMultiplexer": "none",
+  "conductorWorkflowDisplay": "main-window"
+}
+```
+
+### Settings Keys
+
+| Key | Values | Description |
+|-----|--------|-------------|
+| `conductorWorkflow` | Array of workflow IDs | Ordered list of configured workflows (first is default) |
+| `conductorWorkflowMultiplexer` | `"none"` (default), `"zellij"` | Backend for workflow execution |
+| `conductorWorkflowDisplay` | `"main-window"`, `"split-pane"` | Display strategy (only when multiplexer is `"zellij"`) |
+
+### Multiplexer Modes
+
+- **`none`**: Default mode. Workflows execute in background using LocalProcessRunner.
+- **`zellij`**: Visible mode. Workflow steps run in Zellij sessions/panes.
+
+### Zellij Display Strategies
+
+- **`main-window`**: Preferred primary workflow view when already inside Zellij.
+- **`split-pane`**: Preferred side-by-side workflow view when already inside Zellij.
+
+Outside Zellij, both display strategies fall back to starting a detached Zellij session and printing attach instructions. Split panes are only created when Pi is already running inside Zellij.
+
+### Settings Precedence
+
+1. Project settings (`.pi/agent/settings.json` in project root)
+2. User settings (`~/.pi/agent/settings.json`)
+
+Project settings override user settings when a key is present.
 
 ## Agent Format
 
@@ -156,6 +222,7 @@ const result = await registry.resolveByCapability('code-review');
 import {
   createOrchestrator,
   LocalProcessRunner,
+  ZellijRunner,
   PLAN_IMPLEMENT_REVIEW,
   createCustomWorkflow,
 } from 'pi-conductor';
@@ -167,6 +234,16 @@ const orchestrator = createOrchestrator(
   new LocalProcessRunner({ workingDir: process.cwd() })
 );
 const result = await orchestrator.execute(PLAN_IMPLEMENT_REVIEW, userTask);
+
+// Using ZellijRunner for visible execution
+const zellijRunner = new ZellijRunner({
+  workingDir: process.cwd(),
+  displayStrategy: 'main-window',
+  inZellijSession: Boolean(process.env.ZELLIJ),
+});
+
+const zellijOrchestrator = createOrchestrator(registry as any, zellijRunner);
+const zellijResult = await zellijOrchestrator.execute(PLAN_IMPLEMENT_REVIEW, userTask);
 
 // Creating custom workflows
 const workflow = createCustomWorkflow('my-workflow', 'My Workflow', {

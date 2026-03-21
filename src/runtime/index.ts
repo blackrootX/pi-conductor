@@ -5,3 +5,4 @@ export * from "./childSessionRunner";
 export * from "./scheduler";
 export * from "./synthesizer";
 export * from "./orchestrator";
+export * from "./zellijRunner";
