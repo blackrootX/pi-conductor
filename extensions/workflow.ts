@@ -1,7 +1,7 @@
 // extensions/workflow.ts - Workflow command extension for pi
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import {
   cleanupWorkflowStorage,
   executeWorkflowCommand,
@@ -494,6 +494,13 @@ async function promptForTask(
 interface WorkflowProgressState {
   workflowId?: string;
   workflowName?: string;
+  workflowSteps: Array<{
+    stepId: string;
+    title: string;
+    agentName: string;
+    status: "pending" | "running" | StepResultEnvelope["status"];
+    summary?: string;
+  }>;
   approvalPending?: {
     stepId: string;
     stepTitle: string;
@@ -512,6 +519,7 @@ interface WorkflowProgressState {
 
 function createProgressState(): WorkflowProgressState {
   return {
+    workflowSteps: [],
     runningSteps: new Map(),
     completedSteps: [],
   };
@@ -527,10 +535,16 @@ function updateWorkflowUi(
       state.workflowId = event.workflowId;
       state.workflowName = event.workflowName;
       ctx.ui.setStatus("workflow", `Workflow ${event.workflowName} starting`);
-      ctx.ui.setWidget("workflow", [
-        `Workflow: ${event.workflowName}`,
-        "Status: starting",
-      ]);
+      ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
+      break;
+    case "workflow:resolve":
+      state.workflowSteps = event.steps.map((step) => ({
+        stepId: step.id,
+        title: step.title,
+        agentName: step.agent.name,
+        status: "pending",
+      }));
+      ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
       break;
     case "step:start":
       state.approvalPending = undefined;
@@ -539,6 +553,11 @@ function updateWorkflowUi(
         title: event.stepTitle,
         agentName: event.agentName,
         sessionId: event.sessionId,
+      });
+      updateWorkflowStepState(state, event.stepId, {
+        status: "running",
+        title: event.stepTitle,
+        agentName: event.agentName,
       });
       ctx.ui.setStatus("workflow", `Running ${event.stepTitle} (${event.agentName})`);
       ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
@@ -581,6 +600,10 @@ function updateWorkflowUi(
         title: running?.title,
         agentName: running?.agentName,
         sessionId: running?.sessionId,
+        status: event.status,
+        summary: event.summary,
+      });
+      updateWorkflowStepState(state, event.stepId, {
         status: event.status,
         summary: event.summary,
       });
@@ -660,14 +683,21 @@ function updateWorkflowResultUi(
 ): void {
   const statusText = `${result.workflowName}: ${result.status} in ${formatDuration(durationMs)}`;
   ctx.ui.setStatus("workflow", statusText);
-  ctx.ui.setWidget("workflow", [
-    `Workflow: ${result.workflowName}`,
-    `Status: ${result.status}`,
-    `Run ID: ${result.runId}`,
-    `Duration: ${formatDuration(durationMs)}`,
-    `Steps: ${Object.keys(result.stepResults).length}`,
-    result.summary ? `Summary: ${result.summary}` : "Summary: n/a",
-  ]);
+  for (const [stepId, stepResult] of Object.entries(result.stepResults)) {
+    updateWorkflowStepState(state, stepId, {
+      status: stepResult.status,
+      title: stepResult.stepTitle,
+      agentName: stepResult.agentName,
+      summary: stepResult.summary,
+    });
+  }
+  ctx.ui.setWidget("workflow", buildWorkflowWidget(state, {
+    footer: [
+      `Run ID: ${result.runId}`,
+      `Duration: ${formatDuration(durationMs)}`,
+      result.summary ? `Summary: ${result.summary}` : "Summary: n/a",
+    ],
+  }));
   state.runningSteps.clear();
   ctx.ui.setWidget("workflow-approval", []);
 }
@@ -689,48 +719,29 @@ function finalizeWorkflowUi(
     `Duration: ${formatDuration(execution.durationMs)}`,
     `Completed steps: ${state.completedSteps.length}`,
   ];
-  ctx.ui.setWidget("workflow", widgetLines);
+  ctx.ui.setWidget("workflow", buildWorkflowWidget(state, { footer: widgetLines.slice(2) }));
 }
 
-function buildWorkflowWidget(state: WorkflowProgressState): string[] {
-  const lines = [
-    `Workflow: ${state.workflowName ?? state.workflowId ?? "workflow"}`,
-    `Running: ${state.runningSteps.size}  Completed: ${state.completedSteps.length}`,
-  ];
+function buildWorkflowWidget(
+  state: WorkflowProgressState,
+  options?: { footer?: string[] }
+) {
+  return (_tui: unknown, theme: ExtensionCommandContext["ui"]["theme"]) => {
+    const text = new Text("", 0, 1);
 
-  if (state.approvalPending) {
-    lines.push(`Approval pending: ${state.approvalPending.stepTitle} (${state.approvalPending.agentName})`);
-  }
-
-  const cards: string[] = [];
-
-  for (const [stepId, step] of state.runningSteps.entries()) {
-    cards.push(
-      ...formatWorkflowCard({
-        title: step.title ?? stepId,
-        subtitle: step.agentName ?? "agent",
-        status: "running",
-      })
-    );
-  }
-
-  for (const step of state.completedSteps.slice(-4)) {
-    cards.push(
-      ...formatWorkflowCard({
-        title: step.title ?? step.stepId,
-        subtitle: step.agentName ?? "agent",
-        status: step.status,
-        summary: step.summary,
-      })
-    );
-  }
-
-  if (cards.length === 0) {
-    lines.push("No active step cards yet.");
-    return lines;
-  }
-
-  return [...lines, ...cards];
+    return {
+      render(width: number): string[] {
+        const header = buildWorkflowWidgetHeader(state, options?.footer);
+        const cards = buildWorkflowCards(state, width, theme);
+        const output = [...header, ...cards];
+        text.setText(output.join("\n"));
+        return text.render(width);
+      },
+      invalidate() {
+        text.invalidate();
+      },
+    };
+  };
 }
 
 function formatWorkflowCard(input: {
@@ -738,22 +749,31 @@ function formatWorkflowCard(input: {
   subtitle: string;
   status: "running" | StepResultEnvelope["status"];
   summary?: string;
-}): string[] {
-  const width = 52;
+}, width: number, theme: ExtensionCommandContext["ui"]["theme"]): string[] {
+  const statusColor =
+    input.status === "running" ? "accent" :
+    input.status === "succeeded" ? "success" :
+    input.status === "pending" ? "dim" : "error";
+  const statusIcon =
+    input.status === "running" ? "●" :
+    input.status === "succeeded" ? "✓" :
+    input.status === "pending" ? "○" : "✗";
   const statusLabel = formatCardStatus(input.status);
   const summary = input.summary?.trim();
   const summaryLine = summary
     ? truncateForCard(summary, width - 4)
     : input.status === "running"
       ? "Working..."
+      : input.status === "pending"
+        ? "Waiting..."
       : "Done";
 
   return [
-    `┌${"─".repeat(width - 2)}┐`,
-    `│ ${padForCard(input.title, width - 4)} │`,
-    `│ ${padForCard(`${input.subtitle} • ${statusLabel}`, width - 4)} │`,
-    `│ ${padForCard(summaryLine, width - 4)} │`,
-    `└${"─".repeat(width - 2)}┘`,
+    theme.fg("dim", `┌${"─".repeat(width - 2)}┐`),
+    theme.fg("dim", "│") + " " + padForCard(input.title, width - 4) + " " + theme.fg("dim", "│"),
+    theme.fg("dim", "│") + " " + theme.fg(statusColor, `${statusIcon} ${padForCard(`${input.subtitle} • ${statusLabel}`, width - 6)}`) + " " + theme.fg("dim", "│"),
+    theme.fg("dim", "│") + " " + theme.fg(input.status === "pending" ? "dim" : "muted", padForCard(summaryLine, width - 4)) + " " + theme.fg("dim", "│"),
+    theme.fg("dim", `└${"─".repeat(width - 2)}┘`),
   ];
 }
 
@@ -783,6 +803,88 @@ function truncateForCard(value: string, maxLength: number): string {
 function padForCard(value: string, width: number): string {
   const truncated = truncateForCard(value, width);
   return truncated.padEnd(width, " ");
+}
+
+function updateWorkflowStepState(
+  state: WorkflowProgressState,
+  stepId: string,
+  patch: Partial<WorkflowProgressState["workflowSteps"][number]>
+): void {
+  const existing = state.workflowSteps.find((step) => step.stepId === stepId);
+  if (existing) {
+    Object.assign(existing, patch);
+    return;
+  }
+
+  state.workflowSteps.push({
+    stepId,
+    title: patch.title ?? stepId,
+    agentName: patch.agentName ?? "agent",
+    status: patch.status ?? "pending",
+    summary: patch.summary,
+  });
+}
+
+function buildWorkflowWidgetHeader(
+  state: WorkflowProgressState,
+  footer?: string[]
+): string[] {
+  const lines = [
+    `Workflow: ${state.workflowName ?? state.workflowId ?? "workflow"}`,
+    `Running: ${state.runningSteps.size}  Completed: ${state.completedSteps.length}`,
+  ];
+
+  if (state.approvalPending) {
+    lines.push(`Approval pending: ${state.approvalPending.stepTitle} (${state.approvalPending.agentName})`);
+  }
+
+  if (footer) {
+    lines.push(...footer);
+  }
+
+  return lines;
+}
+
+function buildWorkflowCards(
+  state: WorkflowProgressState,
+  width: number,
+  theme: ExtensionCommandContext["ui"]["theme"]
+): string[] {
+  if (state.workflowSteps.length === 0) {
+    return ["No active step cards yet."];
+  }
+
+  const cols = state.workflowSteps.length;
+  const arrowWidth = cols > 1 ? 5 : 0;
+  const totalArrowWidth = arrowWidth * Math.max(0, cols - 1);
+  const cardWidth = Math.max(22, Math.floor((width - totalArrowWidth) / Math.max(1, cols)));
+  const cards = state.workflowSteps.map((step) =>
+    formatWorkflowCard(
+      {
+        title: step.title,
+        subtitle: step.agentName,
+        status: step.status,
+        summary: step.summary,
+      },
+      cardWidth,
+      theme
+    )
+  );
+
+  const lines: string[] = [];
+  const cardHeight = cards[0]?.length ?? 0;
+  const arrowRow = 2;
+
+  for (let line = 0; line < cardHeight; line++) {
+    let row = cards[0][line];
+    for (let index = 1; index < cards.length; index++) {
+      row += line === arrowRow ? theme.fg("dim", " ──▶ ") : " ".repeat(5);
+      row += cards[index][line];
+    }
+    lines.push(truncateToWidth(row, width));
+  }
+
+  return lines;
 }
 
 function formatStepCompletionMessage(
