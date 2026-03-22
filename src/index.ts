@@ -336,6 +336,8 @@ async function waitForWorkflowStatusFile(
 ): Promise<{
   success: boolean;
   message?: string;
+  summary?: string;
+  closedByUser?: boolean;
 }> {
   let lastProgressContent = "";
   while (true) {
@@ -357,9 +359,16 @@ async function waitForWorkflowStatusFile(
         done?: boolean;
         success?: boolean;
         message?: string;
+        summary?: string;
+        closedByUser?: boolean;
       };
       if (data.done) {
-        return { success: Boolean(data.success), message: data.message };
+        return {
+          success: Boolean(data.success),
+          message: data.message,
+          summary: data.summary,
+          closedByUser: data.closedByUser,
+        };
       }
     } catch {
       /* still waiting */
@@ -377,6 +386,42 @@ function blockMainSessionInput(ctx: ExtensionCommandContext): () => void {
   return () => {
     restoreInput();
     ctx.ui.setWorkingMessage();
+  };
+}
+
+function buildMainSessionSummary(
+  workflowName: string,
+  status: {
+    success: boolean;
+    message?: string;
+    summary?: string;
+    closedByUser?: boolean;
+  },
+): { text: string; type: "info" | "warning" | "error" } {
+  const summary = status.summary?.trim() || status.message?.trim();
+  if (status.success) {
+    return {
+      text: summary
+        ? `Workflow ${workflowName} finished.\n\n${summary}`
+        : `Workflow ${workflowName} finished.`,
+      type: "info",
+    };
+  }
+
+  if (status.closedByUser) {
+    return {
+      text: summary
+        ? `Workflow ${workflowName} pane was closed.\n\n${summary}`
+        : `Workflow ${workflowName} pane was closed.`,
+      type: "warning",
+    };
+  }
+
+  return {
+    text: summary
+      ? `Workflow ${workflowName} failed.\n\n${summary}`
+      : `Workflow ${workflowName} failed.`,
+    type: "error",
   };
 }
 
@@ -733,12 +778,8 @@ export default function registerExtension(pi: ExtensionAPI) {
               launched.progressFile,
               (payload) => setWorkflowCardsWidget(ctx, payload),
             );
-            if (!status.success) {
-              ctx.ui.notify(
-                status.message || `Workflow ${workflowName} failed in Zellij.`,
-                "error",
-              );
-            }
+            const summary = buildMainSessionSummary(workflowName, status);
+            ctx.ui.notify(summary.text, summary.type);
           } finally {
             ctx.ui.setStatus("workflow", undefined);
             unblockInput();

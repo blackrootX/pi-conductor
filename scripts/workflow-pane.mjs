@@ -18,6 +18,8 @@ const { buildWorkflowCardPayload, renderWorkflowCardLines } = cards;
 let latestRenderState = null;
 let animationTimer = null;
 let currentDefaultModel = undefined;
+let currentStatusFile = undefined;
+let closingHandled = false;
 
 function parseArgs(argv) {
   const args = {};
@@ -111,6 +113,63 @@ function writeStatus(statusFile, payload) {
   fs.writeFileSync(statusFile, JSON.stringify(payload), "utf8");
 }
 
+function truncateSummary(text, maxLength = 1200) {
+  const normalized = text.trim();
+  if (!normalized) return "";
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, maxLength - 3)}...`
+    : normalized;
+}
+
+function buildWorkflowSummary(details, finalMessage, isRunning) {
+  const completedSteps = details.results
+    .filter((result) => !isErrorResult(result))
+    .map((result) => result.agent);
+  const latestStep = details.results[details.results.length - 1];
+  const parts = [];
+
+  if (completedSteps.length > 0) {
+    parts.push(`Completed: ${completedSteps.join(" -> ")}`);
+  }
+
+  if (isRunning && latestStep) {
+    parts.push(`Active: ${latestStep.agent}`);
+  }
+
+  const output =
+    truncateSummary(finalMessage || (latestStep ? getFinalOutput(latestStep.messages) : ""));
+  if (output) parts.push(output);
+
+  return parts.join("\n\n");
+}
+
+function writeCurrentStatus(overrides = {}) {
+  if (!currentStatusFile || !latestRenderState) return;
+
+  const summary = buildWorkflowSummary(
+    latestRenderState.details,
+    latestRenderState.finalMessage,
+    latestRenderState.isRunning,
+  );
+
+  writeStatus(currentStatusFile, {
+    done: true,
+    success: false,
+    message: latestRenderState.finalMessage || "Workflow pane was closed.",
+    summary,
+    closedByUser: true,
+    ...overrides,
+  });
+}
+
+function handlePaneCloseSignal() {
+  if (closingHandled) return;
+  closingHandled = true;
+  setAnimationRunning(false);
+  writeCurrentStatus();
+  process.exit(0);
+}
+
 async function promptToClosePane() {
   const rl = readline.createInterface({ input: stdin, output: stdout });
   const answer = await rl.question(
@@ -140,6 +199,7 @@ async function main() {
   currentDefaultModel = defaultModel;
   const progressFile = args["progress-file"];
   const statusFile = args["status-file"];
+  currentStatusFile = statusFile;
 
   if (!workflowName || !task) {
     console.error("Missing required args: --workflow and --task");
@@ -185,7 +245,13 @@ async function main() {
     done: true,
     success: !result.isError,
     message: result.isError ? result.errorMessage : result.finalText,
+    summary: buildWorkflowSummary(
+      latestRenderState.details,
+      latestRenderState.finalMessage,
+      false,
+    ),
   });
+  closingHandled = true;
 
   if (stdin.isTTY && stdout.isTTY) {
     stdout.write("\n");
@@ -200,7 +266,12 @@ main().catch((error) => {
     done: true,
     success: false,
     message: error instanceof Error ? error.message : String(error),
+    summary: truncateSummary(error instanceof Error ? error.message : String(error)),
   });
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
 });
+
+process.on("SIGTERM", handlePaneCloseSignal);
+process.on("SIGHUP", handlePaneCloseSignal);
+process.on("SIGINT", handlePaneCloseSignal);
