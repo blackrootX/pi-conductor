@@ -16,8 +16,8 @@ const {
 const { buildWorkflowCardPayload, renderWorkflowCardLines } = cards;
 
 let latestRenderState = null;
-let latestProgressPayload = null;
 let animationTimer = null;
+let currentDefaultModel = undefined;
 
 function parseArgs(argv) {
   const args = {};
@@ -68,8 +68,7 @@ function renderWorkflow(details, finalMessage, isRunning = false, animationTick 
     lines.push("");
   }
 
-  const payload = buildWorkflowCardPayload(details, isRunning);
-  latestProgressPayload = payload;
+  const payload = buildWorkflowCardPayload(details, isRunning, currentDefaultModel);
   lines.push(
     ...renderWorkflowCardLines(payload, stdout.columns || 100, undefined, {
       animationTick,
@@ -137,6 +136,8 @@ async function main() {
   const workflowName = args.workflow;
   const task = args.task;
   const cwd = args.cwd || process.cwd();
+  const defaultModel = args["default-model"] || undefined;
+  currentDefaultModel = defaultModel;
   const progressFile = args["progress-file"];
   const statusFile = args["status-file"];
 
@@ -145,8 +146,8 @@ async function main() {
     process.exit(1);
   }
 
-  const result = await runWorkflowByName(cwd, workflowName, task, undefined, (details) => {
-    writeStatus(progressFile, buildWorkflowCardPayload(details, true));
+  const result = await runWorkflowByName(cwd, workflowName, task, defaultModel, undefined, (details) => {
+    writeStatus(progressFile, buildWorkflowCardPayload(details, true, defaultModel));
     latestRenderState = { details, finalMessage: undefined, isRunning: true };
     setAnimationRunning(true);
     redraw();
@@ -163,6 +164,7 @@ async function main() {
         results: result.results,
       },
       false,
+      defaultModel,
     ),
   );
   latestRenderState = {

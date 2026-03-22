@@ -232,6 +232,10 @@ function buildConductorInstruction(workflowName: string, task: string): string {
   ].join("\n");
 }
 
+function getCurrentModelLabel(ctx: ExtensionContext): string | undefined {
+  return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+}
+
 async function launchWorkflowInZellijPane(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -263,6 +267,8 @@ async function launchWorkflowInZellijPane(
         task,
         "--cwd",
         ctx.cwd,
+        "--default-model",
+        getCurrentModelLabel(ctx) ?? "",
         "--progress-file",
         progressFile,
         "--status-file",
@@ -613,10 +619,14 @@ export default function registerExtension(pi: ExtensionAPI) {
         runtimeCwd,
         params.workflow,
         params.task,
+        getCurrentModelLabel(ctx),
         signal,
         onUpdate
           ? (details) => {
-              setWorkflowCardsWidget(ctx, buildWorkflowCardPayload(details, true));
+              setWorkflowCardsWidget(
+                ctx,
+                buildWorkflowCardPayload(details, true, getCurrentModelLabel(ctx)),
+              );
               onUpdate({
                 content: [
                   {
@@ -645,6 +655,7 @@ export default function registerExtension(pi: ExtensionAPI) {
               results: result.results,
             },
             false,
+            getCurrentModelLabel(ctx),
           ),
         );
       }
@@ -708,6 +719,7 @@ export default function registerExtension(pi: ExtensionAPI) {
               workflowName,
               steps: workflowConfig.agentNames.map((agent) => ({
                 agent,
+                model: getCurrentModelLabel(ctx),
                 status: "pending",
                 elapsedMs: 0,
                 lastWork: "",

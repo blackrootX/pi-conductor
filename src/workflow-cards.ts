@@ -5,6 +5,7 @@ export type WorkflowCardStatus = "pending" | "running" | "done" | "error";
 
 export interface WorkflowCardState {
   agent: string;
+  model?: string;
   status: WorkflowCardStatus;
   elapsedMs: number;
   lastWork: string;
@@ -64,144 +65,32 @@ function truncateText(text: string, maxWidth: number): string {
   return `${text.slice(0, maxWidth - 3)}...`;
 }
 
-type BorderFrame = {
-  topLeft: string;
-  topRight: string;
-  bottomLeft: string;
-  bottomRight: string;
-  horizontal: string;
-  vertical: string;
-  style: (text: string) => string;
-};
-
-function getBorderFrame(
-  status: WorkflowCardStatus,
-  animationTick: number,
-  styler: Styler,
-): BorderFrame {
-  if (status !== "running") {
-    return {
-      topLeft: "┌",
-      topRight: "┐",
-      bottomLeft: "└",
-      bottomRight: "┘",
-      horizontal: "─",
-      vertical: "│",
-      style: styler.dim,
-    };
-  }
-
-  const frames: BorderFrame[] = [
-    {
-      topLeft: "┏",
-      topRight: "┓",
-      bottomLeft: "┗",
-      bottomRight: "┛",
-      horizontal: "━",
-      vertical: "┃",
-      style: styler.accent,
-    },
-    {
-      topLeft: "╔",
-      topRight: "╗",
-      bottomLeft: "╚",
-      bottomRight: "╝",
-      horizontal: "═",
-      vertical: "║",
-      style: styler.accent,
-    },
-    {
-      topLeft: "┍",
-      topRight: "┑",
-      bottomLeft: "┕",
-      bottomRight: "┙",
-      horizontal: "━",
-      vertical: "│",
-      style: styler.accent,
-    },
-    {
-      topLeft: "╓",
-      topRight: "╖",
-      bottomLeft: "╙",
-      bottomRight: "╜",
-      horizontal: "─",
-      vertical: "║",
-      style: styler.accent,
-    },
-  ];
-
-  return frames[Math.floor(animationTick / 250) % frames.length];
-}
-
-function renderCard(
-  state: WorkflowCardState,
-  columnWidth: number,
-  styler: Styler,
-  animationTick: number,
-): string[] {
-  const innerWidth = Math.max(12, columnWidth - 2);
-  const name = truncateText(displayName(state.agent), innerWidth - 1);
-  const elapsed =
-    state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
-  const statusLabel = `${getStatusIcon(state.status)} ${state.status}${elapsed}`;
-  const lastWork = state.lastWork.trim()
-    ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
-    : "—";
-
-  const border = getBorderFrame(state.status, animationTick, styler);
-  const top = border.style(
-    `${border.topLeft}${border.horizontal.repeat(innerWidth)}${border.topRight}`,
-  );
-  const bottom = border.style(
-    `${border.bottomLeft}${border.horizontal.repeat(innerWidth)}${border.bottomRight}`,
-  );
-  const lines = [
-    stylePaddedLine(
-      ` ${styler.accent(styler.bold(name))}`,
-      innerWidth,
-      border.vertical,
-      border.style,
-    ),
-    stylePaddedLine(
-      ` ${getStatusText(state.status, statusLabel, styler)}`,
-      innerWidth,
-      border.vertical,
-      border.style,
-    ),
-    stylePaddedLine(
-      ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
-      innerWidth,
-      border.vertical,
-      border.style,
-    ),
-  ];
-
-  return [top, ...lines, bottom];
-}
-
-function stylePaddedLine(
-  content: string,
-  width: number,
-  vertical: string,
-  borderStyle: (text: string) => string,
-): string {
-  const visibleContent = stripAnsi(content);
-  return (
-    borderStyle(vertical) +
-    content +
-    " ".repeat(Math.max(0, width - visibleContent.length)) +
-    borderStyle(vertical)
-  );
-}
-
 function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
-function getStatusIcon(status: WorkflowCardStatus): string {
+function formatModelLabel(model?: string): string {
+  if (!model?.trim()) return "";
+  const trimmed = model.trim();
+  const slashIndex = trimmed.lastIndexOf("/");
+  return slashIndex >= 0 ? trimmed.slice(slashIndex + 1) : trimmed;
+}
+
+function buildTitle(agent: string, model?: string): string {
+  const name = displayName(agent);
+  const label = formatModelLabel(model);
+  return label ? `${name} - ${label}` : name;
+}
+
+function getSpinnerFrame(animationTick: number): string {
+  const frames = ["◐", "◓", "◑", "◒"];
+  return frames[Math.floor(animationTick / 250) % frames.length];
+}
+
+function getStatusIcon(status: WorkflowCardStatus, animationTick: number): string {
   switch (status) {
     case "running":
-      return "●";
+      return getSpinnerFrame(animationTick);
     case "done":
       return "✓";
     case "error":
@@ -228,6 +117,63 @@ function getStatusText(
   }
 }
 
+function stylePaddedLine(
+  content: string,
+  width: number,
+  borderStyle: (text: string) => string,
+): string {
+  const visibleContent = stripAnsi(content);
+  return (
+    borderStyle("│") +
+    content +
+    " ".repeat(Math.max(0, width - visibleContent.length)) +
+    borderStyle("│")
+  );
+}
+
+function renderCard(
+  state: WorkflowCardState,
+  columnWidth: number,
+  styler: Styler,
+  animationTick: number,
+): string[] {
+  const innerWidth = Math.max(16, columnWidth - 2);
+  const title = truncateText(buildTitle(state.agent, state.model), innerWidth - 1);
+  const elapsed =
+    state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
+  const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${elapsed}`;
+  const lastWork = state.lastWork.trim()
+    ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
+    : "—";
+
+  const borderStyle = state.status === "running" ? styler.accent : styler.dim;
+  const top = borderStyle(`┌${"─".repeat(innerWidth)}┐`);
+  const bottom = borderStyle(`└${"─".repeat(innerWidth)}┘`);
+
+  return [
+    top,
+    stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
+    stylePaddedLine(
+      ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
+      innerWidth,
+      borderStyle,
+    ),
+    bottom,
+  ];
+}
+
+function renderConnector(
+  nextStep: WorkflowCardState,
+  animationTick: number,
+  styler: Styler,
+): string {
+  if (nextStep.status !== "running") return styler.dim(" ──▶ ");
+
+  const frames = [" •──▶", " ─•─▶", " ──•▶", " ───▶"];
+  return styler.accent(frames[Math.floor(animationTick / 250) % frames.length]);
+}
+
 function renderRows(
   steps: WorkflowCardState[],
   width: number,
@@ -237,7 +183,7 @@ function renderRows(
   if (steps.length === 0) return [styler.dim("No workflow steps yet.")];
 
   const arrowWidth = 5;
-  const minCardWidth = 18;
+  const minCardWidth = 20;
   const cardsPerRow = Math.max(
     1,
     Math.min(
@@ -258,15 +204,16 @@ function renderRows(
       minCardWidth,
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
-    const cards = chunk.map((step) =>
-      renderCard(step, cardWidth, styler, animationTick),
-    );
+    const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
     const connectorRow = 2;
 
     for (let line = 0; line < cards[0].length; line++) {
       let row = cards[0][line];
       for (let cardIndex = 1; cardIndex < cards.length; cardIndex++) {
-        row += line === connectorRow ? styler.dim(" ──▶ ") : " ".repeat(arrowWidth);
+        row +=
+          line === connectorRow
+            ? renderConnector(chunk[cardIndex], animationTick, styler)
+            : " ".repeat(arrowWidth);
         row += cards[cardIndex][line];
       }
       output.push(row);
@@ -281,12 +228,14 @@ function renderRows(
 export function buildWorkflowCardPayload(
   details: WorkflowDetails,
   isRunning: boolean,
+  defaultModel?: string,
 ): WorkflowCardPayload {
   const steps = details.agentNames.map((agentName, index) => {
     const result = details.results.find((item) => item.step === index + 1);
     if (!result) {
       return {
         agent: agentName,
+        model: defaultModel,
         status: "pending" as const,
         elapsedMs: 0,
         lastWork: "",
@@ -303,6 +252,7 @@ export function buildWorkflowCardPayload(
 
     return {
       agent: agentName,
+      model: result.model ?? defaultModel,
       status,
       elapsedMs: result.elapsedMs ?? 0,
       lastWork: result.lastWork ?? "",

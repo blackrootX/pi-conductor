@@ -92,6 +92,7 @@ async function runSingleAgent(
   agents: AgentConfig[],
   agentName: string,
   task: string,
+  defaultModel: string | undefined,
   step: number,
   signal: AbortSignal | undefined,
   onUpdate: ((result: SingleResult) => void) | undefined,
@@ -147,7 +148,7 @@ async function runSingleAgent(
       contextTokens: 0,
       turns: 0,
     },
-    model: agent.model,
+    model: agent.model ?? defaultModel,
     step,
   };
 
@@ -282,6 +283,7 @@ export async function runWorkflowByName(
   cwd: string,
   workflowName: string,
   task: string,
+  defaultModel?: string,
   signal?: AbortSignal,
   onUpdate?: WorkflowUpdateCallback,
 ): Promise<WorkflowRunResult> {
@@ -336,6 +338,7 @@ export async function runWorkflowByName(
       agents,
       agentName,
       currentInput,
+      defaultModel,
       index + 1,
       signal,
       onUpdate
