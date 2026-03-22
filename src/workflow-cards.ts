@@ -27,6 +27,7 @@ type Styler = {
   muted(text: string): string;
   success(text: string): string;
   error(text: string): string;
+  highlight(text: string): string;
 };
 
 function createThemeStyler(theme: Theme): Styler {
@@ -37,6 +38,7 @@ function createThemeStyler(theme: Theme): Styler {
     muted: (text) => theme.fg("muted", text),
     success: (text) => theme.fg("success", text),
     error: (text) => theme.fg("error", text),
+    highlight: (text) => theme.fg("warning", text),
   };
 }
 
@@ -48,6 +50,7 @@ function createPlainStyler(): Styler {
     muted: (text) => text,
     success: (text) => text,
     error: (text) => text,
+    highlight: (text) => text,
   };
 }
 
@@ -146,7 +149,7 @@ function renderCard(
     ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
 
-  const borderStyle = state.status === "running" ? styler.accent : styler.dim;
+  const borderStyle = state.status === "running" ? styler.highlight : styler.dim;
   const top = borderStyle(`┌${"─".repeat(innerWidth)}┐`);
   const bottom = borderStyle(`└${"─".repeat(innerWidth)}┘`);
 
@@ -171,7 +174,7 @@ function renderConnector(
   if (nextStep.status !== "running") return styler.dim(" ──▶ ");
 
   const frames = [" •──▶", " ─•─▶", " ──•▶", " ───▶"];
-  return styler.accent(frames[Math.floor(animationTick / 250) % frames.length]);
+  return styler.highlight(frames[Math.floor(animationTick / 250) % frames.length]);
 }
 
 function renderRows(
