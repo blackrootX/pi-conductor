@@ -1253,7 +1253,6 @@ Settings:
 Examples:
   # Save built-in workflows as project templates
   /workflow add plan-implement-review
-  /workflow add quick-review
 
   # Save a workflow as a user template
   /workflow save plan-implement-review --as my-plan-review --scope user
@@ -1277,9 +1276,6 @@ Examples:
 
   # Run a workflow (uses settings to determine runner)
   /workflow run plan-implement-review --task 'Add user authentication'
-
-  # Run with verbose output
-  /workflow run implement-and-review -t 'Fix the login bug' --verbose
 
   # Run in Zellij mode explicitly
   /workflow run plan-implement-review -t 'Build feature' --runner zellij

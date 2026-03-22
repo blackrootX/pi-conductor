@@ -88,16 +88,12 @@ Inspect and execute workflows with interactive menu and settings.
 # Show workflow details
 /workflow --show plan-implement-review
 /workflow show plan-implement-review
-/workflow -s parallel-audit
 
 # Run a workflow
 /workflow run plan-implement-review --task "Implement user authentication"
-/workflow run implement-and-review -t "Fix the login bug" --verbose
-/workflow run quick-review -t "Review this code"
 
 # Manage configured workflows
 /workflow add plan-implement-review
-/workflow remove quick-review
 /workflow cleanup
 /workflow cleanup sessions
 /workflow cleanup runs
@@ -165,10 +161,6 @@ You can also clean workflow storage manually:
 | Workflow | Description | Agents |
 |----------|-------------|--------|
 | `plan-implement-review` | Sequential: plan → implement → review | planner → coder → reviewer |
-| `parallel-audit` | Parallel audit of backend, frontend, tests, docs | 4× reviewer |
-| `implement-and-review` | Simple: implement → review | coder → reviewer |
-| `research-and-write` | Research then write | task-analysis → coder |
-| `quick-review` | Single-agent quick review | reviewer |
 
 ## Workflow Settings
 

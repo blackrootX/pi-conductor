@@ -12,6 +12,8 @@ export interface WorkflowTemplateEntry {
   source: WorkflowTemplateSource;
 }
 
+const DEFAULT_BUILT_IN_WORKFLOW_IDS = new Set(["plan-implement-review"]);
+
 interface WorkflowTemplateFile {
   workflows?: WorkflowSpec[];
 }
@@ -193,6 +195,9 @@ export async function getAvailableWorkflowMap(
   const merged: Record<string, WorkflowTemplateEntry> = {};
 
   for (const workflow of Object.values(WORKFLOW_PRESETS)) {
+    if (!DEFAULT_BUILT_IN_WORKFLOW_IDS.has(workflow.id)) {
+      continue;
+    }
     merged[workflow.id] = {
       workflow,
       source: "built-in",
