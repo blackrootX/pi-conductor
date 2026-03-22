@@ -82,10 +82,12 @@ Inspect and execute workflows with interactive menu and settings.
 
 # List available workflows
 /workflow --list
+/workflow list
 /workflow -l
 
 # Show workflow details
 /workflow --show plan-implement-review
+/workflow show plan-implement-review
 /workflow -s parallel-audit
 
 # Run a workflow
@@ -96,6 +98,9 @@ Inspect and execute workflows with interactive menu and settings.
 # Manage configured workflows
 /workflow add plan-implement-review
 /workflow remove quick-review
+/workflow cleanup
+/workflow cleanup sessions
+/workflow cleanup runs
 
 # Open settings menu
 /workflow settings
@@ -140,6 +145,18 @@ Workflow steps can also declare `requiresApproval: true` to pause before executi
 ```
 
 Approval happens at the workflow layer, so it works the same way for both local and Zellij-backed execution. If a workflow is executed without a Pi approval handler, approval-gated steps are auto-approved to keep direct command execution usable.
+
+### Workflow Cleanup
+
+Conductor treats `.pi/workflows/sessions/` as scratch space and `.pi/workflows/runs/` as retained run history. Finished sessions are removed automatically after successful artifact persistence, and run history is pruned to the newest 20 runs.
+
+You can also clean workflow storage manually:
+
+```bash
+/workflow cleanup
+/workflow cleanup sessions
+/workflow cleanup runs
+```
 
 ## Built-in Workflows
 

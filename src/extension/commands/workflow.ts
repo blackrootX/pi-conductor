@@ -17,6 +17,8 @@ import {
 } from "../../runtime/childSessionRunner";
 
 export interface WorkflowCommandOptions {
+  /** Project cwd for workflow config/template resolution */
+  cwd?: string;
   /** List configured workflows */
   list?: boolean;
   /** Show a specific workflow */
@@ -47,6 +49,10 @@ export interface WorkflowCommandOptions {
   sequential?: boolean;
   /** Open workflow settings menu */
   settings?: boolean;
+  /** Cleanup workflow artifacts */
+  cleanup?: WorkflowCleanupTarget;
+  /** Parse/validation errors captured from command args */
+  parseErrors?: string[];
 }
 
 export interface WorkflowCommandObserver {
@@ -62,6 +68,7 @@ export interface WorkflowCommandExecution {
 }
 
 const WORKFLOW_RUN_RETENTION_COUNT = 20;
+export type WorkflowCleanupTarget = "sessions" | "runs" | "all";
 
 /**
  * Execute the /workflow command.
@@ -71,6 +78,10 @@ export async function executeWorkflowCommand(
   registry?: AgentRegistry,
   observer?: WorkflowCommandObserver
 ): Promise<WorkflowCommandExecution | void> {
+  if (options.parseErrors && options.parseErrors.length > 0) {
+    throw new Error(options.parseErrors.join("\n"));
+  }
+
   if (options.help) {
     console.log(getHelpText());
     return;
@@ -81,12 +92,12 @@ export async function executeWorkflowCommand(
   }
 
   if (options.add) {
-    await addWorkflow(options.add);
+    await addWorkflow(options.add, options.cwd);
     return;
   }
 
   if (options.remove) {
-    await removeWorkflow(options.remove);
+    await removeWorkflow(options.remove, options.cwd);
     return;
   }
 
@@ -95,15 +106,21 @@ export async function executeWorkflowCommand(
     return;
   }
 
+  if (options.cleanup) {
+    const summary = await cleanupWorkflowStorage(options.cleanup, options.workingDir || options.cwd || process.cwd());
+    console.log(summary);
+    return;
+  }
+
   // Handle list option
   if (options.list) {
-    await listConfiguredWorkflows();
+    await listConfiguredWorkflows(options.cwd);
     return;
   }
 
   // Handle show option
   if (options.show) {
-    await showWorkflow(options.show);
+    await showWorkflow(options.show, options.cwd);
     return;
   }
 
@@ -127,8 +144,8 @@ export async function executeWorkflowCommand(
 /**
  * List configured workflows.
  */
-async function listConfiguredWorkflows(): Promise<void> {
-  const configured = await getConfiguredWorkflowIds();
+async function listConfiguredWorkflows(cwd = process.cwd()): Promise<void> {
+  const configured = await getConfiguredWorkflowIds(cwd);
 
   console.log("\nConfigured Workflows:\n");
 
@@ -141,7 +158,7 @@ async function listConfiguredWorkflows(): Promise<void> {
 
   for (let i = 0; i < configured.length; i++) {
     const workflowId = configured[i];
-    const preset = await getWorkflowDefinition(workflowId);
+    const preset = await getWorkflowDefinition(workflowId, cwd);
     const label = i === 0 ? " (default)" : "";
 
     console.log(`  ${i + 1}. ${workflowId}${label}`);
@@ -192,8 +209,8 @@ async function isZellijAvailable(): Promise<boolean> {
 /**
  * Show details of a specific workflow.
  */
-async function showWorkflow(workflowId: string): Promise<void> {
-  const resolved = await getWorkflowDefinition(workflowId);
+async function showWorkflow(workflowId: string, cwd = process.cwd()): Promise<void> {
+  const resolved = await getWorkflowDefinition(workflowId, cwd);
   const workflow = resolved?.workflow;
 
   if (!workflow) {
@@ -303,15 +320,15 @@ function resolveWorkflowSelection(
   };
 }
 
-async function addWorkflow(workflowId: string): Promise<void> {
-  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId);
-  const preset = normalizedWorkflowId ? await getWorkflowDefinition(normalizedWorkflowId) : undefined;
+async function addWorkflow(workflowId: string, cwd = process.cwd()): Promise<void> {
+  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId, cwd);
+  const preset = normalizedWorkflowId ? await getWorkflowDefinition(normalizedWorkflowId, cwd) : undefined;
   if (!preset) {
     const available = (await listWorkflowDefinitions()).map((entry) => entry.id).join(", ");
     throw new Error(`Unknown workflow: ${workflowId}. Available workflows: ${available}`);
   }
 
-  const settings = await readWorkflowSettings();
+  const settings = await readWorkflowSettings(cwd);
   const configured = settings.conductorWorkflow ?? [];
 
   if (configured.includes(preset.workflow.id)) {
@@ -320,18 +337,18 @@ async function addWorkflow(workflowId: string): Promise<void> {
   }
 
   settings.conductorWorkflow = [...configured, preset.workflow.id];
-  await writeWorkflowSettings(settings);
+  await writeWorkflowSettings(settings, "project", cwd);
 
   console.log(`Added workflow: ${preset.workflow.id}`);
 }
 
-async function removeWorkflow(workflowId: string): Promise<void> {
-  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId);
+async function removeWorkflow(workflowId: string, cwd = process.cwd()): Promise<void> {
+  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId, cwd);
   if (!normalizedWorkflowId) {
     throw new Error(`Unknown workflow: ${workflowId}`);
   }
 
-  const settings = await readWorkflowSettings();
+  const settings = await readWorkflowSettings(cwd);
   const configured = settings.conductorWorkflow ?? [];
 
   if (!configured.includes(normalizedWorkflowId)) {
@@ -340,7 +357,7 @@ async function removeWorkflow(workflowId: string): Promise<void> {
   }
 
   settings.conductorWorkflow = configured.filter((id) => id !== normalizedWorkflowId);
-  await writeWorkflowSettings(settings);
+  await writeWorkflowSettings(settings, "project", cwd);
 
   console.log(`Removed workflow: ${normalizedWorkflowId}`);
 }
@@ -349,7 +366,8 @@ async function saveWorkflow(
   workflowId: string,
   options: WorkflowCommandOptions
 ): Promise<void> {
-  const resolved = await getWorkflowDefinition(workflowId, options.workingDir ?? process.cwd());
+  const cwd = options.cwd ?? process.cwd();
+  const resolved = await getWorkflowDefinition(workflowId, cwd);
   if (!resolved) {
     throw new Error(`Unknown workflow: ${workflowId}`);
   }
@@ -361,12 +379,12 @@ async function saveWorkflow(
     id: targetId,
   };
 
-  await saveWorkflowTemplate(workflowToSave, scope, options.workingDir ?? process.cwd());
+  await saveWorkflowTemplate(workflowToSave, scope, cwd);
   console.log(`Saved workflow template: ${targetId} (${scope})`);
 }
 
-export async function resolveWorkflowIdForAdd(inputId: string): Promise<string | undefined> {
-  const presets = await listWorkflowDefinitions();
+export async function resolveWorkflowIdForAdd(inputId: string, cwd = process.cwd()): Promise<string | undefined> {
+  const presets = await listWorkflowDefinitions(cwd);
   const exact = presets.find((preset) => preset.id === inputId);
   if (exact) return exact.id;
 
@@ -520,14 +538,14 @@ export async function writeWorkflowSettings(
   await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
 }
 
-async function getConfiguredWorkflowIds(): Promise<string[]> {
-  const settings = await readWorkflowSettings();
+async function getConfiguredWorkflowIds(cwd = process.cwd()): Promise<string[]> {
+  const settings = await readWorkflowSettings(cwd);
   return settings.conductorWorkflow ?? [];
 }
 
-export async function getConfiguredWorkflows(): Promise<Array<{ id: string; name: string; description?: string }>> {
-  const ids = await getConfiguredWorkflowIds();
-  const definitions = await Promise.all(ids.map((id) => getWorkflowDefinition(id)));
+export async function getConfiguredWorkflows(cwd = process.cwd()): Promise<Array<{ id: string; name: string; description?: string }>> {
+  const ids = await getConfiguredWorkflowIds(cwd);
+  const definitions = await Promise.all(ids.map((id) => getWorkflowDefinition(id, cwd)));
   return ids.map((id, index) => {
     const preset = definitions[index];
     return {
@@ -679,11 +697,12 @@ async function runWorkflow(
   registry: AgentRegistry,
   observer?: WorkflowCommandObserver
 ): Promise<WorkflowCommandExecution> {
-  const resolvedWorkflow = await getWorkflowDefinition(workflowId);
+  const projectCwd = options.cwd || process.cwd();
+  const resolvedWorkflow = await getWorkflowDefinition(workflowId, projectCwd);
   const workflow = resolvedWorkflow?.workflow;
 
   if (!workflow) {
-    const available = (await listWorkflowDefinitions()).map((preset) => preset.id).join(", ");
+    const available = (await listWorkflowDefinitions(projectCwd)).map((preset) => preset.id).join(", ");
     throw new Error(
       `Unknown workflow: ${workflowId}\nAvailable workflows: ${available}`
     );
@@ -695,11 +714,11 @@ async function runWorkflow(
   }
 
   // Get effective settings
-  const effectiveSettings = await getEffectiveWorkflowSettings();
+  const effectiveSettings = await getEffectiveWorkflowSettings(projectCwd);
   const sequential = options.sequential ?? true;
 
   // Determine working directory
-  const workingDir = options.workingDir || process.cwd();
+  const workingDir = options.workingDir || projectCwd;
 
   // Create run directory with timestamp
   const runId = `run-${Date.now()}`;
@@ -1026,6 +1045,29 @@ async function cleanupWorkflowArtifacts(
   await pruneRunDirectories(workingDir);
 }
 
+export async function cleanupWorkflowStorage(
+  target: WorkflowCleanupTarget,
+  workingDir = process.cwd()
+): Promise<string> {
+  const cleaned: string[] = [];
+
+  if (target === "sessions" || target === "all") {
+    const sessionsDir = path.join(workingDir, ".pi", "workflows", "sessions");
+    await fs.rm(sessionsDir, { recursive: true, force: true });
+    cleaned.push("session scratch data");
+  }
+
+  if (target === "runs" || target === "all") {
+    const runsDir = path.join(workingDir, ".pi", "workflows", "runs");
+    await fs.rm(runsDir, { recursive: true, force: true });
+    cleaned.push("run artifacts");
+  }
+
+  return cleaned.length > 0
+    ? `Cleaned ${cleaned.join(" and ")} in ${path.join(workingDir, ".pi", "workflows")}`
+    : "Nothing to clean.";
+}
+
 async function cleanupSessionDirectories(
   result: WorkflowRunResult,
   workingDir: string
@@ -1087,23 +1129,55 @@ async function pruneRunDirectories(workingDir: string): Promise<void> {
  * Parse CLI arguments for /workflow command.
  */
 export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions {
-  const options: WorkflowCommandOptions = {};
+  const options: WorkflowCommandOptions = { parseErrors: [] };
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    const readRequiredValue = (flag: string): string | undefined => {
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        options.parseErrors?.push(`Missing value for ${flag}`);
+        return undefined;
+      }
+      i++;
+      return value;
+    };
 
     switch (arg) {
+      case "list":
+        options.list = true;
+        break;
+      case "show":
+        options.show = readRequiredValue("show <id>");
+        break;
+      case "settings":
+        options.settings = true;
+        break;
+      case "cleanup": {
+        const value = args[i + 1];
+        if (value && !value.startsWith("-")) {
+          if (value === "sessions" || value === "runs" || value === "all") {
+            options.cleanup = value;
+            i++;
+          } else {
+            options.parseErrors?.push(`Invalid cleanup target: ${value}. Expected sessions, runs, or all.`);
+          }
+        } else {
+          options.cleanup = "all";
+        }
+        break;
+      }
       case "add":
-        options.add = args[++i] || undefined;
+        options.add = readRequiredValue("add <id>");
         break;
       case "remove":
-        options.remove = args[++i] || undefined;
+        options.remove = readRequiredValue("remove <id>");
         break;
       case "save":
-        options.save = args[++i] || undefined;
+        options.save = readRequiredValue("save <id>");
         break;
       case "run":
-        options.run = args[++i] || undefined;
+        options.run = readRequiredValue("run <id>");
         break;
       case "--list":
       case "-l":
@@ -1111,23 +1185,33 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
         break;
       case "--show":
       case "-s":
-        options.show = args[++i] || undefined;
+        options.show = readRequiredValue("--show <id>");
         break;
       case "--task":
       case "-t":
-        options.task = args[++i] || undefined;
+        options.task = readRequiredValue("--task <text>");
         break;
       case "--as":
-        options.saveAs = args[++i] || undefined;
+        options.saveAs = readRequiredValue("--as <id>");
         break;
       case "--scope": {
-        const scope = args[++i];
-        options.scope = scope === "user" ? "user" : "project";
+        const scope = readRequiredValue("--scope <project|user>");
+        if (scope === "project" || scope === "user") {
+          options.scope = scope;
+        } else if (scope) {
+          options.parseErrors?.push(`Invalid scope: ${scope}. Expected project or user.`);
+        }
         break;
       }
-      case "--runner":
-        options.runner = (args[++i] || "local-process") as "local-process" | "default" | "zellij";
+      case "--runner": {
+        const runner = readRequiredValue("--runner <local-process|default|zellij>");
+        if (runner === "local-process" || runner === "default" || runner === "zellij") {
+          options.runner = runner;
+        } else if (runner) {
+          options.parseErrors?.push(`Invalid runner: ${runner}. Expected local-process, default, or zellij.`);
+        }
         break;
+      }
       case "--verbose":
       case "-v":
         options.verbose = true;
@@ -1142,6 +1226,9 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "--settings":
         options.settings = true;
         break;
+      case "--cleanup":
+        options.cleanup = "all";
+        break;
       case "--help":
       case "-h":
         options.help = true;
@@ -1153,6 +1240,10 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
           }
         }
     }
+  }
+
+  if (options.parseErrors?.length === 0) {
+    delete options.parseErrors;
   }
 
   return options;
@@ -1171,6 +1262,7 @@ Usage:
   /workflow add <id>
   /workflow remove <id>
   /workflow save <id> [options]
+  /workflow cleanup [sessions|runs|all]
 
 Interactive Menu:
   /workflow               Opens interactive menu for workflow management
@@ -1180,6 +1272,7 @@ Subcommands:
   add <id>                Add a workflow to project settings
   remove <id>             Remove a workflow from project settings
   save <id>               Save a workflow as a project or user template
+  cleanup [target]        Remove workflow session scratch data, run artifacts, or both
   settings                Open workflow settings menu
 
 Options:
@@ -1190,6 +1283,7 @@ Options:
   --scope <scope>         Save scope: project (default) or user
   --runner <type>         Runner type: local-process (default), default, or zellij
   --settings              Open workflow settings menu
+  --cleanup               Clean both workflow sessions and run artifacts
   -v, --verbose           Verbose output
   --sequential            Explicitly request sequential execution (default)
   -d, --working-dir <dir> Working directory for run artifacts
@@ -1220,6 +1314,11 @@ Examples:
 
   # Open settings menu
   /workflow settings
+
+  # Clean workflow scratch data and run history
+  /workflow cleanup
+  /workflow cleanup sessions
+  /workflow cleanup runs
 
   # Show workflow details
   /workflow --show plan-implement-review

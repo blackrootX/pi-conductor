@@ -3,6 +3,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import {
+  cleanupWorkflowStorage,
   executeWorkflowCommand,
   getConfiguredWorkflows,
   getWorkflowSettingsContext,
@@ -57,6 +58,11 @@ type WorkflowMessageDetails =
       stepId: string;
       approved: boolean;
       reason?: string;
+    }
+  | {
+      kind: "cleanup-complete";
+      target: "sessions" | "runs" | "all";
+      summary: string;
     };
 
 /**
@@ -75,7 +81,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("workflow", {
     description: "Inspect and run multi-agent workflows",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const parsedArgs = parseWorkflowCommandArgs(args.split(/\s+/).filter(Boolean));
+      const parsedArgs = parseWorkflowCommandArgs(tokenizeCommandArgs(args));
       const trimmedArgs = args.trim();
 
       // Create registry for agent resolution
@@ -115,7 +121,7 @@ export default function (pi: ExtensionAPI) {
         if (shouldUseNativeWorkflowUi(parsedArgs, trimmedArgs)) {
           execution = await runNativeWorkflowUi(pi, ctx, parsedArgs, registry, observer);
         } else {
-          execution = await executeWorkflowCommand(parsedArgs, registry, observer);
+          execution = await executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer);
         }
 
         finalizeWorkflowUi(ctx, progressState, execution);
@@ -137,7 +143,7 @@ function shouldUseNativeWorkflowUi(
   parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>,
   rawArgs: string
 ): boolean {
-  if (parsedArgs.help || parsedArgs.list || parsedArgs.show || parsedArgs.add || parsedArgs.remove || parsedArgs.run) {
+  if (parsedArgs.help || parsedArgs.list || parsedArgs.show || parsedArgs.add || parsedArgs.remove || parsedArgs.run || parsedArgs.cleanup) {
     if (!parsedArgs.save) {
       return false;
     }
@@ -176,6 +182,7 @@ async function runNativeWorkflowUi(
     "Add workflow",
     "Remove workflow",
     "Save workflow template",
+    "Cleanup artifacts",
     "Settings",
   ]);
 
@@ -202,6 +209,9 @@ async function runNativeWorkflowUi(
     case "Save workflow template":
       await saveWorkflowTemplateFromPiUi(ctx);
       return;
+    case "Cleanup artifacts":
+      await cleanupWorkflowFromPiUi(pi, ctx);
+      return;
     default:
       return;
   }
@@ -214,7 +224,7 @@ async function promptAndRunWorkflowFromPiUi(
   observer: WorkflowCommandObserver,
   parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>
 ): Promise<WorkflowCommandExecution | void> {
-  const workflows = await getConfiguredWorkflows();
+  const workflows = await getConfiguredWorkflows(ctx.cwd);
   if (workflows.length === 0) {
     throw new Error("No configured workflows found. Use /workflow add <workflow-id> to add one.");
   }
@@ -234,14 +244,14 @@ async function promptAndRunWorkflowFromPiUi(
   }
 
   return executeWorkflowCommand(
-    { ...parsedArgs, run: workflow.id, task },
+    { ...parsedArgs, run: workflow.id, task, cwd: ctx.cwd },
     registry,
     observer
   ) as Promise<WorkflowCommandExecution | void>;
 }
 
 async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promise<void> {
-  const workflows = await getConfiguredWorkflows();
+  const workflows = await getConfiguredWorkflows(ctx.cwd);
   if (workflows.length === 0) {
     ctx.ui.notify("No configured workflows found", "info");
     return;
@@ -255,7 +265,7 @@ async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promis
 
 async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
   const presets = await listWorkflowDefinitions(ctx.cwd);
-  const configured = new Set((await getConfiguredWorkflows()).map((workflow) => workflow.id));
+  const configured = new Set((await getConfiguredWorkflows(ctx.cwd)).map((workflow) => workflow.id));
   const candidates = presets
     .filter((preset) => !configured.has(preset.id))
     .map((preset) => {
@@ -274,12 +284,12 @@ async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> 
   }
 
   const workflowId = selected.split(" [")[0].split(" - ")[0];
-  await executeWorkflowCommand({ add: workflowId });
+  await executeWorkflowCommand({ add: workflowId, cwd: ctx.cwd });
   ctx.ui.notify(`Added workflow: ${workflowId}`, "info");
 }
 
 async function removeWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
-  const workflows = await getConfiguredWorkflows();
+  const workflows = await getConfiguredWorkflows(ctx.cwd);
   if (workflows.length === 0) {
     ctx.ui.notify("No configured workflows to remove", "info");
     return;
@@ -294,7 +304,7 @@ async function removeWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<voi
   }
 
   const workflowId = selected.split(" - ")[0];
-  await executeWorkflowCommand({ remove: workflowId });
+  await executeWorkflowCommand({ remove: workflowId, cwd: ctx.cwd });
   ctx.ui.notify(`Removed workflow: ${workflowId}`, "info");
 }
 
@@ -340,6 +350,44 @@ async function saveWorkflowTemplateFromPiUi(ctx: ExtensionCommandContext): Promi
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(`Failed to save workflow template: ${message}`, "error");
+  }
+}
+
+async function cleanupWorkflowFromPiUi(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<void> {
+  const choice = await ctx.ui.select("Cleanup workflow artifacts", [
+    "Session scratch data",
+    "Run artifacts",
+    "Everything",
+  ]);
+
+  if (!choice) {
+    ctx.ui.notify("Cleanup cancelled", "info");
+    return;
+  }
+
+  const target =
+    choice === "Session scratch data" ? "sessions" :
+    choice === "Run artifacts" ? "runs" : "all";
+
+  try {
+    const summary = await cleanupWorkflowStorage(target, ctx.cwd);
+    ctx.ui.notify(summary, "info");
+    pi.sendMessage({
+      customType: "workflow-update",
+      display: true,
+      content: summary,
+      details: {
+        kind: "cleanup-complete",
+        target,
+        summary,
+      } satisfies WorkflowMessageDetails,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Cleanup failed: ${message}`, "error");
   }
 }
 
@@ -687,6 +735,11 @@ function renderWorkflowMessage(
     return `${header}\nDecision: ${details.approved ? "approved" : "rejected"}${reason}`;
   }
 
+  if (details.kind === "cleanup-complete") {
+    const header = `[workflow cleanup] ${details.target}`;
+    return `${header}\n${details.summary}`;
+  }
+
   const color = details.status === "succeeded" ? "success" : details.status === "cancelled" ? "warning" : "error";
   const header = theme.fg(color, `[workflow result] ${details.workflowName}`);
   const summary = details.summary ? `\nSummary: ${details.summary}` : "";
@@ -759,4 +812,58 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   const seconds = Math.floor((ms % 60000) / 1000);
   return `${minutes}m ${seconds}s`;
+}
+
+function tokenizeCommandArgs(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaping = false;
+
+  for (const char of input) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+
+  if (current) {
+    tokens.push(current);
+  }
+
+  return tokens;
 }
