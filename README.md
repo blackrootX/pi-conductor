@@ -96,8 +96,9 @@ Outside Zellij:
 Inside Zellij:
 
 - `/workflow` opens a right-side pane automatically
-- that pane runs a dedicated Pi session for the workflow
-- the pane shows one unified live workflow view
+- the left Pi session stays blocked until the workflow finishes
+- the right pane shows one unified live workflow view for the workflow run
+- when the workflow finishes, the right pane asks whether to close or stay open
 
 ## Development
 

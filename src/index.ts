@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import {
@@ -11,19 +11,19 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import type { WorkflowConfig } from "./workflows.js";
+import { DEFAULT_WORKFLOW_NAME, discoverWorkflows } from "./workflows.js";
 import {
-  type AgentConfig,
-  type AgentSource,
-  discoverAgents,
-} from "./agents.js";
-import {
-  DEFAULT_WORKFLOW_NAME,
-  type WorkflowConfig,
-  type WorkflowSource,
-  discoverWorkflows,
-} from "./workflows.js";
+  type SingleResult,
+  type WorkflowDetails,
+  getFinalOutput,
+  isErrorResult,
+  runWorkflowByName,
+} from "./workflow-runtime.js";
 
 const COLLAPSED_ITEM_COUNT = 10;
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ZELLIJ_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "workflow-pane.mjs");
 
 const ConductorParams = Type.Object({
   workflow: Type.String({
@@ -39,42 +39,9 @@ const ConductorParams = Type.Object({
   ),
 });
 
-interface UsageStats {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
-  contextTokens: number;
-  turns: number;
-}
-
-interface SingleResult {
-  agent: string;
-  agentSource: AgentSource | "unknown";
-  task: string;
-  exitCode: number;
-  messages: Message[];
-  stderr: string;
-  usage: UsageStats;
-  model?: string;
-  stopReason?: string;
-  errorMessage?: string;
-  step?: number;
-}
-
-interface WorkflowDetails {
-  workflowName: string;
-  workflowSource: WorkflowSource;
-  workflowFilePath: string | null;
-  results: SingleResult[];
-}
-
 type DisplayItem =
   | { type: "text"; text: string }
   | { type: "toolCall"; name: string; args: Record<string, unknown> };
-
-type OnUpdateCallback = (partial: AgentToolResult<WorkflowDetails>) => void;
 
 function formatTokens(count: number): string {
   if (count < 1000) return count.toString();
@@ -191,17 +158,6 @@ function formatToolCall(
   }
 }
 
-function getFinalOutput(messages: Message[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "assistant") continue;
-    for (const part of msg.content) {
-      if (part.type === "text") return part.text;
-    }
-  }
-  return "";
-}
-
 function getDisplayItems(messages: Message[]): DisplayItem[] {
   const items: DisplayItem[] = [];
   for (const msg of messages) {
@@ -241,216 +197,6 @@ function aggregateUsage(results: SingleResult[]) {
   return total;
 }
 
-function writePromptToTempFile(
-  agentName: string,
-  prompt: string,
-): { dir: string; filePath: string } {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tempDir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-  return { dir: tempDir, filePath };
-}
-
-function isErrorResult(result: SingleResult): boolean {
-  return (
-    result.exitCode !== 0 ||
-    result.stopReason === "error" ||
-    result.stopReason === "aborted"
-  );
-}
-
-async function runSingleAgent(
-  defaultCwd: string,
-  agents: AgentConfig[],
-  agentName: string,
-  task: string,
-  cwd: string | undefined,
-  step: number,
-  signal: AbortSignal | undefined,
-  onUpdate: OnUpdateCallback | undefined,
-  makeDetails: (results: SingleResult[]) => WorkflowDetails,
-): Promise<SingleResult> {
-  const agent = agents.find((item) => item.name === agentName);
-  if (!agent) {
-    return {
-      agent: agentName,
-      agentSource: "unknown",
-      task,
-      exitCode: 1,
-      messages: [],
-      stderr: `Unknown agent: "${agentName}"`,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        contextTokens: 0,
-        turns: 0,
-      },
-      step,
-    };
-  }
-
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) args.push("--model", agent.model);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  }
-
-  let tempPromptDir: string | null = null;
-  let tempPromptPath: string | null = null;
-
-  const currentResult: SingleResult = {
-    agent: agentName,
-    agentSource: agent.source,
-    task,
-    exitCode: 0,
-    messages: [],
-    stderr: "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      contextTokens: 0,
-      turns: 0,
-    },
-    model: agent.model,
-    step,
-  };
-
-  const emitUpdate = () => {
-    if (!onUpdate) return;
-    onUpdate({
-      content: [
-        {
-          type: "text",
-          text: getFinalOutput(currentResult.messages) || "(running...)",
-        },
-      ],
-      details: makeDetails([currentResult]),
-    });
-  };
-
-  try {
-    if (agent.systemPrompt.trim()) {
-      const tempPrompt = writePromptToTempFile(agent.name, agent.systemPrompt);
-      tempPromptDir = tempPrompt.dir;
-      tempPromptPath = tempPrompt.filePath;
-      args.push("--append-system-prompt", tempPromptPath);
-    }
-
-    args.push(task);
-    let wasAborted = false;
-
-    const exitCode = await new Promise<number>((resolve) => {
-      const proc = spawn("pi", args, {
-        cwd: cwd ?? defaultCwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let buffer = "";
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: any;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-
-        if (event.type === "message_end" && event.message) {
-          const message = event.message as Message;
-          currentResult.messages.push(message);
-
-          if (message.role === "assistant") {
-            currentResult.usage.turns++;
-            const usage = message.usage;
-            if (usage) {
-              currentResult.usage.input += usage.input || 0;
-              currentResult.usage.output += usage.output || 0;
-              currentResult.usage.cacheRead += usage.cacheRead || 0;
-              currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-              currentResult.usage.cost += usage.cost?.total || 0;
-              currentResult.usage.contextTokens = usage.totalTokens || 0;
-            }
-            if (!currentResult.model && message.model) {
-              currentResult.model = message.model;
-            }
-            if (message.stopReason) {
-              currentResult.stopReason = message.stopReason;
-            }
-            if (message.errorMessage) {
-              currentResult.errorMessage = message.errorMessage;
-            }
-          }
-          emitUpdate();
-        }
-
-        if (event.type === "tool_result_end" && event.message) {
-          currentResult.messages.push(event.message as Message);
-          emitUpdate();
-        }
-      };
-
-      proc.stdout.on("data", (data) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
-      });
-
-      proc.stderr.on("data", (data) => {
-        currentResult.stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
-      });
-
-      proc.on("error", () => {
-        resolve(1);
-      });
-
-      if (signal) {
-        const killProc = () => {
-          wasAborted = true;
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 5000);
-        };
-        if (signal.aborted) killProc();
-        else signal.addEventListener("abort", killProc, { once: true });
-      }
-    });
-
-    currentResult.exitCode = exitCode;
-    if (wasAborted) throw new Error("Workflow step was aborted");
-    return currentResult;
-  } finally {
-    if (tempPromptPath) {
-      try {
-        fs.unlinkSync(tempPromptPath);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (tempPromptDir) {
-      try {
-        fs.rmdirSync(tempPromptDir);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-}
-
 function tokenizeCommandArgs(input: string): string[] {
   const tokens: string[] = [];
   const pattern = /"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+)/g;
@@ -470,10 +216,6 @@ function isInsideZellij(): boolean {
   );
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 function buildConductorInstruction(workflowName: string, task: string): string {
   return [
     "Use the `conductor` tool immediately.",
@@ -489,15 +231,10 @@ async function launchWorkflowInZellijPane(
   ctx: ExtensionCommandContext,
   workflowName: string,
   task: string,
-): Promise<boolean> {
-  const instruction = buildConductorInstruction(workflowName, task);
+): Promise<{ launched: boolean; statusFile?: string }> {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-zellij-"));
+  const statusFile = path.join(tempDir, "workflow-status.json");
   const paneName = `workflow:${workflowName}`;
-  const script = [
-    `pi --no-session -p ${shellQuote(instruction)}`,
-    "status=$?",
-    "printf '\\n\\n[workflow finished with exit code %s] Press Enter to close this pane.' \"$status\"",
-    "read -r _",
-  ].join("; ");
 
   try {
     await pi.exec(
@@ -511,16 +248,44 @@ async function launchWorkflowInZellijPane(
         "--cwd",
         ctx.cwd,
         "--",
-        "bash",
-        "-lc",
-        script,
+        process.execPath,
+        ZELLIJ_PANE_SCRIPT,
+        "--workflow",
+        workflowName,
+        "--task",
+        task,
+        "--cwd",
+        ctx.cwd,
+        "--status-file",
+        statusFile,
       ],
       { cwd: ctx.cwd },
     );
-    ctx.ui.notify(`Opened workflow in Zellij pane: ${workflowName}`, "info");
-    return true;
+    return { launched: true, statusFile };
   } catch {
-    return false;
+    return { launched: false };
+  }
+}
+
+async function waitForWorkflowStatusFile(statusFile: string): Promise<{
+  success: boolean;
+  message?: string;
+}> {
+  while (true) {
+    try {
+      const content = fs.readFileSync(statusFile, "utf8");
+      const data = JSON.parse(content) as {
+        done?: boolean;
+        success?: boolean;
+        message?: string;
+      };
+      if (data.done) {
+        return { success: Boolean(data.success), message: data.message };
+      }
+    } catch {
+      /* still waiting */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 
@@ -759,109 +524,45 @@ export default function registerExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtimeCwd = params.cwd ?? ctx.cwd;
-      const { agents } = discoverAgents(runtimeCwd);
-      const { workflows } = discoverWorkflows(runtimeCwd);
-      const workflow = workflows.find((item) => item.name === params.workflow);
-
-      if (!workflow) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Unknown workflow: "${params.workflow}". Available workflows: ${buildAvailableWorkflowText(workflows) || "none"}.`,
-            },
-          ],
-          details: {
-            workflowName: params.workflow,
-            workflowSource: "built-in" as const,
-            workflowFilePath: null,
-            results: [],
-          },
-          isError: true,
-        };
-      }
-
-      const makeDetails = (results: SingleResult[]): WorkflowDetails => ({
-        workflowName: workflow.name,
-        workflowSource: workflow.source,
-        workflowFilePath: workflow.filePath ?? null,
-        results,
-      });
-
-      const missingAgents = workflow.agentNames.filter(
-        (agentName) => !agents.some((agent) => agent.name === agentName),
-      );
-      if (missingAgents.length > 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Workflow "${workflow.name}" cannot start. Missing agents: ${missingAgents.join(", ")}.`,
-            },
-          ],
-          details: makeDetails([]),
-          isError: true,
-        };
-      }
-
-      const results: SingleResult[] = [];
-      let currentInput = params.task;
-
-      for (let index = 0; index < workflow.agentNames.length; index++) {
-        const agentName = workflow.agentNames[index];
-        const workflowUpdate: OnUpdateCallback | undefined = onUpdate
-          ? (partial) => {
-              const currentResult = partial.details?.results[0];
-              if (!currentResult) return;
+      const result = await runWorkflowByName(
+        runtimeCwd,
+        params.workflow,
+        params.task,
+        signal,
+        onUpdate
+          ? (details) => {
               onUpdate({
-                content: partial.content,
-                details: makeDetails([...results, currentResult]),
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      details.results.length > 0
+                        ? getFinalOutput(details.results[details.results.length - 1].messages) ||
+                          "(running...)"
+                        : "(running...)",
+                  },
+                ],
+                details,
               });
             }
-          : undefined;
-
-        const result = await runSingleAgent(
-          runtimeCwd,
-          agents,
-          agentName,
-          currentInput,
-          runtimeCwd,
-          index + 1,
-          signal,
-          workflowUpdate,
-          makeDetails,
-        );
-        results.push(result);
-
-        if (isErrorResult(result)) {
-          const errorMessage =
-            result.errorMessage ||
-            result.stderr ||
-            getFinalOutput(result.messages) ||
-            "(no output)";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow stopped at step ${index + 1} (${agentName}): ${errorMessage}`,
-              },
-            ],
-            details: makeDetails(results),
-            isError: true,
-          };
-        }
-
-        currentInput = getFinalOutput(result.messages);
-      }
-
-      const finalText =
-        results.length > 0
-          ? getFinalOutput(results[results.length - 1].messages) || "(no output)"
-          : "(no output)";
-
+          : undefined,
+      );
       return {
-        content: [{ type: "text", text: finalText }],
-        details: makeDetails(results),
+        content: [
+          {
+            type: "text",
+            text: result.isError
+              ? result.errorMessage || "(workflow failed)"
+              : result.finalText,
+          },
+        ],
+        details: {
+          workflowName: result.workflowName,
+          workflowSource: result.workflowSource,
+          workflowFilePath: result.workflowFilePath,
+          results: result.results,
+        },
+        isError: result.isError,
       };
     },
 
@@ -895,7 +596,18 @@ export default function registerExtension(pi: ExtensionAPI) {
           workflowName,
           task,
         );
-        if (launched) return;
+        if (launched.launched && launched.statusFile) {
+          ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
+          const status = await waitForWorkflowStatusFile(launched.statusFile);
+          ctx.ui.setStatus("workflow", undefined);
+          if (!status.success) {
+            ctx.ui.notify(
+              status.message || `Workflow ${workflowName} failed in Zellij.`,
+              "error",
+            );
+          }
+          return;
+        }
         ctx.ui.notify(
           "Could not open a Zellij pane. Running the workflow in the current Pi session instead.",
           "warning",

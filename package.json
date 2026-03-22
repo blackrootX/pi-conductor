@@ -14,6 +14,7 @@
   },
   "files": [
     "extensions",
+    "scripts",
     "src",
     "README.md",
     "LICENSE"
