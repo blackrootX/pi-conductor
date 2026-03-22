@@ -5,7 +5,7 @@ import type { ResolvedWorkflowStep, StepResultEnvelope, StepArtifact, StepStatus
 import type { ChildSessionContext } from "./contextBuilder";
 import { buildChildSessionContext } from "./contextBuilder";
 import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { accessSync, constants, promises as fs } from "node:fs";
 import path from "node:path";
 
 export interface ChildSessionOptions {
@@ -596,30 +596,30 @@ export function shouldContinueOnFailure(
  * Find the pi CLI executable path.
  */
 function findPiCli(): string {
-  // Check common locations
   const possiblePaths = [
-    // User's global npm/bin
     path.join(process.env.HOME || "", ".npm-global", "bin", "pi"),
     path.join(process.env.HOME || "", ".local", "bin", "pi"),
-    // npx
-    "npx",
-    // Direct installation
     "pi",
-    // Current node_modules
     path.join(__dirname, "..", "..", "node_modules", ".bin", "pi"),
   ];
 
-  // Check if we can use npx
   if (process.env.PATH) {
     const pathEnv = process.env.PATH.split(path.delimiter);
     for (const dir of pathEnv) {
-      const piPath = path.join(dir, "pi");
-      possiblePaths.push(piPath);
+      possiblePaths.push(path.join(dir, "pi"));
     }
   }
 
-  // Return npx as fallback (it will resolve the package)
-  return "npx";
+  for (const candidate of possiblePaths) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep scanning until we find an executable pi binary.
+    }
+  }
+
+  return "pi";
 }
 
 /**

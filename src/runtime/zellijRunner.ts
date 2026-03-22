@@ -1,7 +1,7 @@
 // src/runtime/zellijRunner.ts - Zellij-based workflow execution
 
 import { execSync, spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { accessSync, constants, promises as fs } from "node:fs";
 import path from "node:path";
 import type { AgentSpec } from "../types";
 import type { ResolvedWorkflowStep, StepResultEnvelope, StepArtifact, StepStatus } from "../workflow/types";
@@ -427,7 +427,6 @@ export class ZellijRunner implements SessionRunner {
     const possiblePaths = [
       path.join(process.env.HOME || "", ".npm-global", "bin", "pi"),
       path.join(process.env.HOME || "", ".local", "bin", "pi"),
-      "npx",
       "pi",
       path.join(__dirname, "..", "..", "node_modules", ".bin", "pi"),
     ];
@@ -435,12 +434,20 @@ export class ZellijRunner implements SessionRunner {
     if (process.env.PATH) {
       const pathEnv = process.env.PATH.split(path.delimiter);
       for (const dir of pathEnv) {
-        const piPath = path.join(dir, "pi");
-        possiblePaths.push(piPath);
+        possiblePaths.push(path.join(dir, "pi"));
       }
     }
 
-    return "npx";
+    for (const candidate of possiblePaths) {
+      try {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // Keep scanning until we find an executable pi binary.
+      }
+    }
+
+    return "pi";
   }
 
   /**
