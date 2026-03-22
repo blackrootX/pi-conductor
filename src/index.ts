@@ -289,6 +289,27 @@ async function waitForWorkflowStatusFile(statusFile: string): Promise<{
   }
 }
 
+function blockMainSessionInput(ctx: ExtensionCommandContext): () => void {
+  if (!ctx.hasUI) return () => {};
+
+  const restoreInput = ctx.ui.onTerminalInput(() => ({ consume: true }));
+  ctx.ui.setWorkingMessage("Workflow running in Zellij. Input is blocked until it finishes.");
+  ctx.ui.setWidget(
+    "workflow-zellij-block",
+    [
+      "Workflow is running in the Zellij side pane.",
+      "This session is temporarily blocked until the workflow finishes.",
+    ],
+    { placement: "aboveEditor" },
+  );
+
+  return () => {
+    restoreInput();
+    ctx.ui.setWorkingMessage();
+    ctx.ui.setWidget("workflow-zellij-block", undefined);
+  };
+}
+
 async function resolveWorkflowCommandInput(
   args: string,
   ctx: ExtensionCommandContext,
@@ -597,14 +618,19 @@ export default function registerExtension(pi: ExtensionAPI) {
           task,
         );
         if (launched.launched && launched.statusFile) {
+          const unblockInput = blockMainSessionInput(ctx);
           ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
-          const status = await waitForWorkflowStatusFile(launched.statusFile);
-          ctx.ui.setStatus("workflow", undefined);
-          if (!status.success) {
-            ctx.ui.notify(
-              status.message || `Workflow ${workflowName} failed in Zellij.`,
-              "error",
-            );
+          try {
+            const status = await waitForWorkflowStatusFile(launched.statusFile);
+            if (!status.success) {
+              ctx.ui.notify(
+                status.message || `Workflow ${workflowName} failed in Zellij.`,
+                "error",
+              );
+            }
+          } finally {
+            ctx.ui.setStatus("workflow", undefined);
+            unblockInput();
           }
           return;
         }

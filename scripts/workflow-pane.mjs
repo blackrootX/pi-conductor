@@ -72,11 +72,14 @@ function writeStatus(statusFile, payload) {
 
 async function promptToClosePane() {
   const rl = readline.createInterface({ input: stdin, output: stdout });
-  const answer = await rl.question("Close this pane? [y/N]: ");
+  const answer = await rl.question(
+    "Press Enter to close this pane, or type 'keep' to leave it open: ",
+  );
   rl.close();
 
-  if (answer.trim().toLowerCase().startsWith("y")) {
-    spawnSync("zellij", ["action", "close-pane"], { stdio: "inherit" });
+  const normalized = answer.trim().toLowerCase();
+  if (!normalized || normalized === "y" || normalized === "yes") {
+    spawnSync("zellij", ["action", "close-pane"], { stdio: "ignore" });
     return;
   }
 
@@ -130,6 +133,12 @@ async function main() {
 }
 
 main().catch((error) => {
+  const args = parseArgs(process.argv);
+  writeStatus(args["status-file"], {
+    done: true,
+    success: false,
+    message: error instanceof Error ? error.message : String(error),
+  });
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
 });
