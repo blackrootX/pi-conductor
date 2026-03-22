@@ -1,0 +1,9 @@
+{
+  "conductorWorkflow": [
+    "planner-coder-review",
+    "plan-implement-review",
+    "implement-and-review"
+  ],
+  "conductorWorkflowMultiplexer": "zellij",
+  "conductorWorkflowDisplay": "split-pane"
+}
