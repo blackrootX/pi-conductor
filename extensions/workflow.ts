@@ -122,12 +122,10 @@ export default function (pi: ExtensionAPI) {
         if (shouldUseNativeWorkflowUi(parsedArgs, trimmedArgs)) {
           execution = await runNativeWorkflowUi(pi, ctx, parsedArgs, registry, observer);
         } else {
-          execution = parsedArgs.run
-            ? await runWorkflowWithInputLock(
-                ctx,
-                () => executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer)
-              )
-            : await executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer);
+          execution = await executeWorkflowFromExtension(ctx, registry, observer, {
+            ...parsedArgs,
+            cwd: ctx.cwd,
+          });
         }
 
         finalizeWorkflowUi(ctx, progressState, execution);
@@ -149,21 +147,20 @@ function shouldUseNativeWorkflowUi(
   parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>,
   rawArgs: string
 ): boolean {
-  if (parsedArgs.help || parsedArgs.list || parsedArgs.show || parsedArgs.add || parsedArgs.remove || parsedArgs.run || parsedArgs.cleanup) {
-    if (!parsedArgs.save) {
-      return false;
-    }
-  }
-
-  if (parsedArgs.save) {
-    return false;
-  }
-
   if (parsedArgs.settings || rawArgs === "settings") {
     return true;
   }
 
-  return true;
+  return !(
+    parsedArgs.help ||
+    parsedArgs.list ||
+    parsedArgs.show ||
+    parsedArgs.add ||
+    parsedArgs.remove ||
+    parsedArgs.run ||
+    parsedArgs.save ||
+    parsedArgs.cleanup
+  );
 }
 
 async function runNativeWorkflowUi(
@@ -182,45 +179,19 @@ async function runNativeWorkflowUi(
     return promptAndRunWorkflowFromPiUi(parsedArgs.task.trim(), ctx, registry, observer, parsedArgs);
   }
 
-  const choice = await ctx.ui.select("Workflow", [
-    "Run workflow",
-    "List workflows",
-    "Add workflow",
-    "Remove workflow",
-    "Save workflow template",
-    "Cleanup artifacts",
-    "Settings",
-  ]);
+  const actions = createNativeWorkflowActions(pi, ctx, registry, observer, parsedArgs);
+  const choice = await ctx.ui.select(
+    "Workflow",
+    actions.map((action) => action.label)
+  );
 
   if (!choice) {
     ctx.ui.notify("Workflow menu cancelled", "info");
     return;
   }
 
-  switch (choice) {
-    case "Run workflow":
-      return promptAndRunWorkflowFromPiUi(undefined, ctx, registry, observer, parsedArgs);
-    case "List workflows":
-      await showConfiguredWorkflowsInPi(ctx);
-      return;
-    case "Add workflow":
-      await addWorkflowFromPiUi(ctx, registry);
-      return;
-    case "Remove workflow":
-      await removeWorkflowFromPiUi(ctx);
-      return;
-    case "Settings":
-      await runNativeWorkflowSettings(ctx);
-      return;
-    case "Save workflow template":
-      await saveWorkflowTemplateFromPiUi(ctx);
-      return;
-    case "Cleanup artifacts":
-      await cleanupWorkflowFromPiUi(pi, ctx);
-      return;
-    default:
-      return;
-  }
+  const action = actions.find((entry) => entry.label === choice);
+  return action?.run();
 }
 
 async function promptAndRunWorkflowFromPiUi(
@@ -230,33 +201,78 @@ async function promptAndRunWorkflowFromPiUi(
   observer: WorkflowCommandObserver,
   parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>
 ): Promise<WorkflowCommandExecution | void> {
-  const workflows = await getConfiguredWorkflows(ctx.cwd);
-  if (workflows.length === 0) {
-    throw new Error("No workflows found. Create one with /workflow -> Add workflow.");
-  }
-
-  const options = workflows.map((workflow) =>
-    workflow.description ? `${workflow.id} - ${workflow.description}` : workflow.id
-  );
-  const selected = await pickFromList(ctx, "Select workflow", options);
-  if (!selected) {
+  const workflow = await selectWorkflowForRun(ctx);
+  if (!workflow) {
     return;
   }
 
-  const workflow = workflows[options.indexOf(selected)];
   const task = initialTask ?? await promptForTask(ctx, workflow.id);
   if (!task) {
     return;
   }
 
-  return runWorkflowWithInputLock(
-    ctx,
-    () => executeWorkflowCommand(
-      { ...parsedArgs, run: workflow.id, task, cwd: ctx.cwd },
-      registry,
-      observer
-    ) as Promise<WorkflowCommandExecution | void>
-  );
+  return executeWorkflowFromExtension(ctx, registry, observer, {
+    ...parsedArgs,
+    run: workflow.id,
+    task,
+    cwd: ctx.cwd,
+  });
+}
+
+interface NativeWorkflowAction {
+  label: string;
+  run: () => Promise<WorkflowCommandExecution | void>;
+}
+
+function createNativeWorkflowActions(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  registry: Awaited<ReturnType<typeof createDefaultRegistry>>,
+  observer: WorkflowCommandObserver,
+  parsedArgs: ReturnType<typeof parseWorkflowCommandArgs>
+): NativeWorkflowAction[] {
+  return [
+    {
+      label: "Run workflow",
+      run: () => promptAndRunWorkflowFromPiUi(undefined, ctx, registry, observer, parsedArgs),
+    },
+    {
+      label: "List workflows",
+      run: async () => {
+        await showConfiguredWorkflowsInPi(ctx);
+      },
+    },
+    {
+      label: "Add workflow",
+      run: async () => {
+        await addWorkflowFromPiUi(ctx, registry);
+      },
+    },
+    {
+      label: "Remove workflow",
+      run: async () => {
+        await removeWorkflowFromPiUi(ctx);
+      },
+    },
+    {
+      label: "Save workflow template",
+      run: async () => {
+        await saveWorkflowTemplateFromPiUi(ctx);
+      },
+    },
+    {
+      label: "Cleanup artifacts",
+      run: async () => {
+        await cleanupWorkflowFromPiUi(pi, ctx);
+      },
+    },
+    {
+      label: "Settings",
+      run: async () => {
+        await runNativeWorkflowSettings(ctx);
+      },
+    },
+  ];
 }
 
 function createWorkflowLockMessage(theme: ExtensionCommandContext["ui"]["theme"]) {
@@ -293,6 +309,33 @@ async function runWorkflowWithInputLock<T>(
     handle?.close?.();
     await lockPromise;
   }
+}
+
+async function executeWorkflowFromExtension(
+  ctx: ExtensionCommandContext,
+  registry: Awaited<ReturnType<typeof createDefaultRegistry>>,
+  observer: WorkflowCommandObserver,
+  options: ReturnType<typeof parseWorkflowCommandArgs> & { cwd: string }
+): Promise<WorkflowCommandExecution | void> {
+  const runCommand = () => executeWorkflowCommand(options, registry, observer);
+  return options.run
+    ? runWorkflowWithInputLock(ctx, runCommand)
+    : runCommand();
+}
+
+async function selectWorkflowForRun(
+  ctx: ExtensionCommandContext
+): Promise<{ id: string; name: string; description?: string } | undefined> {
+  const workflows = await getConfiguredWorkflows(ctx.cwd);
+  if (workflows.length === 0) {
+    throw new Error("No workflows found. Create one with /workflow -> Add workflow.");
+  }
+
+  const labels = workflows.map((workflow) =>
+    workflow.description ? `${workflow.id} - ${workflow.description}` : workflow.id
+  );
+  const selected = await pickFromList(ctx, "Select workflow", labels);
+  return selected ? workflows[labels.indexOf(selected)] : undefined;
 }
 
 async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promise<void> {
