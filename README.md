@@ -178,7 +178,6 @@ Workflow settings are stored in `.pi/agent/settings.json` (project) with fallbac
 
 ```json
 {
-  "conductorWorkflow": ["plan-implement-review", "quick-review"],
   "conductorWorkflowMultiplexer": "none",
   "conductorWorkflowDisplay": "main-window"
 }
@@ -188,7 +187,6 @@ Workflow settings are stored in `.pi/agent/settings.json` (project) with fallbac
 
 | Key | Values | Description |
 |-----|--------|-------------|
-| `conductorWorkflow` | Array of workflow IDs | Ordered list of configured workflows (first is default) |
 | `conductorWorkflowMultiplexer` | `"none"` (default), `"zellij"` | Backend for workflow execution |
 | `conductorWorkflowDisplay` | `"main-window"`, `"split-pane"` | Display strategy (only when multiplexer is `"zellij"`) |
 
@@ -211,9 +209,36 @@ Outside Zellij, both display strategies fall back to starting a detached Zellij 
 
 Project settings override user settings when a key is present.
 
+## Predefined Workflow Templates
+
+Like `pi-teams`, `pi-conductor` supports simple reusable templates in YAML. Create `~/.pi/workflows.yaml` for user-global workflows or `.pi/workflows.yaml` in a project for project-specific workflows.
+
+```yaml
+full:
+  - planner
+  - coder
+  - reviewer
+
+quick-review:
+  - reviewer
+
+frontend:
+  - planner
+  - coder
+  - reviewer
+```
+
+Each template entry becomes a sequential workflow that runs the listed agent IDs in order. Project templates override user templates, and both override built-in workflows with the same ID.
+
+`pi-conductor` still reads the older JSON workflow template files for compatibility, but YAML is the preferred format for simple predefined workflows.
+
 ## Agent Format
 
 Agents are markdown files with YAML frontmatter:
+
+- project agents: `.pi/agents/*.md`
+- user agents: `~/.pi/agent/agents/*.md`
+- built-in agents: [agents/](/Users/tree/Code/Github/pi-conductor/agents)
 
 ```yaml
 ---

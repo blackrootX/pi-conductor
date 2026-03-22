@@ -19,8 +19,9 @@ import {
 import { createDefaultRegistry } from "../src/registry";
 import { formatWorkflowResult, type ProgressEvent } from "../src/runtime/orchestrator";
 import type { StepResultEnvelope, WorkflowRunResult } from "../src/workflow/types";
-import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../src/workflow/templates";
+import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowAgentListTemplate, saveWorkflowTemplate } from "../src/workflow/templates";
 import type { WorkflowApprovalRequest, WorkflowApprovalResult } from "../src/workflow/approval";
+import type { AgentSpec } from "../src/types";
 
 type WorkflowMessageDetails =
   | {
@@ -198,7 +199,7 @@ async function runNativeWorkflowUi(
       await showConfiguredWorkflowsInPi(ctx);
       return;
     case "Add workflow":
-      await addWorkflowFromPiUi(ctx);
+      await addWorkflowFromPiUi(ctx, registry);
       return;
     case "Remove workflow":
       await removeWorkflowFromPiUi(ctx);
@@ -226,7 +227,7 @@ async function promptAndRunWorkflowFromPiUi(
 ): Promise<WorkflowCommandExecution | void> {
   const workflows = await getConfiguredWorkflows(ctx.cwd);
   if (workflows.length === 0) {
-    throw new Error("No configured workflows found. Use /workflow add <workflow-id> to add one.");
+    throw new Error("No workflows found. Create one with /workflow -> Add workflow.");
   }
 
   const options = workflows.map((workflow) =>
@@ -253,57 +254,84 @@ async function promptAndRunWorkflowFromPiUi(
 async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promise<void> {
   const workflows = await getConfiguredWorkflows(ctx.cwd);
   if (workflows.length === 0) {
-    ctx.ui.notify("No configured workflows found", "info");
+    ctx.ui.notify("No workflows found", "info");
     return;
   }
 
   ctx.ui.setWidget("workflow-config", workflows.map((workflow, index) =>
     `${index + 1}. ${workflow.id}${workflow.description ? ` - ${workflow.description}` : ""}`
   ));
-  ctx.ui.notify(`Loaded ${workflows.length} configured workflow(s)`, "info");
+  ctx.ui.notify(`Loaded ${workflows.length} workflow(s)`, "info");
 }
 
-async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
-  const presets = await listWorkflowDefinitions(ctx.cwd);
-  const configured = new Set((await getConfiguredWorkflows(ctx.cwd)).map((workflow) => workflow.id));
-  const candidates = presets
-    .filter((preset) => !configured.has(preset.id))
-    .map((preset) => {
-      const description = preset.description ? ` - ${preset.description}` : "";
-      return `${preset.id}${description} [${preset.source}]`;
-    });
-
-  if (candidates.length === 0) {
-    ctx.ui.notify("All known workflows are already configured", "info");
+async function addWorkflowFromPiUi(
+  ctx: ExtensionCommandContext,
+  registry: Awaited<ReturnType<typeof createDefaultRegistry>>
+): Promise<void> {
+  const scope = await ctx.ui.select("Create workflow in", ["project", "user"]);
+  if (!scope) {
+    ctx.ui.notify("Workflow creation cancelled", "info");
     return;
   }
 
-  const selected = await ctx.ui.select("Add workflow", candidates);
-  if (!selected) {
+  const agents = (await registry.listAgents())
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  if (agents.length === 0) {
+    ctx.ui.notify("No agents available to build a workflow", "warning");
     return;
   }
 
-  const workflowId = selected.split(" [")[0].split(" - ")[0];
-  await executeWorkflowCommand({ add: workflowId, cwd: ctx.cwd });
-  ctx.ui.notify(`Added workflow: ${workflowId}`, "info");
+  const selectedAgents = await selectWorkflowAgents(ctx, agents);
+  if (selectedAgents.length === 0) {
+    ctx.ui.notify("Workflow creation cancelled", "info");
+    ctx.ui.setWidget("workflow-builder", []);
+    return;
+  }
+
+  const defaultWorkflowId = selectedAgents.map((agent) => agent.id).join("-");
+  const workflowId = (await ctx.ui.input("Workflow id:", defaultWorkflowId))?.trim();
+  if (!workflowId) {
+    ctx.ui.notify("Workflow creation cancelled", "info");
+    ctx.ui.setWidget("workflow-builder", []);
+    return;
+  }
+
+  const description = (await ctx.ui.input("Description (optional):", ""))?.trim() || undefined;
+
+  try {
+    await saveWorkflowAgentListTemplate(
+      workflowId,
+      selectedAgents.map((agent) => agent.id),
+      scope as SettingsScope,
+      ctx.cwd,
+      description
+    );
+    ctx.ui.notify(`Created workflow: ${workflowId} (${scope})`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Failed to create workflow: ${message}`, "error");
+  } finally {
+    ctx.ui.setWidget("workflow-builder", []);
+  }
 }
 
 async function removeWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
-  const workflows = await getConfiguredWorkflows(ctx.cwd);
+  const workflows = (await listWorkflowDefinitions(ctx.cwd)).filter((workflow) => workflow.source !== "built-in");
   if (workflows.length === 0) {
-    ctx.ui.notify("No configured workflows to remove", "info");
+    ctx.ui.notify("No custom workflows available to remove", "info");
     return;
   }
 
   const selected = await ctx.ui.select(
     "Remove workflow",
-    workflows.map((workflow) => workflow.description ? `${workflow.id} - ${workflow.description}` : workflow.id)
+    workflows.map((workflow) => `${workflow.id}${workflow.description ? ` - ${workflow.description}` : ""} [${workflow.source}]`)
   );
   if (!selected) {
     return;
   }
 
-  const workflowId = selected.split(" - ")[0];
+  const workflowId = selected.split(" [")[0].split(" - ")[0];
   await executeWorkflowCommand({ remove: workflowId, cwd: ctx.cwd });
   ctx.ui.notify(`Removed workflow: ${workflowId}`, "info");
 }
@@ -438,7 +466,6 @@ async function runNativeWorkflowSettings(ctx: ExtensionCommandContext): Promise<
     }
 
     await writeWorkflowSettings({
-      conductorWorkflow: settings.conductorWorkflow,
       conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer,
       conductorWorkflowDisplay: settings.conductorWorkflowDisplay,
     }, scope, ctx.cwd);
@@ -812,6 +839,48 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   const seconds = Math.floor((ms % 60000) / 1000);
   return `${minutes}m ${seconds}s`;
+}
+
+async function selectWorkflowAgents(
+  ctx: ExtensionCommandContext,
+  agents: AgentSpec[]
+): Promise<AgentSpec[]> {
+  const selected: AgentSpec[] = [];
+
+  while (true) {
+    const lines = [
+      "Building workflow",
+      ...selected.map((agent, index) => `${index + 1}. ${agent.id}${agent.description ? ` - ${agent.description}` : ""}`),
+    ];
+    ctx.ui.setWidget("workflow-builder", lines);
+
+    const options = [
+      ...agents.map((agent) => `${agent.id}${agent.description ? ` - ${agent.description}` : ""} [${agent.source}]`),
+      "Done",
+    ];
+
+    const choice = await ctx.ui.select("Select agent for workflow", options);
+    if (!choice) {
+      return [];
+    }
+
+    if (choice === "Done") {
+      if (selected.length === 0) {
+        ctx.ui.notify("Select at least one agent before finishing", "warning");
+        continue;
+      }
+      return selected;
+    }
+
+    const agentId = choice.split(" [")[0].split(" - ")[0];
+    const agent = agents.find((entry) => entry.id === agentId);
+    if (!agent) {
+      ctx.ui.notify(`Unknown agent: ${agentId}`, "warning");
+      continue;
+    }
+
+    selected.push(agent);
+  }
 }
 
 function tokenizeCommandArgs(input: string): string[] {

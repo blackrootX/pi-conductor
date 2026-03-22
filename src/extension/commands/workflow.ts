@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { getPreset } from "../../workflow/presets";
 import { mergeWorkflowSkills } from "../../workflow/skills";
-import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../../workflow/templates";
+import { getWorkflowDefinition, listWorkflowDefinitions, removeWorkflowTemplate, saveWorkflowTemplate } from "../../workflow/templates";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
 import { createOrchestrator } from "../../runtime/orchestrator";
@@ -142,35 +142,27 @@ export async function executeWorkflowCommand(
 }
 
 /**
- * List configured workflows.
+ * List available workflows.
  */
 async function listConfiguredWorkflows(cwd = process.cwd()): Promise<void> {
-  const configured = await getConfiguredWorkflowIds(cwd);
+  const configured = await listWorkflowDefinitions(cwd);
 
-  console.log("\nConfigured Workflows:\n");
+  console.log("\nAvailable Workflows:\n");
 
   if (configured.length === 0) {
-    console.log("  No workflows configured.");
-    console.log("  Use '/workflow add <workflow-id>' to add one.");
+    console.log("  No workflows available.");
     console.log("");
     return;
   }
 
   for (let i = 0; i < configured.length; i++) {
-    const workflowId = configured[i];
-    const preset = await getWorkflowDefinition(workflowId, cwd);
-    const label = i === 0 ? " (default)" : "";
-
-    console.log(`  ${i + 1}. ${workflowId}${label}`);
-    if (preset) {
-      console.log(`     ${preset.workflow.name}`);
-      if (preset.workflow.description) {
-        console.log(`     ${preset.workflow.description}`);
-      }
-      console.log(`     Source: ${preset.source}`);
-    } else {
-      console.log("     Unknown workflow ID in settings");
+    const workflow = configured[i];
+    console.log(`  ${i + 1}. ${workflow.id}`);
+    console.log(`     ${workflow.name}`);
+    if (workflow.description) {
+      console.log(`     ${workflow.description}`);
     }
+    console.log(`     Source: ${workflow.source}`);
     console.log("");
   }
 }
@@ -187,7 +179,6 @@ async function saveWorkflowSettings(
 
   const newSettings: WorkflowSettings = {
     ...existingSettings,
-    conductorWorkflow: settings.conductorWorkflow,
     conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer,
     conductorWorkflowDisplay: settings.conductorWorkflowDisplay,
   };
@@ -324,42 +315,22 @@ async function addWorkflow(workflowId: string, cwd = process.cwd()): Promise<voi
   const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId, cwd);
   const preset = normalizedWorkflowId ? await getWorkflowDefinition(normalizedWorkflowId, cwd) : undefined;
   if (!preset) {
-    const available = (await listWorkflowDefinitions()).map((entry) => entry.id).join(", ");
+    const available = (await listWorkflowDefinitions(cwd)).map((entry) => entry.id).join(", ");
     throw new Error(`Unknown workflow: ${workflowId}. Available workflows: ${available}`);
   }
 
-  const settings = await readWorkflowSettings(cwd);
-  const configured = settings.conductorWorkflow ?? [];
-
-  if (configured.includes(preset.workflow.id)) {
-    console.log(`Workflow already configured: ${preset.workflow.id}`);
-    return;
-  }
-
-  settings.conductorWorkflow = [...configured, preset.workflow.id];
-  await writeWorkflowSettings(settings, "project", cwd);
-
-  console.log(`Added workflow: ${preset.workflow.id}`);
+  await saveWorkflowTemplate(preset.workflow, "project", cwd);
+  console.log(`Saved workflow template: ${preset.workflow.id} (project)`);
 }
 
 async function removeWorkflow(workflowId: string, cwd = process.cwd()): Promise<void> {
-  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId, cwd);
-  if (!normalizedWorkflowId) {
+  const resolved = await getWorkflowDefinition(workflowId, cwd);
+  if (!resolved) {
     throw new Error(`Unknown workflow: ${workflowId}`);
   }
 
-  const settings = await readWorkflowSettings(cwd);
-  const configured = settings.conductorWorkflow ?? [];
-
-  if (!configured.includes(normalizedWorkflowId)) {
-    console.log(`Workflow not configured: ${normalizedWorkflowId}`);
-    return;
-  }
-
-  settings.conductorWorkflow = configured.filter((id) => id !== normalizedWorkflowId);
-  await writeWorkflowSettings(settings, "project", cwd);
-
-  console.log(`Removed workflow: ${normalizedWorkflowId}`);
+  await removeWorkflowTemplate(resolved.workflow.id, resolved.source, cwd);
+  console.log(`Removed workflow: ${resolved.workflow.id}`);
 }
 
 async function saveWorkflow(
@@ -413,7 +384,6 @@ function dedupeSuggestions(values: string[]): string[] {
 }
 
 export interface WorkflowSettings {
-  conductorWorkflow?: string[];
   conductorWorkflowMultiplexer?: WorkflowMultiplexer;
   conductorWorkflowDisplay?: WorkflowDisplayStrategy;
 }
@@ -423,7 +393,6 @@ export type WorkflowDisplayStrategy = "main-window" | "split-pane";
 export type SettingsScope = "project" | "user";
 
 export interface EffectiveWorkflowSettings {
-  conductorWorkflow: string[];
   conductorWorkflowMultiplexer: WorkflowMultiplexer;
   conductorWorkflowDisplay: WorkflowDisplayStrategy;
 }
@@ -449,9 +418,6 @@ async function readRawSettingsFile(settingsPath: string): Promise<Record<string,
 async function readWorkflowSettingsFromFile(settingsPath: string): Promise<WorkflowSettings> {
   const parsed = await readRawSettingsFile(settingsPath);
   return {
-    conductorWorkflow: Array.isArray(parsed.conductorWorkflow)
-      ? parsed.conductorWorkflow.filter((entry): entry is string => typeof entry === "string")
-      : undefined,
     conductorWorkflowMultiplexer: parsed.conductorWorkflowMultiplexer === undefined
       ? undefined
       : parseMultiplexer(parsed.conductorWorkflowMultiplexer),
@@ -485,7 +451,6 @@ async function readWorkflowSettings(cwd = process.cwd()): Promise<WorkflowSettin
 
 function hasExplicitWorkflowSettings(settings: WorkflowSettings): boolean {
   return (
-    settings.conductorWorkflow !== undefined ||
     settings.conductorWorkflowMultiplexer !== undefined ||
     settings.conductorWorkflowDisplay !== undefined
   );
@@ -494,7 +459,6 @@ function hasExplicitWorkflowSettings(settings: WorkflowSettings): boolean {
 async function getEffectiveWorkflowSettings(cwd = process.cwd()): Promise<EffectiveWorkflowSettings> {
   const settings = await readWorkflowSettings(cwd);
   return {
-    conductorWorkflow: settings.conductorWorkflow ?? [],
     conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer ?? "none",
     conductorWorkflowDisplay: settings.conductorWorkflowDisplay ?? "main-window",
   };
@@ -507,7 +471,6 @@ export async function getWorkflowSettingsContext(
   if (hasExplicitWorkflowSettings(projectSettings)) {
     return {
       settings: {
-        conductorWorkflow: projectSettings.conductorWorkflow ?? [],
         conductorWorkflowMultiplexer: projectSettings.conductorWorkflowMultiplexer ?? "none",
         conductorWorkflowDisplay: projectSettings.conductorWorkflowDisplay ?? "main-window",
       },
@@ -518,7 +481,6 @@ export async function getWorkflowSettingsContext(
   const userSettings = await readWorkflowSettingsFromFile(getUserSettingsPath());
   return {
     settings: {
-      conductorWorkflow: userSettings.conductorWorkflow ?? [],
       conductorWorkflowMultiplexer: userSettings.conductorWorkflowMultiplexer ?? "none",
       conductorWorkflowDisplay: userSettings.conductorWorkflowDisplay ?? "main-window",
     },
@@ -538,22 +500,13 @@ export async function writeWorkflowSettings(
   await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
 }
 
-async function getConfiguredWorkflowIds(cwd = process.cwd()): Promise<string[]> {
-  const settings = await readWorkflowSettings(cwd);
-  return settings.conductorWorkflow ?? [];
-}
-
 export async function getConfiguredWorkflows(cwd = process.cwd()): Promise<Array<{ id: string; name: string; description?: string }>> {
-  const ids = await getConfiguredWorkflowIds(cwd);
-  const definitions = await Promise.all(ids.map((id) => getWorkflowDefinition(id, cwd)));
-  return ids.map((id, index) => {
-    const preset = definitions[index];
-    return {
-      id,
-      name: preset?.workflow.name ?? id,
-      description: preset?.workflow.description,
-    };
-  });
+  const definitions = await listWorkflowDefinitions(cwd);
+  return definitions.map((workflow) => ({
+    id: workflow.id,
+    name: workflow.name,
+    description: workflow.description,
+  }));
 }
 
 // ============================================================================
@@ -1294,12 +1247,11 @@ Settings:
   directory (with fallback to ~/.pi/agent/settings.json).
 
   Supported settings:
-    conductorWorkflow           Array of configured workflow IDs
     conductorWorkflowMultiplexer  "none" (default) or "zellij"
     conductorWorkflowDisplay      "main-window" or "split-pane" (zellij only)
 
 Examples:
-  # Add workflows to settings
+  # Save built-in workflows as project templates
   /workflow add plan-implement-review
   /workflow add quick-review
 
