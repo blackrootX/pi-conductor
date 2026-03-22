@@ -79,6 +79,12 @@ export {
   createCustomWorkflow,
 } from "./workflow/presets";
 export {
+  getWorkflowDefinition,
+  listWorkflowDefinitions,
+  getAvailableWorkflowMap,
+  saveWorkflowTemplate,
+} from "./workflow/templates";
+export {
   resolveWorkflow,
   formatResolutionErrors,
 } from "./workflow/resolver";

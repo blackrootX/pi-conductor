@@ -2,4 +2,5 @@
 
 export * from "./types";
 export * from "./presets";
+export * from "./templates";
 export * from "./resolver";

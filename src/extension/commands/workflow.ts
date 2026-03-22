@@ -3,7 +3,8 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { listPresets, getPreset } from "../../workflow/presets";
+import { getPreset } from "../../workflow/presets";
+import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../../workflow/templates";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
 import { createOrchestrator } from "../../runtime/orchestrator";
@@ -26,6 +27,12 @@ export interface WorkflowCommandOptions {
   remove?: string;
   /** Run a workflow */
   run?: string;
+  /** Save a workflow as a template */
+  save?: string;
+  /** Target id when saving a template */
+  saveAs?: string;
+  /** Template save scope */
+  scope?: "project" | "user";
   /** Task description */
   task?: string;
   /** Runner type */
@@ -80,6 +87,11 @@ export async function executeWorkflowCommand(
     return;
   }
 
+  if (options.save) {
+    await saveWorkflow(options.save, options);
+    return;
+  }
+
   // Handle list option
   if (options.list) {
     await listConfiguredWorkflows();
@@ -88,7 +100,7 @@ export async function executeWorkflowCommand(
 
   // Handle show option
   if (options.show) {
-    showWorkflow(options.show);
+    await showWorkflow(options.show);
     return;
   }
 
@@ -126,15 +138,16 @@ async function listConfiguredWorkflows(): Promise<void> {
 
   for (let i = 0; i < configured.length; i++) {
     const workflowId = configured[i];
-    const preset = getPreset(workflowId);
+    const preset = await getWorkflowDefinition(workflowId);
     const label = i === 0 ? " (default)" : "";
 
     console.log(`  ${i + 1}. ${workflowId}${label}`);
     if (preset) {
-      console.log(`     ${preset.name}`);
-      if (preset.description) {
-        console.log(`     ${preset.description}`);
+      console.log(`     ${preset.workflow.name}`);
+      if (preset.workflow.description) {
+        console.log(`     ${preset.workflow.description}`);
       }
+      console.log(`     Source: ${preset.source}`);
     } else {
       console.log("     Unknown workflow ID in settings");
     }
@@ -176,8 +189,9 @@ async function isZellijAvailable(): Promise<boolean> {
 /**
  * Show details of a specific workflow.
  */
-function showWorkflow(workflowId: string): void {
-  const workflow = getPreset(workflowId);
+async function showWorkflow(workflowId: string): Promise<void> {
+  const resolved = await getWorkflowDefinition(workflowId);
+  const workflow = resolved?.workflow;
 
   if (!workflow) {
     console.error(`Unknown workflow: ${workflowId}`);
@@ -187,6 +201,9 @@ function showWorkflow(workflowId: string): void {
 
   console.log(`\n# ${workflow.name}`);
   console.log(`**ID:** ${workflow.id}`);
+  if (resolved) {
+    console.log(`**Source:** ${resolved.source}`);
+  }
   if (workflow.description) {
     console.log(`\n${workflow.description}`);
   }
@@ -272,29 +289,29 @@ function resolveWorkflowSelection(
 }
 
 async function addWorkflow(workflowId: string): Promise<void> {
-  const normalizedWorkflowId = resolveWorkflowIdForAdd(workflowId);
-  const preset = normalizedWorkflowId ? getPreset(normalizedWorkflowId) : undefined;
+  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId);
+  const preset = normalizedWorkflowId ? await getWorkflowDefinition(normalizedWorkflowId) : undefined;
   if (!preset) {
-    const available = listPresets().map((entry) => entry.id).join(", ");
+    const available = (await listWorkflowDefinitions()).map((entry) => entry.id).join(", ");
     throw new Error(`Unknown workflow: ${workflowId}. Available workflows: ${available}`);
   }
 
   const settings = await readWorkflowSettings();
   const configured = settings.conductorWorkflow ?? [];
 
-  if (configured.includes(preset.id)) {
-    console.log(`Workflow already configured: ${preset.id}`);
+  if (configured.includes(preset.workflow.id)) {
+    console.log(`Workflow already configured: ${preset.workflow.id}`);
     return;
   }
 
-  settings.conductorWorkflow = [...configured, preset.id];
+  settings.conductorWorkflow = [...configured, preset.workflow.id];
   await writeWorkflowSettings(settings);
 
-  console.log(`Added workflow: ${preset.id}`);
+  console.log(`Added workflow: ${preset.workflow.id}`);
 }
 
 async function removeWorkflow(workflowId: string): Promise<void> {
-  const normalizedWorkflowId = resolveWorkflowIdForAdd(workflowId);
+  const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId);
   if (!normalizedWorkflowId) {
     throw new Error(`Unknown workflow: ${workflowId}`);
   }
@@ -313,8 +330,28 @@ async function removeWorkflow(workflowId: string): Promise<void> {
   console.log(`Removed workflow: ${normalizedWorkflowId}`);
 }
 
-export function resolveWorkflowIdForAdd(inputId: string): string | undefined {
-  const presets = listPresets();
+async function saveWorkflow(
+  workflowId: string,
+  options: WorkflowCommandOptions
+): Promise<void> {
+  const resolved = await getWorkflowDefinition(workflowId, options.workingDir ?? process.cwd());
+  if (!resolved) {
+    throw new Error(`Unknown workflow: ${workflowId}`);
+  }
+
+  const scope = options.scope ?? "project";
+  const targetId = options.saveAs?.trim() || workflowId;
+  const workflowToSave: WorkflowSpec = {
+    ...resolved.workflow,
+    id: targetId,
+  };
+
+  await saveWorkflowTemplate(workflowToSave, scope, options.workingDir ?? process.cwd());
+  console.log(`Saved workflow template: ${targetId} (${scope})`);
+}
+
+export async function resolveWorkflowIdForAdd(inputId: string): Promise<string | undefined> {
+  const presets = await listWorkflowDefinitions();
   const exact = presets.find((preset) => preset.id === inputId);
   if (exact) return exact.id;
 
@@ -475,12 +512,13 @@ async function getConfiguredWorkflowIds(): Promise<string[]> {
 
 export async function getConfiguredWorkflows(): Promise<Array<{ id: string; name: string; description?: string }>> {
   const ids = await getConfiguredWorkflowIds();
-  return ids.map((id) => {
-    const preset = getPreset(id);
+  const definitions = await Promise.all(ids.map((id) => getWorkflowDefinition(id)));
+  return ids.map((id, index) => {
+    const preset = definitions[index];
     return {
       id,
-      name: preset?.name ?? id,
-      description: preset?.description,
+      name: preset?.workflow.name ?? id,
+      description: preset?.workflow.description,
     };
   });
 }
@@ -626,10 +664,11 @@ async function runWorkflow(
   registry: AgentRegistry,
   observer?: WorkflowCommandObserver
 ): Promise<WorkflowCommandExecution> {
-  const workflow = getPreset(workflowId);
+  const resolvedWorkflow = await getWorkflowDefinition(workflowId);
+  const workflow = resolvedWorkflow?.workflow;
 
   if (!workflow) {
-    const available = listPresets().map((preset) => preset.id).join(", ");
+    const available = (await listWorkflowDefinitions()).map((preset) => preset.id).join(", ");
     throw new Error(
       `Unknown workflow: ${workflowId}\nAvailable workflows: ${available}`
     );
@@ -1031,6 +1070,9 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "remove":
         options.remove = args[++i] || undefined;
         break;
+      case "save":
+        options.save = args[++i] || undefined;
+        break;
       case "run":
         options.run = args[++i] || undefined;
         break;
@@ -1046,6 +1088,14 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
       case "-t":
         options.task = args[++i] || undefined;
         break;
+      case "--as":
+        options.saveAs = args[++i] || undefined;
+        break;
+      case "--scope": {
+        const scope = args[++i];
+        options.scope = scope === "user" ? "user" : "project";
+        break;
+      }
       case "--runner":
         options.runner = (args[++i] || "local-process") as "local-process" | "default" | "zellij";
         break;
@@ -1069,7 +1119,7 @@ export function parseWorkflowCommandArgs(args: string[]): WorkflowCommandOptions
         break;
       default:
         if (!arg.startsWith("-")) {
-          if (!options.show && !options.run && !options.add && !options.remove && !options.task) {
+          if (!options.show && !options.run && !options.add && !options.remove && !options.save && !options.task) {
             options.task = arg;
           }
         }
@@ -1091,6 +1141,7 @@ Usage:
   /workflow run <id> [options]
   /workflow add <id>
   /workflow remove <id>
+  /workflow save <id> [options]
 
 Interactive Menu:
   /workflow               Opens interactive menu for workflow management
@@ -1099,12 +1150,15 @@ Subcommands:
   run <id>                Run a workflow with the given ID
   add <id>                Add a workflow to project settings
   remove <id>             Remove a workflow from project settings
+  save <id>               Save a workflow as a project or user template
   settings                Open workflow settings menu
 
 Options:
   -l, --list              List configured workflows
   -s, --show <id>         Show details of a specific workflow
   -t, --task <text>       Task description for workflow execution
+  --as <id>               Target id when saving a workflow template
+  --scope <scope>         Save scope: project (default) or user
   --runner <type>         Runner type: local-process (default), default, or zellij
   --settings              Open workflow settings menu
   -v, --verbose           Verbose output
@@ -1125,6 +1179,9 @@ Examples:
   # Add workflows to settings
   /workflow add plan-implement-review
   /workflow add quick-review
+
+  # Save a workflow as a user template
+  /workflow save plan-implement-review --as my-plan-review --scope user
 
   # List configured workflows
   /workflow --list

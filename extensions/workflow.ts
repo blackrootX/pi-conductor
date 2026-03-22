@@ -7,7 +7,6 @@ import {
   getConfiguredWorkflows,
   getWorkflowSettingsContext,
   parseWorkflowCommandArgs,
-  resolveWorkflowIdForAdd,
   type WorkflowCommandExecution,
   type WorkflowCommandObserver,
   type EffectiveWorkflowSettings,
@@ -19,7 +18,7 @@ import {
 import { createDefaultRegistry } from "../src/registry";
 import { formatWorkflowResult, type ProgressEvent } from "../src/runtime/orchestrator";
 import type { StepResultEnvelope, WorkflowRunResult } from "../src/workflow/types";
-import { listPresets } from "../src/workflow/presets";
+import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../src/workflow/templates";
 
 type WorkflowMessageDetails =
   | {
@@ -122,6 +121,12 @@ function shouldUseNativeWorkflowUi(
   rawArgs: string
 ): boolean {
   if (parsedArgs.help || parsedArgs.list || parsedArgs.show || parsedArgs.add || parsedArgs.remove || parsedArgs.run) {
+    if (!parsedArgs.save) {
+      return false;
+    }
+  }
+
+  if (parsedArgs.save) {
     return false;
   }
 
@@ -153,6 +158,7 @@ async function runNativeWorkflowUi(
     "List workflows",
     "Add workflow",
     "Remove workflow",
+    "Save workflow template",
     "Settings",
   ]);
 
@@ -175,6 +181,9 @@ async function runNativeWorkflowUi(
       return;
     case "Settings":
       await runNativeWorkflowSettings(ctx);
+      return;
+    case "Save workflow template":
+      await saveWorkflowTemplateFromPiUi(ctx);
       return;
     default:
       return;
@@ -228,11 +237,14 @@ async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promis
 }
 
 async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
-  const presets = listPresets();
+  const presets = await listWorkflowDefinitions(ctx.cwd);
   const configured = new Set((await getConfiguredWorkflows()).map((workflow) => workflow.id));
   const candidates = presets
     .filter((preset) => !configured.has(preset.id))
-    .map((preset) => preset.description ? `${preset.id} - ${preset.description}` : preset.id);
+    .map((preset) => {
+      const description = preset.description ? ` - ${preset.description}` : "";
+      return `${preset.id}${description} [${preset.source}]`;
+    });
 
   if (candidates.length === 0) {
     ctx.ui.notify("All known workflows are already configured", "info");
@@ -244,7 +256,7 @@ async function addWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<void> 
     return;
   }
 
-  const workflowId = selected.split(" - ")[0];
+  const workflowId = selected.split(" [")[0].split(" - ")[0];
   await executeWorkflowCommand({ add: workflowId });
   ctx.ui.notify(`Added workflow: ${workflowId}`, "info");
 }
@@ -267,6 +279,51 @@ async function removeWorkflowFromPiUi(ctx: ExtensionCommandContext): Promise<voi
   const workflowId = selected.split(" - ")[0];
   await executeWorkflowCommand({ remove: workflowId });
   ctx.ui.notify(`Removed workflow: ${workflowId}`, "info");
+}
+
+async function saveWorkflowTemplateFromPiUi(ctx: ExtensionCommandContext): Promise<void> {
+  const workflows = await listWorkflowDefinitions(ctx.cwd);
+  const selected = await ctx.ui.select(
+    "Save workflow template",
+    workflows.map((workflow) => `${workflow.id}${workflow.description ? ` - ${workflow.description}` : ""} [${workflow.source}]`)
+  );
+  if (!selected) {
+    return;
+  }
+
+  const workflowId = selected.split(" [")[0].split(" - ")[0];
+  const resolved = await getWorkflowDefinition(workflowId, ctx.cwd);
+  if (!resolved) {
+    ctx.ui.notify(`Unknown workflow: ${workflowId}`, "error");
+    return;
+  }
+
+  const targetId = (await ctx.ui.input("New workflow template id:", workflowId))?.trim();
+  if (!targetId) {
+    ctx.ui.notify("Template save cancelled", "info");
+    return;
+  }
+
+  const scope = await ctx.ui.select("Save workflow template to", ["project", "user"]);
+  if (!scope) {
+    ctx.ui.notify("Template save cancelled", "info");
+    return;
+  }
+
+  try {
+    await saveWorkflowTemplate(
+      {
+        ...resolved.workflow,
+        id: targetId,
+      },
+      scope as "project" | "user",
+      ctx.cwd
+    );
+    ctx.ui.notify(`Saved workflow template: ${targetId} (${scope})`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Failed to save workflow template: ${message}`, "error");
+  }
 }
 
 async function runNativeWorkflowSettings(ctx: ExtensionCommandContext): Promise<void> {
