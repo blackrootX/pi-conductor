@@ -51,6 +51,8 @@ export interface WorkflowCommandExecution {
   durationMs: number;
 }
 
+const WORKFLOW_RUN_RETENTION_COUNT = 20;
+
 /**
  * Execute the /workflow command.
  */
@@ -743,6 +745,7 @@ async function runWorkflow(
 
   // Persist run artifacts
   await persistRunArtifacts(runDir, runId, result, workflow, workingDir);
+  await cleanupWorkflowArtifacts(result, workingDir);
 
   // Exit with error code if failed
   if (result.status === "failed" || result.status === "aborted" || result.status === "timed_out") {
@@ -945,6 +948,71 @@ async function persistStepLogs(
       // Some runners do not emit logs; skip missing files.
     }
   }
+}
+
+async function cleanupWorkflowArtifacts(
+  result: WorkflowRunResult,
+  workingDir: string
+): Promise<void> {
+  await cleanupSessionDirectories(result, workingDir);
+  await pruneRunDirectories(workingDir);
+}
+
+async function cleanupSessionDirectories(
+  result: WorkflowRunResult,
+  workingDir: string
+): Promise<void> {
+  const sessionRoot = path.join(workingDir, ".pi", "workflows", "sessions");
+  const sessionIds = Array.from(
+    new Set(
+      Object.values(result.stepResults)
+        .map((step) => step.sessionId)
+        .filter((sessionId): sessionId is string => Boolean(sessionId))
+    )
+  );
+
+  await Promise.allSettled(
+    sessionIds.map(async (sessionId) => {
+      const sessionDir = path.join(sessionRoot, sessionId);
+      await fs.rm(sessionDir, { recursive: true, force: true });
+    })
+  );
+}
+
+async function pruneRunDirectories(workingDir: string): Promise<void> {
+  const runsDir = path.join(workingDir, ".pi", "workflows", "runs");
+  let entries: Array<{ name: string; path: string; mtimeMs: number }> = [];
+
+  try {
+    const dirEntries = await fs.readdir(runsDir, { withFileTypes: true });
+    entries = await Promise.all(
+      dirEntries
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => {
+          const fullPath = path.join(runsDir, entry.name);
+          const stat = await fs.stat(fullPath);
+          return {
+            name: entry.name,
+            path: fullPath,
+            mtimeMs: stat.mtimeMs,
+          };
+        })
+    );
+  } catch {
+    return;
+  }
+
+  if (entries.length <= WORKFLOW_RUN_RETENTION_COUNT) {
+    return;
+  }
+
+  const toDelete = entries
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(WORKFLOW_RUN_RETENTION_COUNT);
+
+  await Promise.allSettled(
+    toDelete.map((entry) => fs.rm(entry.path, { recursive: true, force: true }))
+  );
 }
 
 /**
