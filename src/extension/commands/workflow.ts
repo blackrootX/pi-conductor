@@ -167,26 +167,6 @@ async function listConfiguredWorkflows(cwd = process.cwd()): Promise<void> {
   }
 }
 
-async function saveWorkflowSettings(
-  settings: EffectiveWorkflowSettings,
-  scope: SettingsScope,
-  cwd = process.cwd()
-): Promise<void> {
-  const settingsPath = scope === "project"
-    ? getProjectSettingsPath(cwd)
-    : getUserSettingsPath();
-  const existingSettings = await readRawSettingsFile(settingsPath);
-
-  const newSettings: WorkflowSettings = {
-    ...existingSettings,
-    conductorWorkflowMultiplexer: settings.conductorWorkflowMultiplexer,
-    conductorWorkflowDisplay: settings.conductorWorkflowDisplay,
-  };
-
-  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
-  await fs.writeFile(settingsPath, JSON.stringify(newSettings, null, 2) + "\n", "utf8");
-}
-
 async function isZellijAvailable(): Promise<boolean> {
   const { execSync } = await import("node:child_process");
   try {
@@ -264,53 +244,6 @@ function getStepTargetDescription(step: WorkflowSpec["steps"][0]): string {
   return "unknown";
 }
 
-function resolveWorkflowSelection(
-  selection: string,
-  configured: string[]
-): { workflowId?: string; suggestions: string[] } {
-  if (!selection && configured.length > 0) {
-    return { workflowId: configured[0], suggestions: [] };
-  }
-
-  const numeric = Number(selection);
-  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= configured.length) {
-    return { workflowId: configured[numeric - 1], suggestions: [] };
-  }
-
-  const exact = configured.find((workflowId) => workflowId === selection);
-  if (exact) {
-    return { workflowId: exact, suggestions: [] };
-  }
-
-  const lowerSelection = selection.toLowerCase();
-
-  const caseInsensitive = configured.find(
-    (workflowId) => workflowId.toLowerCase() === lowerSelection
-  );
-  if (caseInsensitive) {
-    return { workflowId: caseInsensitive, suggestions: [] };
-  }
-
-  const prefixMatches = configured.filter(
-    (workflowId) => workflowId.toLowerCase().startsWith(lowerSelection)
-  );
-  if (prefixMatches.length === 1) {
-    return { workflowId: prefixMatches[0], suggestions: [] };
-  }
-
-  const tokenMatches = configured.filter((workflowId) =>
-    workflowId.toLowerCase().includes(lowerSelection)
-  );
-  if (tokenMatches.length === 1) {
-    return { workflowId: tokenMatches[0], suggestions: [] };
-  }
-
-  return {
-    workflowId: undefined,
-    suggestions: dedupeSuggestions([...prefixMatches, ...tokenMatches]).slice(0, 3),
-  };
-}
-
 async function addWorkflow(workflowId: string, cwd = process.cwd()): Promise<void> {
   const normalizedWorkflowId = await resolveWorkflowIdForAdd(workflowId, cwd);
   const preset = normalizedWorkflowId ? await getWorkflowDefinition(normalizedWorkflowId, cwd) : undefined;
@@ -377,10 +310,6 @@ export async function resolveWorkflowIdForAdd(inputId: string, cwd = process.cwd
   if (containsMatches.length === 1) return containsMatches[0].id;
 
   return undefined;
-}
-
-function dedupeSuggestions(values: string[]): string[] {
-  return Array.from(new Set(values));
 }
 
 export interface WorkflowSettings {
