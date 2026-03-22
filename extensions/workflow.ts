@@ -122,7 +122,12 @@ export default function (pi: ExtensionAPI) {
         if (shouldUseNativeWorkflowUi(parsedArgs, trimmedArgs)) {
           execution = await runNativeWorkflowUi(pi, ctx, parsedArgs, registry, observer);
         } else {
-          execution = await executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer);
+          execution = parsedArgs.run
+            ? await runWorkflowWithInputLock(
+                ctx,
+                () => executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer)
+              )
+            : await executeWorkflowCommand({ ...parsedArgs, cwd: ctx.cwd }, registry, observer);
         }
 
         finalizeWorkflowUi(ctx, progressState, execution);
@@ -244,11 +249,50 @@ async function promptAndRunWorkflowFromPiUi(
     return;
   }
 
-  return executeWorkflowCommand(
-    { ...parsedArgs, run: workflow.id, task, cwd: ctx.cwd },
-    registry,
-    observer
-  ) as Promise<WorkflowCommandExecution | void>;
+  return runWorkflowWithInputLock(
+    ctx,
+    () => executeWorkflowCommand(
+      { ...parsedArgs, run: workflow.id, task, cwd: ctx.cwd },
+      registry,
+      observer
+    ) as Promise<WorkflowCommandExecution | void>
+  );
+}
+
+function createWorkflowLockMessage(theme: ExtensionCommandContext["ui"]["theme"]) {
+  const text = new Text(
+    `${theme.fg("accent", theme.bold("Workflow running"))}\n\nThe main Pi input is locked until this workflow finishes.`,
+    2,
+    1
+  );
+
+  return {
+    render: (width: number) => text.render(width),
+    invalidate: () => text.invalidate(),
+    handleInput: (_data: string) => true,
+  };
+}
+
+async function runWorkflowWithInputLock<T>(
+  ctx: ExtensionCommandContext,
+  run: () => Promise<T>
+): Promise<T> {
+  let handle: { close?: () => void } | undefined;
+  const lockPromise = ctx.ui.custom(
+    (_tui, theme) => createWorkflowLockMessage(theme),
+    {
+      onHandle: (uiHandle) => {
+        handle = uiHandle as { close?: () => void };
+      },
+    }
+  ).catch(() => undefined);
+
+  try {
+    return await run();
+  } finally {
+    handle?.close?.();
+    await lockPromise;
+  }
 }
 
 async function showConfiguredWorkflowsInPi(ctx: ExtensionCommandContext): Promise<void> {
