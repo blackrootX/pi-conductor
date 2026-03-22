@@ -376,6 +376,7 @@ export class LocalProcessRunner implements SessionRunner {
           PI_WORKFLOW_SESSION_ID: sessionId,
           PI_WORKFLOW_STEP_ID: step.id,
           PI_WORKFLOW_STEP_TITLE: step.title,
+          ...(context.skills.length > 0 ? { PI_WORKFLOW_SKILLS: context.skills.join(",") } : {}),
           ...(step.agent.model ? { PI_WORKFLOW_AGENT_MODEL: step.agent.model } : {}),
         },
       });

@@ -7,6 +7,7 @@ import type {
   StepTarget,
   UnresolvedWorkflowStep,
 } from "./types";
+import { mergeWorkflowSkills } from "./skills";
 import type { ResolutionResult, AgentSpec } from "../types";
 import type { AgentRegistry } from "../registry";
 
@@ -71,6 +72,8 @@ export async function resolveWorkflow(
       title: step.title,
       prompt: step.prompt,
       dependsOn: step.dependsOn,
+      skills: mergeWorkflowSkills(spec.sharedSkills, step.skills),
+      requiresApproval: step.requiresApproval,
       agent: agentResult.agent!,
       target,
     });

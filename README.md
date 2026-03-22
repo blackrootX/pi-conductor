@@ -17,6 +17,7 @@ A pi package for multi-agent orchestration with agent discovery, resolution, and
 ### Workflow Runtime
 - Define and execute multi-agent workflows
 - Built-in workflow presets for common patterns
+- Optional per-step skills for reusable specialization
 - DAG-based scheduling (sequential + parallel execution)
 - Synthesize results from multiple agents
 
@@ -107,6 +108,22 @@ When run from Pi with this extension loaded, `/workflow` reports progress in the
 - one final workflow result message when the run finishes
 
 If Zellij is enabled, step execution is visible there as well. Zellij shows the live subprocesses; the main Pi session shows structured summaries.
+
+### Workflow Skills
+
+Workflow steps can optionally declare `skills` to give a step reusable Pi playbooks without creating a brand-new agent. Agents still define the broad role; skills add specialization for a specific step.
+
+```json
+{
+  "id": "review",
+  "title": "Review implementation",
+  "prompt": "Review the implementation for bugs and regressions.",
+  "role": "reviewer",
+  "skills": ["checks"]
+}
+```
+
+At runtime, conductor injects those skills into the child session context and also exposes them through `PI_WORKFLOW_SKILLS` for the step process.
 
 ## Built-in Workflows
 

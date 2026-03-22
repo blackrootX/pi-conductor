@@ -16,6 +16,8 @@ export interface WorkflowStep {
   title: string;
   prompt: string;
   dependsOn?: string[];
+  skills?: string[];
+  requiresApproval?: boolean;
 }
 
 export type UnresolvedWorkflowStep = WorkflowStep & StepTarget;
@@ -29,8 +31,10 @@ export interface WorkflowSpec {
   name: string;
   description?: string;
   steps: UnresolvedWorkflowStep[];
+  sharedSkills?: string[];
   policy?: WorkflowPolicy;
   synthesis?: WorkflowSynthesisConfig;
+  templateSource?: "built-in" | "project" | "user";
 }
 
 export interface WorkflowPolicy {
@@ -54,6 +58,8 @@ export interface ResolvedWorkflowStep {
   title: string;
   prompt: string;
   dependsOn?: string[];
+  skills?: string[];
+  requiresApproval?: boolean;
   agent: AgentSpec;
   target: StepTarget;
 }

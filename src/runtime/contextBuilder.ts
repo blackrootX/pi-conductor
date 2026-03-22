@@ -1,6 +1,7 @@
 // src/runtime/contextBuilder.ts - Build context for child session runs
 
 import type { ResolvedWorkflowStep, StepResultEnvelope } from "../workflow/types";
+import { formatSkillsForPrompt, normalizeWorkflowSkills } from "../workflow/skills";
 
 export interface ChildSessionContext {
   systemPrompt: string;
@@ -8,6 +9,7 @@ export interface ChildSessionContext {
   stepTitle: string;
   agentName: string;
   agentId: string;
+  skills: string[];
   dependencyOutputs: DependencyOutput[];
   userTask: string;
 }
@@ -30,6 +32,7 @@ export function buildChildSessionContext(
 ): ChildSessionContext {
   // Collect dependency outputs
   const dependencyOutputs = collectDependencyOutputs(step, dependencyResults, allSteps);
+  const skills = normalizeWorkflowSkills(step.skills);
 
   // Build the system prompt
   const systemPrompt = buildSystemPrompt(
@@ -43,7 +46,8 @@ export function buildChildSessionContext(
     step.title,
     step.prompt,
     userTask,
-    dependencyOutputs
+    dependencyOutputs,
+    skills
   );
 
   return {
@@ -52,6 +56,7 @@ export function buildChildSessionContext(
     stepTitle: step.title,
     agentName: step.agent.name,
     agentId: step.agent.id,
+    skills,
     dependencyOutputs,
     userTask,
   };
@@ -91,7 +96,8 @@ function buildTaskPrompt(
   stepTitle: string,
   stepPrompt: string,
   userTask: string,
-  dependencyOutputs: DependencyOutput[]
+  dependencyOutputs: DependencyOutput[],
+  skills: string[]
 ): string {
   const parts: string[] = [];
 
@@ -116,6 +122,12 @@ function buildTaskPrompt(
       parts.push(dep.summary);
       parts.push("");
     }
+  }
+
+  const skillsSection = formatSkillsForPrompt(skills);
+  if (skillsSection) {
+    parts.push(skillsSection);
+    parts.push("");
   }
 
   // Current step instruction

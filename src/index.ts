@@ -79,6 +79,11 @@ export {
   createCustomWorkflow,
 } from "./workflow/presets";
 export {
+  normalizeWorkflowSkills,
+  mergeWorkflowSkills,
+  formatSkillsForPrompt,
+} from "./workflow/skills";
+export {
   getWorkflowDefinition,
   listWorkflowDefinitions,
   getAvailableWorkflowMap,

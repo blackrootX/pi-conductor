@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { getPreset } from "../../workflow/presets";
+import { mergeWorkflowSkills } from "../../workflow/skills";
 import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../../workflow/templates";
 import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
@@ -208,15 +209,27 @@ async function showWorkflow(workflowId: string): Promise<void> {
     console.log(`\n${workflow.description}`);
   }
 
+  if (workflow.sharedSkills && workflow.sharedSkills.length > 0) {
+    console.log("\n## Shared Skills\n");
+    console.log(`- ${workflow.sharedSkills.join(", ")}`);
+  }
+
   console.log("\n## Steps\n");
 
   for (const step of workflow.steps) {
     const target = getStepTargetDescription(step);
+    const effectiveSkills = mergeWorkflowSkills(workflow.sharedSkills, step.skills);
     console.log(`- **${step.title}**`);
     console.log(`  - ID: ${step.id}`);
     console.log(`  - Target: ${target}`);
     if (step.dependsOn && step.dependsOn.length > 0) {
       console.log(`  - Depends on: ${step.dependsOn.join(", ")}`);
+    }
+    if (effectiveSkills.length > 0) {
+      console.log(`  - Skills: ${effectiveSkills.join(", ")}`);
+    }
+    if (step.requiresApproval) {
+      console.log("  - Requires approval: yes");
     }
     console.log(`  - Prompt: ${step.prompt}`);
     console.log("");
