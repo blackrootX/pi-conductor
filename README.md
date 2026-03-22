@@ -125,6 +125,22 @@ Workflow steps can optionally declare `skills` to give a step reusable Pi playbo
 
 At runtime, conductor injects those skills into the child session context and also exposes them through `PI_WORKFLOW_SKILLS` for the step process.
 
+### Workflow Approval Gates
+
+Workflow steps can also declare `requiresApproval: true` to pause before execution. When a workflow is run from Pi, the extension shows an approval prompt in the main Pi UI before that step starts.
+
+```json
+{
+  "id": "implement",
+  "title": "Implement code",
+  "prompt": "Implement the requested change.",
+  "role": "coder",
+  "requiresApproval": true
+}
+```
+
+Approval happens at the workflow layer, so it works the same way for both local and Zellij-backed execution. If a workflow is executed without a Pi approval handler, approval-gated steps are auto-approved to keep direct command execution usable.
+
 ## Built-in Workflows
 
 | Workflow | Description | Agents |

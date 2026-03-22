@@ -5,6 +5,11 @@ import type {
   ResolvedWorkflowStep,
   StepResultEnvelope,
 } from "../workflow/types";
+import {
+  buildApprovalRequest,
+  normalizeApprovalResult,
+  type WorkflowApprovalHandler,
+} from "../workflow/approval";
 import type { SessionRunner } from "./childSessionRunner";
 
 export interface SchedulerOptions {
@@ -30,6 +35,12 @@ export interface SchedulerOptions {
   onWorkflowTimeout?: (timeoutMs: number) => void;
   /** Callback when workflow is cancelled */
   onWorkflowCancelled?: (reason: string) => void;
+  /** Callback when a step requires approval */
+  onStepApprovalRequested?: (step: ResolvedWorkflowStep) => void;
+  /** Callback when approval is resolved */
+  onStepApprovalResolved?: (step: ResolvedWorkflowStep, approved: boolean, reason?: string) => void;
+  /** Async handler for approval-gated steps */
+  approvalHandler?: WorkflowApprovalHandler;
 }
 
 export interface SchedulerResult {
@@ -257,6 +268,42 @@ export class Scheduler {
       startedAt: new Date().toISOString(),
     };
 
+    if (step.requiresApproval) {
+      this.options.onStepApprovalRequested?.(step);
+
+      const approval = this.options.approvalHandler
+        ? normalizeApprovalResult(
+            await this.options.approvalHandler(
+              buildApprovalRequest(this.workflow.spec.id, this.workflow.spec.name, step)
+            )
+          )
+        : { approved: true, reason: "No approval handler configured; auto-approved" };
+
+      this.options.onStepApprovalResolved?.(step, approval.approved, approval.reason);
+
+      if (!approval.approved) {
+        const rejectionMessage = approval.reason || "Step approval was rejected";
+        const rejectedResult: StepResultEnvelope = {
+          stepId: step.id,
+          stepTitle: step.title,
+          agentId: step.agent.id,
+          agentName: step.agent.name,
+          sessionId,
+          status: "cancelled",
+          summary: rejectionMessage,
+          artifact: { type: "text", value: "" },
+          startedAt: this.results[step.id]?.startedAt || new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          error: rejectionMessage,
+        };
+
+        this.results[step.id] = rejectedResult;
+        this.failedSteps.add(step.id);
+        this.options.onStepComplete?.(step.id, rejectedResult);
+        return;
+      }
+    }
+
     // Emit step:running event
     this.options.onStepRunning?.(step, sessionId);
 
@@ -276,15 +323,15 @@ export class Scheduler {
 
       if (result.status === "succeeded") {
         this.completedSteps.add(step.id);
-        this.options.onStepComplete?.(step.id, result);
       } else if (result.status === "failed" || result.status === "timed_out" || result.status === "cancelled") {
         this.failedSteps.add(step.id);
-        this.options.onStepFail?.(step.id, result.error || `Step ${result.status}`);
       }
+
+      this.options.onStepComplete?.(step.id, result);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      this.results[step.id] = {
+      const failedResult: StepResultEnvelope = {
         stepId: step.id,
         stepTitle: step.title,
         agentId: step.agent.id,
@@ -298,7 +345,10 @@ export class Scheduler {
         error: errorMessage,
       };
 
+      this.results[step.id] = failedResult;
+
       this.failedSteps.add(step.id);
+      this.options.onStepComplete?.(step.id, failedResult);
       this.options.onStepFail?.(step.id, errorMessage);
     } finally {
       this.runningSteps.delete(step.id);

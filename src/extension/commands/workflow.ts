@@ -10,6 +10,7 @@ import type { WorkflowSpec, WorkflowRunResult } from "../../workflow/types";
 import type { AgentRegistry } from "../../registry";
 import { createOrchestrator } from "../../runtime/orchestrator";
 import type { ProgressEvent } from "../../runtime/orchestrator";
+import type { WorkflowApprovalHandler } from "../../workflow/approval";
 import {
   DefaultSessionRunner,
   LocalProcessRunner,
@@ -51,6 +52,7 @@ export interface WorkflowCommandOptions {
 export interface WorkflowCommandObserver {
   onProgress?: (event: ProgressEvent) => void;
   onResult?: (result: WorkflowRunResult, durationMs: number) => void;
+  onApprovalRequest?: WorkflowApprovalHandler;
 }
 
 export interface WorkflowCommandExecution {
@@ -748,6 +750,17 @@ async function runWorkflow(
           }
           break;
 
+        case "step:approval-requested":
+          console.log(`  ? Approval required for ${event.stepTitle} (${event.agentName})`);
+          break;
+
+        case "step:approval-resolved":
+          console.log(`  ${event.approved ? "✓" : "✗"} Approval ${event.approved ? "granted" : "rejected"}${event.reason ? `: ${event.reason}` : ""}`);
+          if (!event.approved) {
+            console.log("");
+          }
+          break;
+
         case "step:complete":
           if (event.status === "succeeded") {
             console.log(`  └─ ✓ ${event.summary.slice(0, 60)}${event.summary.length > 60 ? "..." : ""}`);
@@ -776,7 +789,10 @@ async function runWorkflow(
           break;
       }
     },
-    { sequential }
+    {
+      sequential,
+      approvalHandler: observer?.onApprovalRequest,
+    }
   );
 
   // Execute workflow

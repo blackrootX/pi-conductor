@@ -79,6 +79,10 @@ export {
   createCustomWorkflow,
 } from "./workflow/presets";
 export {
+  buildApprovalRequest,
+  normalizeApprovalResult,
+} from "./workflow/approval";
+export {
   normalizeWorkflowSkills,
   mergeWorkflowSkills,
   formatSkillsForPrompt,

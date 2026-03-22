@@ -19,6 +19,7 @@ import { createDefaultRegistry } from "../src/registry";
 import { formatWorkflowResult, type ProgressEvent } from "../src/runtime/orchestrator";
 import type { StepResultEnvelope, WorkflowRunResult } from "../src/workflow/types";
 import { getWorkflowDefinition, listWorkflowDefinitions, saveWorkflowTemplate } from "../src/workflow/templates";
+import type { WorkflowApprovalRequest, WorkflowApprovalResult } from "../src/workflow/approval";
 
 type WorkflowMessageDetails =
   | {
@@ -41,6 +42,21 @@ type WorkflowMessageDetails =
       durationMs: number;
       summary: string;
       finalText: string;
+    }
+  | {
+      kind: "approval-requested";
+      workflowId: string;
+      stepId: string;
+      stepTitle: string;
+      agentName: string;
+      skills: string[];
+    }
+  | {
+      kind: "approval-resolved";
+      workflowId?: string;
+      stepId: string;
+      approved: boolean;
+      reason?: string;
     };
 
 /**
@@ -71,6 +87,7 @@ export default function (pi: ExtensionAPI) {
           updateWorkflowUi(ctx, progressState, event);
           maybeSendProgressMessage(pi, progressState, event);
         },
+        onApprovalRequest: (request) => requestWorkflowApproval(pi, ctx, request),
         onResult: (result, durationMs) => {
           updateWorkflowResultUi(ctx, progressState, result, durationMs);
           pi.sendMessage({
@@ -402,6 +419,11 @@ async function promptForTask(
 interface WorkflowProgressState {
   workflowId?: string;
   workflowName?: string;
+  approvalPending?: {
+    stepId: string;
+    stepTitle: string;
+    agentName: string;
+  };
   runningSteps: Map<string, { title?: string; agentName?: string; sessionId?: string }>;
   completedSteps: Array<{
     stepId: string;
@@ -436,6 +458,8 @@ function updateWorkflowUi(
       ]);
       break;
     case "step:start":
+      state.approvalPending = undefined;
+      ctx.ui.setWidget("workflow-approval", []);
       state.runningSteps.set(event.stepId, {
         title: event.stepTitle,
         agentName: event.agentName,
@@ -452,6 +476,28 @@ function updateWorkflowUi(
       ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
       break;
     }
+    case "step:approval-requested":
+      state.approvalPending = {
+        stepId: event.stepId,
+        stepTitle: event.stepTitle,
+        agentName: event.agentName,
+      };
+      ctx.ui.setStatus("workflow", `Approval needed for ${event.stepTitle} (${event.agentName})`);
+      ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
+      break;
+    case "step:approval-resolved":
+      if (state.approvalPending?.stepId === event.stepId) {
+        state.approvalPending = undefined;
+      }
+      ctx.ui.setWidget("workflow-approval", []);
+      ctx.ui.setStatus(
+        "workflow",
+        event.approved
+          ? `Approval granted for ${event.stepId}`
+          : `Approval rejected for ${event.stepId}${event.reason ? `: ${event.reason}` : ""}`
+      );
+      ctx.ui.setWidget("workflow", buildWorkflowWidget(state));
+      break;
     case "step:complete": {
       const running = state.runningSteps.get(event.stepId);
       state.runningSteps.delete(event.stepId);
@@ -468,12 +514,15 @@ function updateWorkflowUi(
       break;
     }
     case "workflow:cancelled":
+      ctx.ui.setWidget("workflow-approval", []);
       ctx.ui.setStatus("workflow", `Workflow cancelled: ${event.reason}`);
       break;
     case "workflow:timeout":
+      ctx.ui.setWidget("workflow-approval", []);
       ctx.ui.setStatus("workflow", `Workflow timed out after ${event.timeoutMs}ms`);
       break;
     case "workflow:error":
+      ctx.ui.setWidget("workflow-approval", []);
       ctx.ui.setStatus("workflow", `Workflow error: ${event.error}`);
       break;
     default:
@@ -487,6 +536,22 @@ function maybeSendProgressMessage(
   event: ProgressEvent
 ): void {
   if (event.type !== "step:complete") {
+    if (event.type === "step:approval-resolved") {
+      pi.sendMessage({
+        customType: "workflow-update",
+        display: true,
+        content: event.approved
+          ? `Approval granted for ${event.stepId}.`
+          : `Approval rejected for ${event.stepId}${event.reason ? `: ${event.reason}` : ""}.`,
+        details: {
+          kind: "approval-resolved",
+          workflowId: state.workflowId,
+          stepId: event.stepId,
+          approved: event.approved,
+          reason: event.reason,
+        } satisfies WorkflowMessageDetails,
+      });
+    }
     return;
   }
 
@@ -529,6 +594,7 @@ function updateWorkflowResultUi(
     result.summary ? `Summary: ${result.summary}` : "Summary: n/a",
   ]);
   state.runningSteps.clear();
+  ctx.ui.setWidget("workflow-approval", []);
 }
 
 function finalizeWorkflowUi(
@@ -557,6 +623,10 @@ function buildWorkflowWidget(state: WorkflowProgressState): string[] {
     `Running: ${state.runningSteps.size}`,
     `Completed: ${state.completedSteps.length}`,
   ];
+
+  if (state.approvalPending) {
+    lines.push(`Approval: ${state.approvalPending.stepTitle} (${state.approvalPending.agentName})`);
+  }
 
   for (const [stepId, step] of state.runningSteps.entries()) {
     lines.push(`• ${step.title ?? stepId} (${step.agentName ?? "agent"})`);
@@ -603,11 +673,84 @@ function renderWorkflowMessage(
     return `${header}\nStatus: ${details.status}${agent}${session}\nSummary: ${details.summary}${error}`;
   }
 
+  if (details.kind === "approval-requested") {
+    const header = theme.fg("warning", `[workflow approval] ${details.stepTitle}`);
+    const agent = `\nAgent: ${details.agentName}`;
+    const skills = details.skills.length > 0 ? `\nSkills: ${details.skills.join(", ")}` : "";
+    return `${header}${agent}${skills}\nAwaiting approval before execution.`;
+  }
+
+  if (details.kind === "approval-resolved") {
+    const color = details.approved ? "success" : "warning";
+    const header = theme.fg(color, `[workflow approval] ${details.stepId}`);
+    const reason = details.reason ? `\nReason: ${details.reason}` : "";
+    return `${header}\nDecision: ${details.approved ? "approved" : "rejected"}${reason}`;
+  }
+
   const color = details.status === "succeeded" ? "success" : details.status === "cancelled" ? "warning" : "error";
   const header = theme.fg(color, `[workflow result] ${details.workflowName}`);
   const summary = details.summary ? `\nSummary: ${details.summary}` : "";
   const output = details.finalText ? `\nFinal output:\n${details.finalText}` : "";
   return `${header}\nStatus: ${details.status}\nRun ID: ${details.runId}\nDuration: ${formatDuration(details.durationMs)}${summary}${output}`;
+}
+
+async function requestWorkflowApproval(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  request: WorkflowApprovalRequest
+): Promise<WorkflowApprovalResult> {
+  pi.sendMessage({
+    customType: "workflow-update",
+    display: true,
+    content: `Approval required for ${request.stepTitle} (${request.agentName}).`,
+    details: {
+      kind: "approval-requested",
+      workflowId: request.workflowId,
+      stepId: request.stepId,
+      stepTitle: request.stepTitle,
+      agentName: request.agentName,
+      skills: request.skills,
+    } satisfies WorkflowMessageDetails,
+  });
+
+  const messageLines = [
+    `Workflow: ${request.workflowName}`,
+    `Step: ${request.stepTitle}`,
+    `Agent: ${request.agentName}`,
+  ];
+
+  if (request.skills.length > 0) {
+    messageLines.push(`Skills: ${request.skills.join(", ")}`);
+  }
+
+  messageLines.push("");
+  messageLines.push(request.stepPrompt);
+
+  ctx.ui.setWidget("workflow-approval", messageLines);
+
+  const decision = await ctx.ui.select(
+    "Approve workflow step?",
+    [
+      `Approve ${request.stepTitle}`,
+      `Reject ${request.stepTitle}`,
+    ]
+  );
+
+  if (decision?.startsWith("Approve")) {
+    return { approved: true };
+  }
+
+  const reason = (
+    await ctx.ui.input(
+      "Why reject this step? (optional)",
+      "Step approval was rejected"
+    )
+  )?.trim();
+
+  return {
+    approved: false,
+    reason: reason || "Step approval was rejected",
+  };
 }
 
 function formatDuration(ms: number): string {

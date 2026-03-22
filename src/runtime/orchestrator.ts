@@ -8,6 +8,7 @@ import type {
   StepResultEnvelope,
   StepStatus,
 } from "../workflow/types";
+import type { WorkflowApprovalHandler } from "../workflow/approval";
 import type { SessionRunner } from "./childSessionRunner";
 import { resolveWorkflow, formatResolutionErrors } from "../workflow/resolver";
 import { createScheduler } from "./scheduler";
@@ -26,6 +27,8 @@ export interface OrchestratorOptions {
   abortController?: AbortController;
   /** Force sequential execution (maxParallelism=1) */
   sequential?: boolean;
+  /** Optional handler for approval-gated steps */
+  approvalHandler?: WorkflowApprovalHandler;
 }
 
 export interface OrchestratorProgressCallback {
@@ -40,6 +43,8 @@ export type ProgressEvent =
   | { type: "step:complete"; stepId: string; status: StepStatus; summary: string }
   | { type: "step:running"; stepId: string; sessionId: string }
   | { type: "step:pending"; stepId: string }
+  | { type: "step:approval-requested"; stepId: string; stepTitle: string; agentName: string }
+  | { type: "step:approval-resolved"; stepId: string; approved: boolean; reason?: string }
   | { type: "workflow:complete"; result: WorkflowRunResult }
   | { type: "workflow:error"; error: string }
   | { type: "workflow:cancelled"; reason: string }
@@ -55,6 +60,7 @@ export class WorkflowOrchestrator {
   private timeout?: number;
   private abortController?: AbortController;
   private sequential?: boolean;
+  private approvalHandler?: WorkflowApprovalHandler;
 
   constructor(options: OrchestratorOptions) {
     this.registry = options.registry;
@@ -63,6 +69,7 @@ export class WorkflowOrchestrator {
     this.timeout = options.timeout;
     this.abortController = options.abortController;
     this.sequential = options.sequential;
+    this.approvalHandler = options.approvalHandler;
   }
 
   /**
@@ -122,6 +129,7 @@ export class WorkflowOrchestrator {
         abortController: this.abortController,
         // Force sequential execution if requested
         maxParallelism: this.sequential ? 1 : undefined,
+        approvalHandler: this.approvalHandler,
         onStepPending: (step) => {
           this.onProgress?.({
             type: "step:pending",
@@ -133,6 +141,22 @@ export class WorkflowOrchestrator {
             type: "step:running",
             stepId: step.id,
             sessionId,
+          });
+        },
+        onStepApprovalRequested: (step) => {
+          this.onProgress?.({
+            type: "step:approval-requested",
+            stepId: step.id,
+            stepTitle: step.title,
+            agentName: step.agent.name,
+          });
+        },
+        onStepApprovalResolved: (step, approved, reason) => {
+          this.onProgress?.({
+            type: "step:approval-resolved",
+            stepId: step.id,
+            approved,
+            reason,
           });
         },
         onStepStart: (step, sessionId) => {
@@ -150,14 +174,6 @@ export class WorkflowOrchestrator {
             stepId,
             status: result.status,
             summary: result.summary,
-          });
-        },
-        onStepFail: (stepId, error) => {
-          this.onProgress?.({
-            type: "step:complete",
-            stepId,
-            status: "failed",
-            summary: error,
           });
         },
         onWorkflowTimeout: (timeoutMs) => {
@@ -257,6 +273,7 @@ export function createOrchestrator(
     timeout?: number;
     abortController?: AbortController;
     sequential?: boolean;
+    approvalHandler?: WorkflowApprovalHandler;
   }
 ): WorkflowOrchestrator {
   return new WorkflowOrchestrator({
@@ -266,6 +283,7 @@ export function createOrchestrator(
     timeout: options?.timeout,
     abortController: options?.abortController,
     sequential: options?.sequential,
+    approvalHandler: options?.approvalHandler,
   });
 }
 
