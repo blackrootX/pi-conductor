@@ -43,17 +43,6 @@ A pi package for multi-agent orchestration with agent discovery, resolution, and
 
 ## Commands
 
-### `/hello`
-
-Load agent frontmatter into the editor.
-
-```bash
-/hello
-/hello coder
-/hello planner
-/hello reviewer
-```
-
 ### `/team`
 
 Run multi-agent workflows.
