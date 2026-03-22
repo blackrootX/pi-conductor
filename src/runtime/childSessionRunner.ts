@@ -355,18 +355,7 @@ export class LocalProcessRunner implements SessionRunner {
       // Find the pi CLI executable
       const piCliPath = findPiCli();
 
-      const commandArgs = [
-        "run",
-        "--agent", step.agent.id,
-        "--system-prompt", systemPromptPath,
-        "--task", taskPromptPath,
-        "--output", resultPath,
-        "--session-id", sessionId,
-      ];
-
-      if (step.agent.model) {
-        commandArgs.push("--model", step.agent.model);
-      }
+      const commandArgs = buildPiCommandArgs(context, step.agent.model);
 
       const child = spawn(piCliPath, commandArgs, {
         cwd: sessionDir,
@@ -620,6 +609,25 @@ function findPiCli(): string {
   }
 
   return "pi";
+}
+
+function buildPiCommandArgs(
+  context: ChildSessionContext,
+  model?: string
+): string[] {
+  const args = [
+    "--print",
+    "--no-session",
+    "--system-prompt",
+    context.systemPrompt,
+    context.taskPrompt,
+  ];
+
+  if (model) {
+    args.push("--model", model);
+  }
+
+  return args;
 }
 
 /**

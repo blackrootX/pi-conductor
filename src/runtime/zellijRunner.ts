@@ -177,18 +177,7 @@ export class ZellijRunner implements SessionRunner {
 
       // Build the pi command
       const piCliPath = this.findPiCli();
-      const commandArgs = [
-        "run",
-        "--agent", step.agent.id,
-        "--system-prompt", systemPromptPath,
-        "--task", taskPromptPath,
-        "--output", resultPath,
-        "--session-id", sessionId,
-      ];
-
-      if (step.agent.model) {
-        commandArgs.push("--model", step.agent.model);
-      }
+      const commandArgs = this.buildPiCommandArgs(context, step.agent.model);
 
       // If inside Zellij, send command to existing pane
       // If outside, spawn a new zellij session
@@ -201,7 +190,7 @@ export class ZellijRunner implements SessionRunner {
           "action",
           "create-pane",
           "--direction", this.options.displayStrategy === "split-pane" ? "right" : "down",
-          "--command", `${piCliPath} ${commandArgs.join(" ")}`,
+          "--command", this.buildShellCommand(piCliPath, commandArgs),
         ];
 
         try {
@@ -448,6 +437,34 @@ export class ZellijRunner implements SessionRunner {
     }
 
     return "pi";
+  }
+
+  private buildPiCommandArgs(
+    context: {
+      systemPrompt: string;
+      taskPrompt: string;
+    },
+    model?: string
+  ): string[] {
+    const args = [
+      "--print",
+      "--no-session",
+      "--system-prompt",
+      context.systemPrompt,
+      context.taskPrompt,
+    ];
+
+    if (model) {
+      args.push("--model", model);
+    }
+
+    return args;
+  }
+
+  private buildShellCommand(command: string, args: string[]): string {
+    return [command, ...args]
+      .map((part) => `'${part.replace(/'/g, `'\"'\"'`)}'`)
+      .join(" ");
   }
 
   /**
