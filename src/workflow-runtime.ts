@@ -23,6 +23,8 @@ export interface SingleResult {
   agentSource: AgentSource | "unknown";
   task: string;
   exitCode: number;
+  elapsedMs: number;
+  lastWork: string;
   messages: Message[];
   stderr: string;
   usage: UsageStats;
@@ -34,6 +36,7 @@ export interface SingleResult {
 
 export interface WorkflowDetails {
   workflowName: string;
+  agentNames: string[];
   workflowSource: WorkflowSource;
   workflowFilePath: string | null;
   results: SingleResult[];
@@ -43,6 +46,7 @@ export type WorkflowUpdate = WorkflowDetails;
 
 export interface WorkflowRunResult {
   workflowName: string;
+  agentNames: string[];
   workflowSource: WorkflowSource;
   workflowFilePath: string | null;
   results: SingleResult[];
@@ -99,6 +103,8 @@ async function runSingleAgent(
       agentSource: "unknown",
       task,
       exitCode: 1,
+      elapsedMs: 0,
+      lastWork: "",
       messages: [],
       stderr: `Unknown agent: "${agentName}"`,
       usage: {
@@ -128,6 +134,8 @@ async function runSingleAgent(
     agentSource: agent.source,
     task,
     exitCode: 0,
+    elapsedMs: 0,
+    lastWork: "",
     messages: [],
     stderr: "",
     usage: {
@@ -144,8 +152,11 @@ async function runSingleAgent(
   };
 
   const emitUpdate = () => {
+    currentResult.elapsedMs = Date.now() - startTime;
+    currentResult.lastWork = getFinalOutput(currentResult.messages);
     onUpdate?.({ ...currentResult, messages: [...currentResult.messages] });
   };
+  const startTime = Date.now();
 
   try {
     if (agent.systemPrompt.trim()) {
@@ -218,12 +229,18 @@ async function runSingleAgent(
         currentResult.stderr += data.toString();
       });
 
+      const interval = onUpdate ? setInterval(() => emitUpdate(), 1000) : null;
+
       proc.on("close", (code) => {
+        if (interval) clearInterval(interval);
         if (buffer.trim()) processLine(buffer);
         resolve(code ?? 0);
       });
 
-      proc.on("error", () => resolve(1));
+      proc.on("error", () => {
+        if (interval) clearInterval(interval);
+        resolve(1);
+      });
 
       if (signal) {
         const killProc = () => {
@@ -239,6 +256,8 @@ async function runSingleAgent(
     });
 
     currentResult.exitCode = exitCode;
+    currentResult.elapsedMs = Date.now() - startTime;
+    currentResult.lastWork = getFinalOutput(currentResult.messages);
     if (wasAborted) throw new Error("Workflow step was aborted");
     return currentResult;
   } finally {
@@ -273,6 +292,7 @@ export async function runWorkflowByName(
   if (!workflow) {
     return {
       workflowName,
+      agentNames: [],
       workflowSource: "built-in",
       workflowFilePath: null,
       results: [],
@@ -284,6 +304,7 @@ export async function runWorkflowByName(
 
   const makeDetails = (results: SingleResult[]): WorkflowDetails => ({
     workflowName: workflow.name,
+    agentNames: [...workflow.agentNames],
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
     results,
@@ -295,6 +316,7 @@ export async function runWorkflowByName(
   if (missingAgents.length > 0) {
     return {
       workflowName: workflow.name,
+      agentNames: [...workflow.agentNames],
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
       results: [],
@@ -332,6 +354,7 @@ export async function runWorkflowByName(
         "(no output)";
       return {
         workflowName: workflow.name,
+        agentNames: [...workflow.agentNames],
         workflowSource: workflow.source,
         workflowFilePath: workflow.filePath ?? null,
         results,
@@ -346,6 +369,7 @@ export async function runWorkflowByName(
 
   return {
     workflowName: workflow.name,
+    agentNames: [...workflow.agentNames],
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
     results,

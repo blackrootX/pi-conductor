@@ -6,6 +6,7 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import {
   type ExtensionAPI,
+  type ExtensionContext,
   type ExtensionCommandContext,
   getMarkdownTheme,
 } from "@mariozechner/pi-coding-agent";
@@ -20,6 +21,11 @@ import {
   isErrorResult,
   runWorkflowByName,
 } from "./workflow-runtime.js";
+import {
+  type WorkflowCardPayload,
+  buildWorkflowCardPayload,
+  renderWorkflowCardLines,
+} from "./workflow-cards.js";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -231,9 +237,10 @@ async function launchWorkflowInZellijPane(
   ctx: ExtensionCommandContext,
   workflowName: string,
   task: string,
-): Promise<{ launched: boolean; statusFile?: string }> {
+): Promise<{ launched: boolean; progressFile?: string; statusFile?: string }> {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-zellij-"));
   const statusFile = path.join(tempDir, "workflow-status.json");
+  const progressFile = path.join(tempDir, "workflow-progress.json");
   const paneName = `workflow:${workflowName}`;
 
   try {
@@ -256,22 +263,88 @@ async function launchWorkflowInZellijPane(
         task,
         "--cwd",
         ctx.cwd,
+        "--progress-file",
+        progressFile,
         "--status-file",
         statusFile,
       ],
       { cwd: ctx.cwd },
     );
-    return { launched: true, statusFile };
+    return { launched: true, progressFile, statusFile };
   } catch {
     return { launched: false };
   }
 }
 
-async function waitForWorkflowStatusFile(statusFile: string): Promise<{
+function setWorkflowCardsWidget(
+  ctx: ExtensionContext,
+  payload: WorkflowCardPayload | undefined,
+) {
+  if (!payload || !ctx.hasUI) return;
+
+  ctx.ui.setWidget(
+    "workflow-cards",
+    (_tui, theme) => {
+      const text = new Text("", 0, 0);
+      const isAnimated = payload.steps.some((step) => step.status === "running");
+      const interval = isAnimated
+        ? setInterval(() => {
+            text.invalidate();
+          }, 250)
+        : undefined;
+
+      return {
+        render(width: number) {
+          text.setText(
+            renderWorkflowCardLines(payload, width, theme, {
+              animationTick: Date.now(),
+            }).join("\n"),
+          );
+          return text.render(width);
+        },
+        invalidate() {
+          text.invalidate();
+        },
+        dispose() {
+          if (interval) clearInterval(interval);
+        },
+      };
+    },
+    { placement: "aboveEditor" },
+  );
+}
+
+function tryReadWorkflowCardPayload(progressFile: string): WorkflowCardPayload | undefined {
+  try {
+    const content = fs.readFileSync(progressFile, "utf8");
+    return JSON.parse(content) as WorkflowCardPayload;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForWorkflowStatusFile(
+  statusFile: string,
+  progressFile: string | undefined,
+  onProgress?: (payload: WorkflowCardPayload) => void,
+): Promise<{
   success: boolean;
   message?: string;
 }> {
+  let lastProgressContent = "";
   while (true) {
+    if (progressFile) {
+      try {
+        const content = fs.readFileSync(progressFile, "utf8");
+        if (content !== lastProgressContent) {
+          lastProgressContent = content;
+          onProgress?.(JSON.parse(content) as WorkflowCardPayload);
+        }
+      } catch {
+        /* still waiting */
+      }
+    }
+
     try {
       const content = fs.readFileSync(statusFile, "utf8");
       const data = JSON.parse(content) as {
@@ -294,19 +367,10 @@ function blockMainSessionInput(ctx: ExtensionCommandContext): () => void {
 
   const restoreInput = ctx.ui.onTerminalInput(() => ({ consume: true }));
   ctx.ui.setWorkingMessage("Workflow running in Zellij. Input is blocked until it finishes.");
-  ctx.ui.setWidget(
-    "workflow-zellij-block",
-    [
-      "Workflow is running in the Zellij side pane.",
-      "This session is temporarily blocked until the workflow finishes.",
-    ],
-    { placement: "aboveEditor" },
-  );
 
   return () => {
     restoreInput();
     ctx.ui.setWorkingMessage();
-    ctx.ui.setWidget("workflow-zellij-block", undefined);
   };
 }
 
@@ -552,6 +616,7 @@ export default function registerExtension(pi: ExtensionAPI) {
         signal,
         onUpdate
           ? (details) => {
+              setWorkflowCardsWidget(ctx, buildWorkflowCardPayload(details, true));
               onUpdate({
                 content: [
                   {
@@ -568,6 +633,21 @@ export default function registerExtension(pi: ExtensionAPI) {
             }
           : undefined,
       );
+      if (result.agentNames.length > 0) {
+        setWorkflowCardsWidget(
+          ctx,
+          buildWorkflowCardPayload(
+            {
+              workflowName: result.workflowName,
+              agentNames: result.agentNames,
+              workflowSource: result.workflowSource,
+              workflowFilePath: result.workflowFilePath,
+              results: result.results,
+            },
+            false,
+          ),
+        );
+      }
       return {
         content: [
           {
@@ -579,6 +659,7 @@ export default function registerExtension(pi: ExtensionAPI) {
         ],
         details: {
           workflowName: result.workflowName,
+          agentNames: result.agentNames,
           workflowSource: result.workflowSource,
           workflowFilePath: result.workflowFilePath,
           results: result.results,
@@ -619,9 +700,27 @@ export default function registerExtension(pi: ExtensionAPI) {
         );
         if (launched.launched && launched.statusFile) {
           const unblockInput = blockMainSessionInput(ctx);
+          const workflowConfig = discoverWorkflows(ctx.cwd).workflows.find(
+            (workflow) => workflow.name === workflowName,
+          );
+          if (workflowConfig) {
+            setWorkflowCardsWidget(ctx, {
+              workflowName,
+              steps: workflowConfig.agentNames.map((agent) => ({
+                agent,
+                status: "pending",
+                elapsedMs: 0,
+                lastWork: "",
+              })),
+            });
+          }
           ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
           try {
-            const status = await waitForWorkflowStatusFile(launched.statusFile);
+            const status = await waitForWorkflowStatusFile(
+              launched.statusFile,
+              launched.progressFile,
+              (payload) => setWorkflowCardsWidget(ctx, payload),
+            );
             if (!status.success) {
               ctx.ui.notify(
                 status.message || `Workflow ${workflowName} failed in Zellij.`,

@@ -6,12 +6,18 @@ import createJiti from "@mariozechner/jiti";
 
 const jiti = createJiti(import.meta.url);
 const runtime = jiti("../src/workflow-runtime.ts");
+const cards = jiti("../src/workflow-cards.ts");
 
 const {
   runWorkflowByName,
   getFinalOutput,
   isErrorResult,
 } = runtime;
+const { buildWorkflowCardPayload, renderWorkflowCardLines } = cards;
+
+let latestRenderState = null;
+let latestProgressPayload = null;
+let animationTimer = null;
 
 function parseArgs(argv) {
   const args = {};
@@ -24,7 +30,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function renderWorkflow(details, finalMessage) {
+function renderWorkflow(details, finalMessage, isRunning = false, animationTick = Date.now()) {
   const lines = [];
   lines.push(`workflow: ${details.workflowName} (${details.workflowSource})`);
   if (details.workflowFilePath) lines.push(`source: ${details.workflowFilePath}`);
@@ -62,7 +68,43 @@ function renderWorkflow(details, finalMessage) {
     lines.push("");
   }
 
+  const payload = buildWorkflowCardPayload(details, isRunning);
+  latestProgressPayload = payload;
+  lines.push(
+    ...renderWorkflowCardLines(payload, stdout.columns || 100, undefined, {
+      animationTick,
+    }),
+  );
+
   return lines.join("\n");
+}
+
+function redraw() {
+  if (!latestRenderState) return;
+  stdout.write("\x1bc");
+  stdout.write(
+    renderWorkflow(
+      latestRenderState.details,
+      latestRenderState.finalMessage,
+      latestRenderState.isRunning,
+      Date.now(),
+    ),
+  );
+}
+
+function setAnimationRunning(shouldAnimate) {
+  if (shouldAnimate) {
+    if (animationTimer) return;
+    animationTimer = setInterval(() => {
+      redraw();
+    }, 250);
+    return;
+  }
+
+  if (animationTimer) {
+    clearInterval(animationTimer);
+    animationTimer = null;
+  }
 }
 
 function writeStatus(statusFile, payload) {
@@ -73,21 +115,21 @@ function writeStatus(statusFile, payload) {
 async function promptToClosePane() {
   const rl = readline.createInterface({ input: stdin, output: stdout });
   const answer = await rl.question(
-    "Press Enter to close this pane, or type 'keep' to leave it open: ",
+    "Press Enter or y to close this pane, or n to leave it open: ",
   );
   rl.close();
 
   const normalized = answer.trim().toLowerCase();
-  if (!normalized || normalized === "y" || normalized === "yes") {
-    spawnSync("zellij", ["action", "close-pane"], { stdio: "ignore" });
+  if (normalized === "n" || normalized === "no" || normalized === "keep") {
+    const shell = process.env.SHELL || "zsh";
+    await new Promise((resolve) => {
+      const proc = spawn(shell, ["-l"], { stdio: "inherit" });
+      proc.on("exit", () => resolve());
+    });
     return;
   }
 
-  const shell = process.env.SHELL || "zsh";
-  await new Promise((resolve) => {
-    const proc = spawn(shell, ["-l"], { stdio: "inherit" });
-    proc.on("exit", () => resolve());
-  });
+  spawnSync("zellij", ["action", "close-pane"], { stdio: "ignore" });
 }
 
 async function main() {
@@ -95,6 +137,7 @@ async function main() {
   const workflowName = args.workflow;
   const task = args.task;
   const cwd = args.cwd || process.cwd();
+  const progressFile = args["progress-file"];
   const statusFile = args["status-file"];
 
   if (!workflowName || !task) {
@@ -103,22 +146,38 @@ async function main() {
   }
 
   const result = await runWorkflowByName(cwd, workflowName, task, undefined, (details) => {
-    stdout.write("\x1bc");
-    stdout.write(renderWorkflow(details));
+    writeStatus(progressFile, buildWorkflowCardPayload(details, true));
+    latestRenderState = { details, finalMessage: undefined, isRunning: true };
+    setAnimationRunning(true);
+    redraw();
   });
 
-  stdout.write("\x1bc");
-  stdout.write(
-    renderWorkflow(
+  writeStatus(
+    progressFile,
+    buildWorkflowCardPayload(
       {
         workflowName: result.workflowName,
+        agentNames: result.agentNames,
         workflowSource: result.workflowSource,
         workflowFilePath: result.workflowFilePath,
         results: result.results,
       },
-      result.isError ? result.errorMessage : result.finalText,
+      false,
     ),
   );
+  latestRenderState = {
+    details: {
+      workflowName: result.workflowName,
+      agentNames: result.agentNames,
+      workflowSource: result.workflowSource,
+      workflowFilePath: result.workflowFilePath,
+      results: result.results,
+    },
+    finalMessage: result.isError ? result.errorMessage : result.finalText,
+    isRunning: false,
+  };
+  setAnimationRunning(false);
+  redraw();
 
   writeStatus(statusFile, {
     done: true,
@@ -133,6 +192,7 @@ async function main() {
 }
 
 main().catch((error) => {
+  setAnimationRunning(false);
   const args = parseArgs(process.argv);
   writeStatus(args["status-file"], {
     done: true,
