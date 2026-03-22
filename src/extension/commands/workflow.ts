@@ -617,22 +617,11 @@ async function createZellijRunner(
       name: `zellij (${effectiveSettings.conductorWorkflowDisplay})`,
     };
   } else {
-    console.log("\n🔵 Starting detached Zellij session for workflow");
-
-    // Outside Zellij: create detached session
-    const { ZellijRunner } = await import("../../runtime/zellijRunner");
+    console.warn("\n⚠ Zellij display requested outside an active Zellij session.");
+    console.warn("  Falling back to the main Pi session with local workflow cards.");
     return {
-      runner: new ZellijRunner({
-        workingDir,
-        displayStrategy: effectiveSettings.conductorWorkflowDisplay,
-        inZellijSession: false,
-        onStatusChange: (stepId, status) => {
-          if (verbose) {
-            console.log(`  [${status}] ${stepId}`);
-          }
-        },
-      }),
-      name: `zellij (detached ${effectiveSettings.conductorWorkflowDisplay})`,
+      runner: createLocalProcessRunner(workingDir, verbose),
+      name: `local-process (zellij fallback: ${effectiveSettings.conductorWorkflowDisplay})`,
     };
   }
 }

@@ -695,24 +695,94 @@ function finalizeWorkflowUi(
 function buildWorkflowWidget(state: WorkflowProgressState): string[] {
   const lines = [
     `Workflow: ${state.workflowName ?? state.workflowId ?? "workflow"}`,
-    `Running: ${state.runningSteps.size}`,
-    `Completed: ${state.completedSteps.length}`,
+    `Running: ${state.runningSteps.size}  Completed: ${state.completedSteps.length}`,
   ];
 
   if (state.approvalPending) {
-    lines.push(`Approval: ${state.approvalPending.stepTitle} (${state.approvalPending.agentName})`);
+    lines.push(`Approval pending: ${state.approvalPending.stepTitle} (${state.approvalPending.agentName})`);
   }
+
+  const cards: string[] = [];
 
   for (const [stepId, step] of state.runningSteps.entries()) {
-    lines.push(`• ${step.title ?? stepId} (${step.agentName ?? "agent"})`);
+    cards.push(
+      ...formatWorkflowCard({
+        title: step.title ?? stepId,
+        subtitle: step.agentName ?? "agent",
+        status: "running",
+      })
+    );
   }
 
-  const recentCompleted = state.completedSteps.slice(-3);
-  for (const step of recentCompleted) {
-    lines.push(`✓ ${step.title ?? step.stepId}: ${step.status}`);
+  for (const step of state.completedSteps.slice(-4)) {
+    cards.push(
+      ...formatWorkflowCard({
+        title: step.title ?? step.stepId,
+        subtitle: step.agentName ?? "agent",
+        status: step.status,
+        summary: step.summary,
+      })
+    );
   }
 
-  return lines;
+  if (cards.length === 0) {
+    lines.push("No active step cards yet.");
+    return lines;
+  }
+
+  return [...lines, ...cards];
+}
+
+function formatWorkflowCard(input: {
+  title: string;
+  subtitle: string;
+  status: "running" | StepResultEnvelope["status"];
+  summary?: string;
+}): string[] {
+  const width = 52;
+  const statusLabel = formatCardStatus(input.status);
+  const summary = input.summary?.trim();
+  const summaryLine = summary
+    ? truncateForCard(summary, width - 4)
+    : input.status === "running"
+      ? "Working..."
+      : "Done";
+
+  return [
+    `┌${"─".repeat(width - 2)}┐`,
+    `│ ${padForCard(input.title, width - 4)} │`,
+    `│ ${padForCard(`${input.subtitle} • ${statusLabel}`, width - 4)} │`,
+    `│ ${padForCard(summaryLine, width - 4)} │`,
+    `└${"─".repeat(width - 2)}┘`,
+  ];
+}
+
+function formatCardStatus(status: "running" | StepResultEnvelope["status"]): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "succeeded":
+      return "Succeeded";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    case "timed_out":
+      return "Timed out";
+    case "pending":
+      return "Pending";
+    default:
+      return status;
+  }
+}
+
+function truncateForCard(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+}
+
+function padForCard(value: string, width: number): string {
+  const truncated = truncateForCard(value, width);
+  return truncated.padEnd(width, " ");
 }
 
 function formatStepCompletionMessage(

@@ -181,7 +181,7 @@ Workflow settings are stored in `.pi/agent/settings.json` (project) with fallbac
 - **`main-window`**: Preferred primary workflow view when already inside Zellij.
 - **`split-pane`**: Preferred side-by-side workflow view when already inside Zellij.
 
-Outside Zellij, both display strategies fall back to starting a detached Zellij session and printing attach instructions. Split panes are only created when Pi is already running inside Zellij.
+Outside Zellij, both display strategies now fall back to the main Pi session with local workflow cards instead of trying to create a detached Zellij session. Split panes are only created when Pi is already running inside Zellij.
 
 ### Settings Precedence
 
