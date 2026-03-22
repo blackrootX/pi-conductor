@@ -116,6 +116,8 @@ If Zellij is enabled, step execution is visible there as well. Zellij shows the 
 
 ### Workflow Skills
 
+`pi-conductor` now ships a real packaged Pi skill, [skills/conductor-workflows.md](/Users/tree/Code/Github/pi-conductor/skills/conductor-workflows.md), the same way `pi-teams` ships [skills/teams.md](https://github.com/burggraf/pi-teams/blob/main/skills/teams.md). Workflow child sessions automatically invoke that packaged skill, and workflow steps can still add extra skill names on top.
+
 Workflow steps can optionally declare `skills` to give a step reusable Pi playbooks without creating a brand-new agent. Agents still define the broad role; skills add specialization for a specific step.
 
 ```json

@@ -1,7 +1,7 @@
 // src/runtime/contextBuilder.ts - Build context for child session runs
 
 import type { ResolvedWorkflowStep, StepResultEnvelope } from "../workflow/types";
-import { formatSkillsForPrompt, normalizeWorkflowSkills } from "../workflow/skills";
+import { formatSkillsForPrompt, getEffectiveWorkflowSkills } from "../workflow/skills";
 
 export interface ChildSessionContext {
   systemPrompt: string;
@@ -32,7 +32,7 @@ export function buildChildSessionContext(
 ): ChildSessionContext {
   // Collect dependency outputs
   const dependencyOutputs = collectDependencyOutputs(step, dependencyResults, allSteps);
-  const skills = normalizeWorkflowSkills(step.skills);
+  const skills = getEffectiveWorkflowSkills(step.skills);
 
   // Build the system prompt
   const systemPrompt = buildSystemPrompt(

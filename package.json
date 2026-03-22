@@ -24,6 +24,9 @@
   "pi": {
     "extensions": [
       "./extensions"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "scripts": {
@@ -41,7 +44,8 @@
   "files": [
     "src/",
     "agents/",
-    "extensions/"
+    "extensions/",
+    "skills/"
   ],
   "repository": {
     "type": "git",

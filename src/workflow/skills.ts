@@ -1,5 +1,7 @@
 // src/workflow/skills.ts - Helpers for workflow skill configuration
 
+export const CONDUCTOR_WORKFLOW_SKILL = "conductor-workflows";
+
 export function normalizeWorkflowSkills(skills?: string[]): string[] {
   if (!skills || skills.length === 0) {
     return [];
@@ -21,6 +23,13 @@ export function mergeWorkflowSkills(
   return normalizeWorkflowSkills([
     ...(workflowSharedSkills ?? []),
     ...(stepSkills ?? []),
+  ]);
+}
+
+export function getEffectiveWorkflowSkills(skills?: string[]): string[] {
+  return normalizeWorkflowSkills([
+    CONDUCTOR_WORKFLOW_SKILL,
+    ...(skills ?? []),
   ]);
 }
 
