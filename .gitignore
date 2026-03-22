@@ -28,3 +28,6 @@ coverage/
 # Workflow artifacts
 .pi/workflows/sessions/
 .pi/workflows/runs/
+
+# Local Pi package install state
+.pi/settings.json
