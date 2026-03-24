@@ -1,0 +1,309 @@
+import type { Theme } from "@mariozechner/pi-coding-agent";
+
+export type TeamCardStatus = "pending" | "running" | "done" | "error";
+
+export interface TeamMemberState {
+  agent: string;
+  model?: string;
+  status: TeamCardStatus;
+  elapsedMs: number;
+  lastWork: string;
+}
+
+export interface TeamPhaseState {
+  kind: "parallel" | "sequential";
+  warningMessage?: string;
+  members: TeamMemberState[];
+}
+
+export interface TeamCardPayload {
+  teamName: string;
+  phases: TeamPhaseState[];
+}
+
+export interface TeamCardRenderOptions {
+  animationTick?: number;
+}
+
+type Styler = {
+  accent(text: string): string;
+  bold(text: string): string;
+  dim(text: string): string;
+  muted(text: string): string;
+  success(text: string): string;
+  error(text: string): string;
+  highlight(text: string): string;
+};
+
+function createThemeStyler(theme: Theme): Styler {
+  return {
+    accent: (text) => theme.fg("accent", text),
+    bold: (text) => theme.bold(text),
+    dim: (text) => theme.fg("dim", text),
+    muted: (text) => theme.fg("muted", text),
+    success: (text) => theme.fg("success", text),
+    error: (text) => theme.fg("error", text),
+    highlight: (text) => theme.fg("warning", text),
+  };
+}
+
+function createPlainStyler(): Styler {
+  return {
+    accent: (text) => text,
+    bold: (text) => text,
+    dim: (text) => text,
+    muted: (text) => text,
+    success: (text) => text,
+    error: (text) => text,
+    highlight: (text) => text,
+  };
+}
+
+function displayName(name: string): string {
+  return name
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function truncateText(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (text.length <= maxWidth) return text;
+  if (maxWidth <= 3) return ".".repeat(maxWidth);
+  return `${text.slice(0, maxWidth - 3)}...`;
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function formatModelLabel(model?: string): string {
+  if (!model?.trim()) return "";
+  const trimmed = model.trim();
+  const slashIndex = trimmed.lastIndexOf("/");
+  return slashIndex >= 0 ? trimmed.slice(slashIndex + 1) : trimmed;
+}
+
+function buildTitle(agent: string, model?: string): string {
+  const name = displayName(agent);
+  const label = formatModelLabel(model);
+  return label ? `${name} - ${label}` : name;
+}
+
+function getSpinnerFrame(animationTick: number): string {
+  const frames = ["◐", "◓", "◑", "◒"];
+  return frames[Math.floor(animationTick / 250) % frames.length];
+}
+
+function getStatusIcon(status: TeamCardStatus, animationTick: number): string {
+  switch (status) {
+    case "running":
+      return getSpinnerFrame(animationTick);
+    case "done":
+      return "✓";
+    case "error":
+      return "✗";
+    default:
+      return "○";
+  }
+}
+
+function getStatusText(status: TeamCardStatus, text: string, styler: Styler): string {
+  switch (status) {
+    case "running":
+      return styler.accent(text);
+    case "done":
+      return styler.success(text);
+    case "error":
+      return styler.error(text);
+    default:
+      return styler.dim(text);
+  }
+}
+
+function stylePaddedLine(
+  content: string,
+  width: number,
+  borderStyle: (text: string) => string,
+): string {
+  const visibleContent = stripAnsi(content);
+  return (
+    borderStyle("│") +
+    content +
+    " ".repeat(Math.max(0, width - visibleContent.length)) +
+    borderStyle("│")
+  );
+}
+
+function renderCard(
+  state: TeamMemberState,
+  columnWidth: number,
+  styler: Styler,
+  animationTick: number,
+): string[] {
+  const innerWidth = Math.max(16, columnWidth - 2);
+  const title = truncateText(buildTitle(state.agent, state.model), innerWidth - 1);
+  const elapsed =
+    state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
+  const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${elapsed}`;
+  const lastWork = state.lastWork.trim()
+    ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
+    : "—";
+
+  const borderStyle = state.status === "running" ? styler.highlight : styler.dim;
+  const top = borderStyle(`┌${"─".repeat(innerWidth)}┐`);
+  const bottom = borderStyle(`└${"─".repeat(innerWidth)}┘`);
+
+  return [
+    top,
+    stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
+    stylePaddedLine(
+      ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
+      innerWidth,
+      borderStyle,
+    ),
+    bottom,
+  ];
+}
+
+function renderSequentialConnector(
+  nextStep: TeamMemberState,
+  animationTick: number,
+  styler: Styler,
+): string {
+  if (nextStep.status !== "running") return styler.dim(" ──▶ ");
+
+  const frames = [" •──▶", " ─•─▶", " ──•▶", " ───▶"];
+  return styler.highlight(frames[Math.floor(animationTick / 250) % frames.length]);
+}
+
+function renderPhaseRows(
+  members: TeamMemberState[],
+  width: number,
+  styler: Styler,
+  animationTick: number,
+  showConnectors: boolean,
+): string[] {
+  if (members.length === 0) return [styler.dim("No team members yet.")];
+
+  const connectorWidth = showConnectors ? 5 : 2;
+  const minCardWidth = 20;
+  const cardsPerRow = Math.max(
+    1,
+    Math.min(
+      members.length,
+      Math.floor((Math.max(width, minCardWidth) + connectorWidth) / (minCardWidth + connectorWidth)),
+    ),
+  );
+
+  const chunks: TeamMemberState[][] = [];
+  for (let index = 0; index < members.length; index += cardsPerRow) {
+    chunks.push(members.slice(index, index + cardsPerRow));
+  }
+
+  const output: string[] = [];
+  for (const chunk of chunks) {
+    const totalConnectorWidth = connectorWidth * Math.max(0, chunk.length - 1);
+    const cardWidth = Math.max(
+      minCardWidth,
+      Math.floor((Math.max(width, minCardWidth) - totalConnectorWidth) / chunk.length),
+    );
+    const cards = chunk.map((member) => renderCard(member, cardWidth, styler, animationTick));
+    const connectorRow = 2;
+
+    for (let line = 0; line < cards[0].length; line++) {
+      let row = cards[0][line];
+      for (let cardIndex = 1; cardIndex < cards.length; cardIndex++) {
+        if (showConnectors) {
+          row +=
+            line === connectorRow
+              ? renderSequentialConnector(chunk[cardIndex], animationTick, styler)
+              : " ".repeat(connectorWidth);
+        } else {
+          row += " ".repeat(connectorWidth);
+        }
+        row += cards[cardIndex][line];
+      }
+      output.push(row);
+    }
+
+    if (chunk !== chunks[chunks.length - 1]) output.push("");
+  }
+
+  return output;
+}
+
+function cloneMemberState(member: TeamMemberState): TeamMemberState {
+  return { ...member };
+}
+
+function clonePhaseState(phase: TeamPhaseState): TeamPhaseState {
+  return {
+    kind: phase.kind,
+    warningMessage: phase.warningMessage,
+    members: phase.members.map(cloneMemberState),
+  };
+}
+
+export function buildTeamCardPayload(details: {
+  teamName: string;
+  phases: TeamPhaseState[];
+}): TeamCardPayload {
+  return {
+    teamName: details.teamName,
+    phases: details.phases.map(clonePhaseState),
+  };
+}
+
+export function renderTeamCardLines(
+  payload: TeamCardPayload,
+  width: number,
+  theme?: Theme,
+  options?: TeamCardRenderOptions,
+): string[] {
+  const styler = theme ? createThemeStyler(theme) : createPlainStyler();
+  const animationTick = options?.animationTick ?? 0;
+  const output: string[] = [
+    styler.dim("Team"),
+    styler.accent(styler.bold(payload.teamName)),
+  ];
+
+  if (payload.phases.length === 0) {
+    output.push("", styler.dim("No team phases yet."));
+    return output;
+  }
+
+  for (let index = 0; index < payload.phases.length; index++) {
+    const phase = payload.phases[index];
+    output.push("");
+    const phaseLabel =
+      phase.kind === "parallel"
+        ? styler.highlight("∥ parallel")
+        : styler.dim("→ sequential");
+    output.push(
+      phase.warningMessage
+        ? `${phaseLabel} ${styler.highlight("! warning")}`
+        : phaseLabel,
+    );
+    if (phase.warningMessage) {
+      output.push(styler.highlight(`warning: ${phase.warningMessage}`));
+    }
+    output.push(
+      ...renderPhaseRows(
+        phase.members,
+        width,
+        styler,
+        animationTick,
+        phase.kind === "sequential",
+      ),
+    );
+
+    if (index < payload.phases.length - 1) {
+      output.push("");
+      output.push(styler.dim("▼"));
+    }
+  }
+
+  return output;
+}
