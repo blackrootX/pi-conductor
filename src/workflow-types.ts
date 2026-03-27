@@ -10,6 +10,12 @@ export const WORKFLOW_CHANNELS = [
 export type WorkflowChannel = (typeof WORKFLOW_CHANNELS)[number];
 
 export type WorkflowSource = "built-in" | "global" | "project";
+export type ExecutionProfile =
+  | "planning"
+  | "explore"
+  | "implement"
+  | "verify-context";
+export type VerifyStatus = "pending" | "passed" | "failed" | "skipped";
 
 export interface WorkflowStepConfig {
   id: string;
@@ -44,6 +50,9 @@ export interface VerificationItem {
   check: string;
   status: "pass" | "fail" | "not_run";
   notes?: string;
+  kind?: "file_exists" | "grep_assertion" | "diagnostic" | "claimed";
+  path?: string;
+  source?: "worker" | "runtime";
 }
 
 export interface WorkItem {
@@ -68,6 +77,13 @@ export interface ResolvedWorkItemInput {
   resolution?: string;
 }
 
+export interface EvidenceHints {
+  touchedFiles?: string[];
+  artifactPaths?: string[];
+  symbols?: string[];
+  commands?: string[];
+}
+
 export interface AgentResult {
   status: "success" | "blocked" | "failed";
   summary: string;
@@ -80,6 +96,7 @@ export interface AgentResult {
   resolvedWorkItems?: ResolvedWorkItemInput[];
   focusSummary?: string;
   nextStepHint?: string;
+  evidenceHints?: EvidenceHints;
   rawText?: string;
 }
 
@@ -97,11 +114,18 @@ export interface SharedState {
 export interface StepRunState {
   stepId: string;
   agent: string;
+  profile?: ExecutionProfile;
   objective: string;
   status: "pending" | "running" | "done" | "blocked" | "failed";
+  verifyStatus?: VerifyStatus;
+  verifySummary?: string;
+  verifyChecks?: VerificationItem[];
+  verifyAttemptCount?: number;
   startedAt?: string;
   finishedAt?: string;
   result?: AgentResult;
+  provisionalResult?: AgentResult;
+  evidenceHints?: EvidenceHints;
   rawFinalText?: string;
   repairedFinalText?: string;
   parseError?: string;
@@ -120,9 +144,37 @@ export interface WorkflowState {
   steps: StepRunState[];
 }
 
+export interface WorkflowCanonicalStepSnapshot {
+  stepId: string;
+  agent: string;
+  profile?: ExecutionProfile;
+  objective: string;
+  status: StepRunState["status"];
+  verifyStatus?: VerifyStatus;
+  verifySummary?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  summary?: string;
+}
+
+export interface WorkflowPersistedStateSnapshot {
+  runId: string;
+  workflowName: string;
+  workflowSource: WorkflowSource;
+  workflowFilePath?: string | null;
+  userTask: string;
+  status: WorkflowState["status"];
+  currentStepIndex: number;
+  startedAt: string;
+  finishedAt?: string;
+  shared: SharedState;
+  steps: WorkflowCanonicalStepSnapshot[];
+}
+
 export interface WorkOrder {
   stepId: string;
   agent: string;
+  profile?: ExecutionProfile;
   agentDescription?: string;
   objective: string;
   context: {
@@ -138,5 +190,9 @@ export interface WorkOrder {
     currentFocus?: string;
   };
   constraints: string[];
+  profileGuidance?: string[];
+  allowedTools?: string[];
+  definitionOfDone?: string[];
+  requiredEvidence?: string[];
   expectedOutput: WorkflowChannel[];
 }

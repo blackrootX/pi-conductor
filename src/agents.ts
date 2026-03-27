@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 import { composeBuiltInPrompt } from "./workflow-prompt-composer.js";
+import type { ExecutionProfile, WorkflowStepConfig } from "./workflow-types.js";
 
 export type AgentSource = "built-in" | "global" | "project";
 
@@ -14,6 +15,8 @@ export interface AgentConfig {
   source: AgentSource;
   filePath?: string;
   internalIncludes?: string[];
+  rolePrompt?: string;
+  defaultProfile?: ExecutionProfile;
 }
 
 export interface AgentDiscoveryResult {
@@ -33,7 +36,13 @@ const BUILT_IN_AGENTS: BuiltInAgentDefinition[] = [
     description: "Planning specialist for the next workflow step",
     tools: ["read", "grep", "find", "ls"],
     source: "built-in",
-    internalIncludes: ["workflow-role-common", "plan-style"],
+    internalIncludes: [
+      "workflow-role-common",
+      "done-criteria",
+      "evidence-style",
+      "verify-style",
+    ],
+    defaultProfile: "planning",
     rolePrompt: [
       "You are the planning step in a coding workflow.",
       "Be concrete and code-oriented while staying strictly in planning mode.",
@@ -44,7 +53,13 @@ const BUILT_IN_AGENTS: BuiltInAgentDefinition[] = [
     description: "Implementation specialist for workflow execution",
     tools: ["read", "write", "edit", "grep", "find", "ls", "bash"],
     source: "built-in",
-    internalIncludes: ["workflow-role-common", "build-style"],
+    internalIncludes: [
+      "workflow-role-common",
+      "done-criteria",
+      "evidence-style",
+      "verify-style",
+    ],
+    defaultProfile: "implement",
     rolePrompt: [
       "You are the build step in a coding workflow.",
       "Treat the provided context as the current workflow state and execute the required implementation work.",
@@ -56,8 +71,47 @@ function getBuiltInAgents(): AgentConfig[] {
   return BUILT_IN_AGENTS.map(({ rolePrompt, internalIncludes, ...agent }) => ({
     ...agent,
     internalIncludes: [...internalIncludes],
-    systemPrompt: composeBuiltInPrompt(rolePrompt, internalIncludes),
+    rolePrompt,
+    systemPrompt: composeBuiltInPrompt(rolePrompt, internalIncludes, agent.defaultProfile),
   }));
+}
+
+function getAgentToolClass(
+  agent: AgentConfig | undefined,
+): "read-only" | "write-capable" | "unspecified" {
+  const tools = agent?.tools ?? [];
+  if (tools.length === 0) return "unspecified";
+  return tools.some((tool) => tool === "write" || tool === "edit" || tool === "bash")
+    ? "write-capable"
+    : "read-only";
+}
+
+export function resolveExecutionProfile(
+  step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+): ExecutionProfile {
+  if (step.agent === "plan" || agent?.defaultProfile === "planning") {
+    return "planning";
+  }
+  if (step.agent === "build" || agent?.defaultProfile === "implement") {
+    return "implement";
+  }
+
+  const toolClass = getAgentToolClass(agent);
+  if (toolClass === "read-only") return "explore";
+  if (toolClass === "write-capable") return "implement";
+
+  return agent?.source === "built-in" ? "implement" : "explore";
+}
+
+export function resolveAgentSystemPrompt(
+  agent: AgentConfig,
+  profile: ExecutionProfile,
+): string {
+  if (agent.source !== "built-in" || !agent.rolePrompt || !agent.internalIncludes) {
+    return agent.systemPrompt;
+  }
+  return composeBuiltInPrompt(agent.rolePrompt, agent.internalIncludes, profile);
 }
 
 function isDirectory(filePath: string): boolean {

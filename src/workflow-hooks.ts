@@ -5,6 +5,7 @@ import type {
   ArtifactItem,
   BlockerItem,
   DecisionItem,
+  EvidenceHints,
   NewWorkItemInput,
   ResolvedWorkItemInput,
   SharedState,
@@ -75,6 +76,10 @@ export interface BeforeStepPatch {
   objective?: string | null;
   agentDescription?: string | null;
   constraints?: string[];
+  profileGuidance?: string[];
+  allowedTools?: string[];
+  definitionOfDone?: string[];
+  requiredEvidence?: string[];
   expectedOutput?: WorkflowChannel[];
   context?: WorkOrderContextPatch;
 }
@@ -101,6 +106,7 @@ export interface AfterStepPatch {
   resolvedWorkItems?: ResolvedWorkItemInput[];
   focusSummary?: string | null;
   nextStepHint?: string | null;
+  evidenceHints?: EvidenceHints;
 }
 
 export type WorkflowRuntimeErrorStage =
@@ -109,7 +115,8 @@ export type WorkflowRuntimeErrorStage =
   | "agent"
   | "repair"
   | "parse"
-  | "afterStep";
+  | "afterStep"
+  | "verify";
 
 export interface WorkflowRuntimeError {
   stage: WorkflowRuntimeErrorStage;
@@ -142,6 +149,34 @@ export interface OnStepErrorPatch {
   diagnostics?: string[];
 }
 
+export interface AfterPromoteInput {
+  cwd: string;
+  workflow: DeepReadonly<WorkflowConfig>;
+  agent?: DeepReadonly<AgentConfig>;
+  state: DeepReadonly<WorkflowState>;
+  stepIndex: number;
+  workOrder: DeepReadonly<WorkOrder>;
+  result: DeepReadonly<AgentResult>;
+}
+
+export interface AfterPromotePatch {
+  diagnostics?: string[];
+}
+
+export interface OnVerifyFailureInput {
+  cwd: string;
+  workflow: DeepReadonly<WorkflowConfig>;
+  agent?: DeepReadonly<AgentConfig>;
+  state: DeepReadonly<WorkflowState>;
+  stepIndex: number;
+  workOrder: DeepReadonly<WorkOrder>;
+  result: DeepReadonly<AgentResult>;
+  verification: DeepReadonly<VerificationItem[]>;
+  verifySummary?: string;
+}
+
+export type OnVerifyFailurePatch = OnStepErrorPatch;
+
 export interface WorkflowRuntimeHooks {
   beforeWorkflow?: (
     input: BeforeWorkflowInput,
@@ -152,6 +187,12 @@ export interface WorkflowRuntimeHooks {
   afterStep?: (
     input: AfterStepInput,
   ) => MaybePromise<AfterStepPatch | void>;
+  afterPromote?: (
+    input: AfterPromoteInput,
+  ) => MaybePromise<AfterPromotePatch | void>;
+  onVerifyFailure?: (
+    input: OnVerifyFailureInput,
+  ) => MaybePromise<OnVerifyFailurePatch | void>;
   onStepError?: (
     input: OnStepErrorInput,
   ) => MaybePromise<OnStepErrorPatch | void>;
@@ -222,6 +263,20 @@ function mergeOrderedStrings(
     if (normalized) merged.add(normalized);
   }
   return Array.from(merged.values());
+}
+
+function mergeEvidenceHints(
+  current: EvidenceHints | undefined,
+  patch: EvidenceHints | undefined,
+): EvidenceHints | undefined {
+  if (!patch) return current;
+  const merged: EvidenceHints = {
+    touchedFiles: mergeOrderedStrings(current?.touchedFiles, patch.touchedFiles),
+    artifactPaths: mergeOrderedStrings(current?.artifactPaths, patch.artifactPaths),
+    symbols: mergeOrderedStrings(current?.symbols, patch.symbols),
+    commands: mergeOrderedStrings(current?.commands, patch.commands),
+  };
+  return Object.values(merged).some(Boolean) ? merged : undefined;
 }
 
 function decisionKey(item: DecisionItem): string {
@@ -354,6 +409,17 @@ export function mergeBeforeStepPatch(
     ),
     constraints:
       mergeOrderedStrings(current.constraints, patch.constraints) ?? current.constraints,
+    profileGuidance:
+      mergeOrderedStrings(current.profileGuidance, patch.profileGuidance) ??
+      current.profileGuidance,
+    allowedTools:
+      mergeOrderedStrings(current.allowedTools, patch.allowedTools) ?? current.allowedTools,
+    definitionOfDone:
+      mergeOrderedStrings(current.definitionOfDone, patch.definitionOfDone) ??
+      current.definitionOfDone,
+    requiredEvidence:
+      mergeOrderedStrings(current.requiredEvidence, patch.requiredEvidence) ??
+      current.requiredEvidence,
     expectedOutput:
       mergeUniqueItems(
         current.expectedOutput,
@@ -405,6 +471,7 @@ export function mergeAfterStepPatch(
       patch.nextStepHint,
       hasOwn(patch, "nextStepHint"),
     ),
+    evidenceHints: mergeEvidenceHints(current.evidenceHints, patch.evidenceHints),
   };
 }
 

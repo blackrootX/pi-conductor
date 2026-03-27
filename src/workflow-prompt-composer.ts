@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ExecutionProfile } from "./workflow-types.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const INCLUDE_DIR_CANDIDATES = [
@@ -16,11 +17,32 @@ const EMBEDDED_INTERNAL_INCLUDES: Record<string, string> = {
     "You are reporting to the workflow orchestrator, not directly to the next agent.",
     "Follow the runtime response contract exactly.",
   ].join("\n"),
+  "done-criteria": [
+    "Use the definition-of-done section as the concrete success contract for this step.",
+    "Do not claim the step is complete unless the done criteria are satisfied by your actual work.",
+  ].join("\n"),
+  "evidence-style": [
+    "Return concrete evidence hints for touched files, artifacts, symbols, and commands when relevant.",
+    "Treat evidence hints as claims for the runtime to inspect later, not as self-verifying proof.",
+  ].join("\n"),
+  "verify-style": [
+    "The runtime owns verification after your step completes.",
+    "Do not present your own verification claims as authoritative final truth.",
+  ].join("\n"),
+  "implementation-guardrails": [
+    "Prefer the smallest concrete change that satisfies the objective.",
+    "Keep claims tied to repository evidence and do not invent side effects you did not perform.",
+  ].join("\n"),
   "plan-style": [
     "Stay in planning mode.",
     "Inspect the repository and turn the task into concise, implementation-ready guidance for a later execution step.",
     "Do not modify files, create files, or execute implementation work yourself.",
     "Use the structured result to propose newWorkItems, blockers, verification, and the next focus.",
+  ].join("\n"),
+  "explore-style": [
+    "Stay in exploration mode.",
+    "Inspect existing code and gather evidence without making repository changes.",
+    "Prefer concrete findings, paths, and symbols over broad speculation.",
   ].join("\n"),
   "build-style": [
     "Treat the provided context as work to execute, not just discuss.",
@@ -28,6 +50,17 @@ const EMBEDDED_INTERNAL_INCLUDES: Record<string, string> = {
     "Prefer concrete execution over high-level planning.",
     "Use the structured result to record what you changed, what remains, and any blockers or verification.",
   ].join("\n"),
+  "verify-context-style": [
+    "Treat this step as evidence gathering for later runtime verification.",
+    "Return precise evidence hints and candidate proof points, but do not self-certify the final outcome.",
+  ].join("\n"),
+};
+
+const PROFILE_INCLUDES: Record<ExecutionProfile, string[]> = {
+  planning: ["plan-style"],
+  explore: ["explore-style"],
+  implement: ["build-style", "implementation-guardrails"],
+  "verify-context": ["explore-style", "verify-context-style"],
 };
 
 function findIncludeFilePath(includeId: string): string | undefined {
@@ -72,8 +105,13 @@ export function loadInternalInclude(includeId: string): string {
 export function composeBuiltInPrompt(
   rolePrompt: string,
   internalIncludes: readonly string[],
+  profile?: ExecutionProfile,
 ): string {
-  const fragments = internalIncludes.map(loadInternalInclude);
+  const includeIds = [
+    ...internalIncludes,
+    ...(profile ? PROFILE_INCLUDES[profile] ?? [] : []),
+  ].filter(Boolean);
+  const fragments = Array.from(new Set(includeIds)).map(loadInternalInclude);
   const trimmedRolePrompt = rolePrompt.trim();
 
   return [...fragments, trimmedRolePrompt]

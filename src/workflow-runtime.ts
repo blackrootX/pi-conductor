@@ -1,12 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig, AgentSource } from "./agents.js";
-import { discoverAgents } from "./agents.js";
+import {
+  discoverAgents,
+  resolveAgentSystemPrompt,
+  resolveExecutionProfile,
+} from "./agents.js";
 import { runWorkflowAgentSession } from "./workflow-agent-session.js";
 import {
   applyOnStepErrorPatch,
+  type AfterPromotePatch,
   createImmutableHookSnapshot,
   mergeAfterStepPatch,
   mergeBeforeStepPatch,
@@ -20,15 +26,27 @@ import {
 import { renderRepairPrompt, renderStructuredStepPrompt } from "./workflow-prompts.js";
 import { parseAgentResult } from "./workflow-result.js";
 import {
+  buildCanonicalStepSnapshot,
   buildFinalTextFromState,
+  buildPersistedWorkflowStateSnapshot,
   buildWorkOrder,
   completeWorkflowState,
   createWorkflowState,
+  deriveProvisionalResult,
   markStepFailure,
   markStepRunning,
   mergeAgentResultIntoState,
+  recordVerificationOutcome,
+  setProvisionalStepResult,
 } from "./workflow-state.js";
-import type { AgentResult, WorkflowConfig, WorkflowState } from "./workflow-types.js";
+import type {
+  AgentResult,
+  ExecutionProfile,
+  VerificationItem,
+  VerifyStatus,
+  WorkflowConfig,
+  WorkflowState,
+} from "./workflow-types.js";
 import { discoverWorkflows } from "./workflows.js";
 
 const REPAIR_SYSTEM_PROMPT = [
@@ -53,6 +71,7 @@ export interface SingleResult {
   agentSource: AgentSource | "unknown";
   task: string;
   objective?: string;
+  profile?: ExecutionProfile;
   exitCode: number;
   elapsedMs: number;
   lastWork: string;
@@ -77,6 +96,7 @@ export interface WorkflowDetails {
   steps: WorkflowConfig["steps"];
   workflowSource: WorkflowConfig["source"];
   workflowFilePath: string | null;
+  runDir: string;
   results: SingleResult[];
   state: WorkflowState;
 }
@@ -88,6 +108,7 @@ export interface WorkflowRunResult {
   steps: WorkflowConfig["steps"];
   workflowSource: WorkflowConfig["source"];
   workflowFilePath: string | null;
+  runDir: string;
   results: SingleResult[];
   state: WorkflowState;
   finalText: string;
@@ -165,47 +186,524 @@ function writeJsonFile(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
 }
 
+function writeTextFile(filePath: string, text: string): void {
+  fs.writeFileSync(filePath, text, "utf8");
+}
+
+type VerifyPolicy = {
+  verifyOptional: boolean;
+  allowClaimedChecks: boolean;
+  allowFileExistsChecks: boolean;
+  allowGrepChecks: boolean;
+  allowWorkerSelectedFileTargets: boolean;
+};
+
+type PlannedVerifyCheck = {
+  check: string;
+  kind: NonNullable<VerificationItem["kind"]>;
+  path?: string;
+  pattern?: string;
+  source: NonNullable<VerificationItem["source"]>;
+  notes?: string;
+};
+
+type VerifyStepOutcome = {
+  status: VerifyStatus;
+  checks: VerificationItem[];
+  summary: string;
+};
+
+type RepositorySnapshot = {
+  dirtyFileHashes: Map<string, string | null>;
+};
+
+function uniqueStrings(items: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const item of items) {
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    output.push(trimmed);
+  }
+  return output;
+}
+
+function resolveVerifyPolicy(profile: ExecutionProfile): VerifyPolicy {
+  switch (profile) {
+    case "planning":
+    case "explore":
+      return {
+        verifyOptional: true,
+        allowClaimedChecks: true,
+        allowFileExistsChecks: true,
+        allowGrepChecks: true,
+        allowWorkerSelectedFileTargets: true,
+      };
+    case "verify-context":
+      return {
+        verifyOptional: false,
+        allowClaimedChecks: true,
+        allowFileExistsChecks: true,
+        allowGrepChecks: true,
+        allowWorkerSelectedFileTargets: true,
+      };
+    case "implement":
+    default:
+      return {
+        verifyOptional: false,
+        allowClaimedChecks: true,
+        allowFileExistsChecks: true,
+        allowGrepChecks: true,
+        allowWorkerSelectedFileTargets: false,
+      };
+  }
+}
+
+function collectWorkerEvidence(result: AgentResult): {
+  hintedFileTargets: string[];
+  symbolTargets: string[];
+  claimedChecks: VerificationItem[];
+} {
+  const hintedFileTargets = uniqueStrings([
+    ...(result.evidenceHints?.touchedFiles ?? []),
+    ...(result.evidenceHints?.artifactPaths ?? []),
+    ...(result.artifacts ?? []).map((item) => item.path ?? "").filter(Boolean),
+    ...(result.verification ?? []).map((item) => item.path ?? "").filter(Boolean),
+  ]);
+  const symbolTargets = uniqueStrings(result.evidenceHints?.symbols ?? []);
+  const claimedChecks = (result.verification ?? []).map((item) => {
+    const requestedKind =
+      item.kind && item.kind !== "claimed"
+        ? `Worker requested ${item.kind} verification; runtime recorded it as an untrusted claim only.`
+        : undefined;
+    const notes = [item.notes?.trim(), requestedKind].filter(Boolean).join(" ").trim();
+    return {
+      ...item,
+      notes: notes || undefined,
+      source: "worker" as const,
+      kind: "claimed" as const,
+    };
+  });
+  return { hintedFileTargets, symbolTargets, claimedChecks };
+}
+
+function resolveCheckPath(cwd: string, filePath: string): string {
+  return path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+}
+
+function resolveVerifyPath(cwd: string, filePath: string): string | null {
+  const resolvedPath = resolveCheckPath(cwd, filePath);
+  const relativePath = path.relative(cwd, resolvedPath);
+  if (
+    relativePath.startsWith("..") ||
+    path.isAbsolute(relativePath)
+  ) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+function readFileDigest(filePath: string): string | null {
+  try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile()) return null;
+    return createHash("sha1").update(fs.readFileSync(filePath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function parseGitStatusPaths(stdout: string): string[] {
+  const tokens = stdout.split("\0").filter(Boolean);
+  const filePaths: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.length < 4 || token[2] !== " ") continue;
+    const status = token.slice(0, 2);
+    const primaryPath = token.slice(3).trim();
+    if (primaryPath) filePaths.push(primaryPath);
+    if (status.includes("R") || status.includes("C")) {
+      const secondaryPath = tokens[index + 1]?.trim();
+      if (secondaryPath) filePaths.push(secondaryPath);
+      index += 1;
+    }
+  }
+  return uniqueStrings(filePaths);
+}
+
+function captureRepositorySnapshot(cwd: string): RepositorySnapshot | undefined {
+  const gitStatus = spawnSync(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+    { cwd, encoding: "utf8" },
+  );
+  if (gitStatus.status !== 0) return undefined;
+
+  const dirtyFileHashes = new Map<string, string | null>();
+  for (const filePath of parseGitStatusPaths(gitStatus.stdout ?? "")) {
+    const resolvedPath = resolveVerifyPath(cwd, filePath);
+    if (!resolvedPath) continue;
+    dirtyFileHashes.set(filePath, readFileDigest(resolvedPath));
+  }
+
+  return { dirtyFileHashes };
+}
+
+function collectRuntimeTouchedFiles(
+  cwd: string,
+  beforeSnapshot: RepositorySnapshot | undefined,
+): string[] {
+  if (!beforeSnapshot) return [];
+  const afterSnapshot = captureRepositorySnapshot(cwd);
+  if (!afterSnapshot) return [];
+
+  const touchedFiles: string[] = [];
+  for (const [filePath, afterHash] of afterSnapshot.dirtyFileHashes.entries()) {
+    const beforeHash = beforeSnapshot.dirtyFileHashes.get(filePath);
+    if (!beforeSnapshot.dirtyFileHashes.has(filePath) || beforeHash !== afterHash) {
+      touchedFiles.push(filePath);
+    }
+  }
+
+  return uniqueStrings(touchedFiles);
+}
+
+function createVerifyChecks(
+  cwd: string,
+  result: AgentResult,
+  policy: VerifyPolicy,
+  runtimeTouchedFiles: string[],
+): PlannedVerifyCheck[] {
+  const { hintedFileTargets, symbolTargets, claimedChecks } = collectWorkerEvidence(result);
+  const planned: PlannedVerifyCheck[] = [];
+  const trustedRuntimeTargets = uniqueStrings(runtimeTouchedFiles)
+    .map((fileTarget) => ({
+      fileTarget,
+      resolvedPath: resolveVerifyPath(cwd, fileTarget),
+    }))
+    .filter((item) => item.resolvedPath && fs.existsSync(item.resolvedPath))
+    .map((item) => item.fileTarget);
+  const candidateFileTargets = policy.allowWorkerSelectedFileTargets
+    ? uniqueStrings([...trustedRuntimeTargets, ...hintedFileTargets])
+    : trustedRuntimeTargets;
+
+  if (policy.allowFileExistsChecks) {
+    for (const fileTarget of candidateFileTargets.slice(0, 8)) {
+      const resolvedPath = resolveVerifyPath(cwd, fileTarget);
+      if (!resolvedPath) continue;
+      planned.push({
+        check: `Path exists: ${fileTarget}`,
+        kind: "file_exists",
+        path: resolvedPath,
+        source: "runtime",
+      });
+    }
+  }
+
+  if (policy.allowGrepChecks && symbolTargets.length > 0 && candidateFileTargets.length > 0) {
+    let grepCount = 0;
+    for (const fileTarget of candidateFileTargets.slice(0, 4)) {
+      const resolvedPath = resolveVerifyPath(cwd, fileTarget);
+      if (!resolvedPath) continue;
+      for (const symbolTarget of symbolTargets.slice(0, 4)) {
+        planned.push({
+          check: `File contains symbol: ${symbolTarget} in ${fileTarget}`,
+          kind: "grep_assertion",
+          path: resolvedPath,
+          pattern: symbolTarget,
+          source: "runtime",
+        });
+        grepCount += 1;
+        if (grepCount >= 8) break;
+      }
+      if (grepCount >= 8) break;
+    }
+  }
+
+  if (policy.allowClaimedChecks) {
+    for (const claimedCheck of claimedChecks.slice(0, 8)) {
+      const resolvedPath = claimedCheck.path
+        ? resolveVerifyPath(cwd, claimedCheck.path)
+        : undefined;
+      planned.push({
+        check: claimedCheck.check,
+        kind: "claimed",
+        path: resolvedPath ?? undefined,
+        source: "worker",
+        notes: claimedCheck.notes,
+      });
+    }
+  }
+
+  return planned;
+}
+
+function executeVerifyCheck(check: PlannedVerifyCheck): VerificationItem {
+  if (check.kind === "claimed") {
+    return {
+      check: check.check,
+      status: "not_run",
+      notes: check.notes
+        ? `Worker claim recorded for runtime review: ${check.notes}`
+        : "Worker claim recorded for runtime review.",
+      kind: check.kind,
+      path: check.path,
+      source: check.source,
+    };
+  }
+
+  if (check.kind === "file_exists") {
+    const exists = check.path ? fs.existsSync(check.path) : false;
+    return {
+      check: check.check,
+      status: exists ? "pass" : "fail",
+      notes: exists ? check.path : "Missing path on disk.",
+      kind: check.kind,
+      path: check.path,
+      source: check.source,
+    };
+  }
+
+  if (check.kind === "grep_assertion") {
+    if (!check.path || !check.pattern) {
+      return {
+        check: check.check,
+        status: "not_run",
+        notes: "Missing grep target path or pattern.",
+        kind: check.kind,
+        path: check.path,
+        source: check.source,
+      };
+    }
+    try {
+      const content = fs.readFileSync(check.path, "utf8");
+      const matches = content.includes(check.pattern);
+      return {
+        check: check.check,
+        status: matches ? "pass" : "fail",
+        notes: matches
+          ? `Found "${check.pattern}" in ${check.path}.`
+          : `Did not find "${check.pattern}" in ${check.path}.`,
+        kind: check.kind,
+        path: check.path,
+        source: check.source,
+      };
+    } catch (error) {
+      return {
+        check: check.check,
+        status: "fail",
+        notes: `Could not read ${check.path}: ${describeUnknownError(error)}`,
+        kind: check.kind,
+        path: check.path,
+        source: check.source,
+      };
+    }
+  }
+
+  return {
+    check: check.check,
+    status: "not_run",
+    notes: "Unsupported verification check kind.",
+    kind: check.kind,
+    path: check.path,
+    source: check.source,
+  };
+}
+
+function summarizeVerifyOutcome(status: VerifyStatus, checks: VerificationItem[]): string {
+  const passCount = checks.filter((item) => item.status === "pass").length;
+  const failCount = checks.filter((item) => item.status === "fail").length;
+  const notRunCount = checks.filter((item) => item.status === "not_run").length;
+  if (status === "skipped") {
+    return `Verification skipped by runtime policy (${checks.length} selected, ${notRunCount} not_run).`;
+  }
+  return `Verification ${status}: ${passCount} passed, ${failCount} failed, ${notRunCount} not_run.`;
+}
+
+function verifyStep(
+  cwd: string,
+  result: AgentResult,
+  policy: VerifyPolicy,
+  repositorySnapshotBeforeStep: RepositorySnapshot | undefined,
+): VerifyStepOutcome {
+  const runtimeTouchedFiles = policy.allowWorkerSelectedFileTargets
+    ? []
+    : collectRuntimeTouchedFiles(cwd, repositorySnapshotBeforeStep);
+  const plannedChecks = createVerifyChecks(cwd, result, policy, runtimeTouchedFiles);
+  const checks = plannedChecks.map(executeVerifyCheck);
+  const anyFail = checks.some((item) => item.status === "fail");
+  const anyPass = checks.some((item) => item.status === "pass");
+  const allNotRun = checks.length > 0 && checks.every((item) => item.status === "not_run");
+
+  let status: VerifyStatus;
+  if (anyFail) {
+    status = "failed";
+  } else if (anyPass) {
+    status = "passed";
+  } else if (checks.length === 0) {
+    status = policy.verifyOptional ? "skipped" : "failed";
+  } else if (allNotRun) {
+    status = policy.verifyOptional ? "skipped" : "failed";
+  } else {
+    status = "failed";
+  }
+
+  return {
+    status,
+    checks,
+    summary: summarizeVerifyOutcome(status, checks),
+  };
+}
+
+function renderBucketSection(title: string, items: string[]): string {
+  return [title, "", ...(items.length > 0 ? items : ["- None"]), ""].join("\n");
+}
+
+function renderSummaryBucket(state: WorkflowState): string {
+  const summary = state.shared.summary?.trim() || "(no summary yet)";
+  const openItems = state.shared.workItems
+    .filter((item) => item.status === "open" || item.status === "in_progress")
+    .map((item) => `- ${item.title} [${item.status}]${item.details ? ` (${item.details})` : ""}`);
+  const blockedItems = state.shared.workItems
+    .filter((item) => item.status === "blocked")
+    .map((item) => `- ${item.title}${item.details ? ` (${item.details})` : ""}`);
+  return [
+    "# Summary",
+    "",
+    summary,
+    "",
+    renderBucketSection("## Current Focus", [
+      state.shared.focus?.trim() || "(no explicit focus)",
+    ]),
+    renderBucketSection("## Open Work Items", openItems),
+    renderBucketSection("## Blocked Work Items", blockedItems),
+  ]
+    .join("\n")
+    .trim();
+}
+
+function renderDecisionsBucket(state: WorkflowState): string {
+  return [
+    "# Decisions",
+    "",
+    ...(state.shared.decisions.length > 0
+      ? state.shared.decisions.map((item) =>
+          `- ${item.topic}: ${item.decision}${item.rationale ? ` (${item.rationale})` : ""}`
+        )
+      : ["- None"]),
+  ].join("\n");
+}
+
+function renderLearningsBucket(state: WorkflowState): string {
+  return ["# Learnings", "", ...(state.shared.learnings.length > 0 ? state.shared.learnings.map((item) => `- ${item}`) : ["- None"])].join("\n");
+}
+
+function renderIssuesBucket(state: WorkflowState): string {
+  return [
+    "# Issues",
+    "",
+    ...(state.shared.blockers.length > 0
+      ? state.shared.blockers.map((item) =>
+          `- ${item.issue}${item.needs ? ` (needs: ${item.needs})` : ""}`
+        )
+      : ["- None"]),
+  ].join("\n");
+}
+
+function renderVerificationBucket(state: WorkflowState): string {
+  return [
+    "# Verification",
+    "",
+    ...(state.shared.verification.length > 0
+      ? state.shared.verification.map((item) =>
+          `- ${item.check}: ${item.status}${item.notes ? ` (${item.notes})` : ""}`
+        )
+      : ["- None"]),
+  ].join("\n");
+}
+
+function renderProvisionalBucket(state: WorkflowState): string {
+  const lines = ["# Provisional Attempts", ""];
+  const provisionalSteps = state.steps.filter(
+    (step) => step.provisionalResult && !step.result,
+  );
+  if (provisionalSteps.length === 0) {
+    lines.push("- None");
+    return lines.join("\n");
+  }
+  for (const step of provisionalSteps) {
+    lines.push(`## ${step.stepId} (${step.agent})`);
+    lines.push(`- status: ${step.status}`);
+    lines.push(`- verify: ${step.verifyStatus ?? "pending"}`);
+    if (step.verifySummary) lines.push(`- verify summary: ${step.verifySummary}`);
+    if (step.provisionalResult?.summary) {
+      lines.push(`- provisional summary: ${step.provisionalResult.summary}`);
+    }
+    if (step.diagnostics?.length) {
+      lines.push(...step.diagnostics.map((item) => `- diagnostic: ${item}`));
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trim();
+}
+
+function persistWorkflowBuckets(
+  persistence: WorkflowPersistence,
+  state: WorkflowState,
+): void {
+  try {
+    writeTextFile(path.join(persistence.runDir, "summary.md"), `${renderSummaryBucket(state)}\n`);
+    writeTextFile(path.join(persistence.runDir, "decisions.md"), `${renderDecisionsBucket(state)}\n`);
+    writeTextFile(path.join(persistence.runDir, "learnings.md"), `${renderLearningsBucket(state)}\n`);
+    writeTextFile(path.join(persistence.runDir, "issues.md"), `${renderIssuesBucket(state)}\n`);
+    writeTextFile(path.join(persistence.runDir, "verification.md"), `${renderVerificationBucket(state)}\n`);
+    writeTextFile(path.join(persistence.runDir, "provisional.md"), `${renderProvisionalBucket(state)}\n`);
+  } catch {
+    // Canonical JSON persistence must remain authoritative even if markdown rendering fails.
+  }
+}
+
 function persistWorkflowState(
   persistence: WorkflowPersistence,
   workflow: WorkflowConfig,
   state: WorkflowState,
-  results: SingleResult[],
 ): void {
-  writeJsonFile(path.join(persistence.runDir, "state.json"), {
-    runId: state.runId,
-    workflowName: workflow.name,
-    workflowSource: workflow.source,
-    workflowFilePath: workflow.filePath ?? null,
-    status: state.status,
-    startedAt: state.startedAt,
-    finishedAt: state.finishedAt,
-    resultCount: results.length,
-    state,
-  });
+  writeJsonFile(
+    path.join(persistence.runDir, "state.json"),
+    buildPersistedWorkflowStateSnapshot(state, workflow.source, workflow.filePath ?? null),
+  );
 }
 
 function persistStepResult(
   persistence: WorkflowPersistence,
   stepIndex: number,
   stepAgent: string,
+  state: WorkflowState,
   result: SingleResult,
-  parsedResult?: AgentResult,
 ): void {
   const fileName = `${String(stepIndex + 1).padStart(2, "0")}-${sanitizeFileNamePart(stepAgent)}.result.json`;
+  const stepState = state.steps[stepIndex];
   writeJsonFile(path.join(persistence.stepsDir, fileName), {
+    canonicalStep: stepState ? buildCanonicalStepSnapshot(stepState) : null,
     step: result.step,
     stepId: result.stepId,
     agent: result.agent,
     agentSource: result.agentSource,
+    profile: result.profile ?? stepState?.profile,
     objective: result.objective,
     exitCode: result.exitCode,
     structuredStatus: result.structuredStatus,
+    verifyStatus: stepState?.verifyStatus,
+    verifySummary: stepState?.verifySummary,
+    verifyChecks: stepState?.verifyChecks ?? null,
     parseError: result.parseError,
     repairAttempted: result.repairAttempted,
     rawFinalText: result.rawFinalText,
     repairedFinalText: result.repairedFinalText,
-    parsedResult: parsedResult ?? null,
-    diagnostics: result.diagnostics ?? null,
+    provisionalResult: stepState?.provisionalResult ?? null,
+    evidenceHints: stepState?.evidenceHints ?? null,
+    diagnostics: stepState?.diagnostics ?? result.diagnostics ?? null,
     usage: result.usage,
     model: result.model,
     stderr: result.stderr,
@@ -215,6 +713,7 @@ function persistStepResult(
 }
 
 function makeWorkflowDetails(
+  persistence: WorkflowPersistence,
   workflow: WorkflowConfig,
   results: SingleResult[],
   state: WorkflowState,
@@ -224,9 +723,19 @@ function makeWorkflowDetails(
     steps: workflow.steps,
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
+    runDir: persistence.runDir,
     results,
     state,
   };
+}
+
+function persistRunArtifacts(
+  persistence: WorkflowPersistence,
+  workflow: WorkflowConfig,
+  state: WorkflowState,
+): void {
+  persistWorkflowState(persistence, workflow, state);
+  persistWorkflowBuckets(persistence, state);
 }
 
 function buildStructuredStopMessage(
@@ -370,6 +879,7 @@ export async function runWorkflowByName(
       steps: [],
       workflowSource: "built-in",
       workflowFilePath: null,
+      runDir: "",
       results: [],
       state: createWorkflowState(
         { name: workflowName, steps: [], source: "built-in" },
@@ -391,6 +901,7 @@ export async function runWorkflowByName(
       steps: workflow.steps,
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
+      runDir: "",
       results: [],
       state: createWorkflowState(workflow, task, runId),
       finalText: "",
@@ -405,7 +916,7 @@ export async function runWorkflowByName(
   const hooks = runtimeHooks;
 
   const emitDetails = (partialResults = results) => {
-    onUpdate?.(makeWorkflowDetails(workflow, partialResults, state));
+    onUpdate?.(makeWorkflowDetails(persistence, workflow, partialResults, state));
   };
 
   const runOnStepErrorHook = async (
@@ -419,6 +930,20 @@ export async function runWorkflowByName(
     } catch (hookError) {
       return mergeOnStepErrorPatch(undefined, {
         diagnostics: [`onStepError hook failed: ${describeUnknownError(hookError)}`],
+      });
+    }
+  };
+
+  const runOnVerifyFailureHook = async (
+    input: Parameters<NonNullable<WorkflowRuntimeHooks["onVerifyFailure"]>>[0],
+  ): Promise<OnStepErrorPatch | undefined> => {
+    if (!hooks.onVerifyFailure) return undefined;
+    try {
+      const patch = await hooks.onVerifyFailure(input);
+      return patch ?? undefined;
+    } catch (hookError) {
+      return mergeOnStepErrorPatch(undefined, {
+        diagnostics: [`onVerifyFailure hook failed: ${describeUnknownError(hookError)}`],
       });
     }
   };
@@ -490,6 +1015,7 @@ export async function runWorkflowByName(
       });
 
     failureResult.objective = workOrder?.objective ?? failureResult.objective;
+    failureResult.profile = workOrder?.profile ?? failureResult.profile;
     failureResult.rawFinalText = rawFinalText ?? failureResult.rawFinalText;
     failureResult.repairedFinalText =
       repairedFinalText ?? failureResult.repairedFinalText;
@@ -508,10 +1034,10 @@ export async function runWorkflowByName(
       persistence,
       index,
       step.agent,
+      state,
       failureResult,
-      state.steps[index]?.result,
     );
-    persistWorkflowState(persistence, workflow, state, results);
+    persistRunArtifacts(persistence, workflow, state);
     emitDetails();
 
     return {
@@ -519,6 +1045,7 @@ export async function runWorkflowByName(
       steps: workflow.steps,
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
+      runDir: persistence.runDir,
       results,
       state,
       finalText: "",
@@ -540,13 +1067,14 @@ export async function runWorkflowByName(
     }
   } catch (error) {
     markWorkflowFailed(state);
-    persistWorkflowState(persistence, workflow, state, results);
+    persistRunArtifacts(persistence, workflow, state);
     emitDetails();
     return {
       workflowName: workflow.name,
       steps: workflow.steps,
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
+      runDir: persistence.runDir,
       results,
       state,
       finalText: "",
@@ -555,15 +1083,21 @@ export async function runWorkflowByName(
     };
   }
 
-  persistWorkflowState(persistence, workflow, state, results);
+  persistRunArtifacts(persistence, workflow, state);
 
   for (let index = 0; index < workflow.steps.length; index++) {
     const step = workflow.steps[index];
     const agent = agents.find((item) => item.name === step.agent);
-    let workOrder = buildWorkOrder(state, step, agent, index);
+    const profile = resolveExecutionProfile(step, agent);
+    const verifyPolicy = resolveVerifyPolicy(profile);
+    const systemPromptOverride = agent
+      ? resolveAgentSystemPrompt(agent, profile)
+      : undefined;
+    let workOrder = buildWorkOrder(state, step, agent, index, profile);
+    state.steps[index].profile = profile;
     state.steps[index].objective = workOrder.objective;
     markStepRunning(state, index);
-    persistWorkflowState(persistence, workflow, state, results);
+    persistRunArtifacts(persistence, workflow, state);
     emitDetails();
 
     try {
@@ -589,9 +1123,12 @@ export async function runWorkflowByName(
     }
 
     state.steps[index].objective = workOrder.objective;
-    persistWorkflowState(persistence, workflow, state, results);
+    persistRunArtifacts(persistence, workflow, state);
     emitDetails();
 
+    const repositorySnapshotBeforeStep = verifyPolicy.allowWorkerSelectedFileTargets
+      ? undefined
+      : captureRepositorySnapshot(cwd);
     const stepPrompt = renderStructuredStepPrompt(workOrder);
 
     let primaryResult: SingleResult;
@@ -608,9 +1145,12 @@ export async function runWorkflowByName(
         signal,
         onUpdate: onUpdate
           ? (partialResult) => {
+              partialResult.profile = profile;
               emitDetails([...results, partialResult]);
             }
           : undefined,
+        systemPromptOverride,
+        toolsOverride: workOrder.allowedTools,
       });
     } catch (error) {
       return await failStep({
@@ -625,6 +1165,7 @@ export async function runWorkflowByName(
     }
 
     const rawFinalText = getFinalOutput(primaryResult.messages);
+    primaryResult.profile = profile;
     primaryResult.rawFinalText = rawFinalText;
     primaryResult.objective = workOrder.objective;
 
@@ -658,7 +1199,7 @@ export async function runWorkflowByName(
     if (!parseOutcome.ok) {
       parseError = parseOutcome.error;
       state.steps[index].parseError = parseError;
-      persistWorkflowState(persistence, workflow, state, results);
+      persistRunArtifacts(persistence, workflow, state);
       emitDetails();
 
       let repairResult: SingleResult;
@@ -675,12 +1216,13 @@ export async function runWorkflowByName(
           signal,
           onUpdate: onUpdate
             ? (partialResult) => {
-                partialResult.parseError = parseError;
-                partialResult.repairAttempted = true;
-                partialResult.rawFinalText = rawFinalText;
-                emitDetails([...results, partialResult]);
-              }
-            : undefined,
+              partialResult.parseError = parseError;
+              partialResult.repairAttempted = true;
+              partialResult.rawFinalText = rawFinalText;
+              partialResult.profile = profile;
+              emitDetails([...results, partialResult]);
+            }
+          : undefined,
           systemPromptOverride: REPAIR_SYSTEM_PROMPT,
           toolsOverride: [],
         });
@@ -704,6 +1246,7 @@ export async function runWorkflowByName(
       repairResult.parseError = parseError;
       repairResult.repairAttempted = true;
       repairResult.objective = workOrder.objective;
+      repairResult.profile = profile;
       finalResultRecord = repairResult;
 
       if (
@@ -789,55 +1332,159 @@ export async function runWorkflowByName(
       });
     }
 
-    finalResultRecord.structuredStatus = structuredResult.status;
-    finalResultRecord.rawFinalText = rawFinalText;
-    finalResultRecord.repairedFinalText = repairedFinalText;
-    finalResultRecord.parseError = parseError;
-    finalResultRecord.repairAttempted = Boolean(parseError);
-    finalResultRecord.lastWork = structuredResult.summary;
-
-    mergeAgentResultIntoState(
+    const provisionalResult = deriveProvisionalResult(structuredResult);
+    setProvisionalStepResult(
       state,
       index,
-      structuredResult,
+      provisionalResult,
       rawFinalText,
       repairedFinalText,
       parseError,
     );
-    results.push(finalResultRecord);
-    persistStepResult(
-      persistence,
-      index,
-      step.agent,
-      finalResultRecord,
-      state.steps[index]?.result,
-    );
-    persistWorkflowState(persistence, workflow, state, results);
-    emitDetails();
 
-    if (structuredResult.status === "blocked" || structuredResult.status === "failed") {
+    finalResultRecord.profile = profile;
+    finalResultRecord.structuredStatus = provisionalResult.status;
+    finalResultRecord.rawFinalText = rawFinalText;
+    finalResultRecord.repairedFinalText = repairedFinalText;
+    finalResultRecord.parseError = parseError;
+    finalResultRecord.repairAttempted = Boolean(parseError);
+    finalResultRecord.lastWork = provisionalResult.summary;
+
+    if (provisionalResult.status === "blocked" || provisionalResult.status === "failed") {
+      recordVerificationOutcome(
+        state,
+        index,
+        "failed",
+        undefined,
+        "Promotion denied because the worker reported a non-success step outcome.",
+        0,
+      );
+      return await failStep({
+        index,
+        step,
+        agent,
+        workOrder,
+        stage: "verify",
+        error: buildStructuredStopMessage(provisionalResult, index + 1, step.agent),
+        resultRecord: finalResultRecord,
+        rawFinalText,
+        repairedFinalText,
+        parseError,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent})`,
+      });
+    }
+
+    const verifyOutcome = verifyStep(
+      cwd,
+      provisionalResult,
+      verifyPolicy,
+      repositorySnapshotBeforeStep,
+    );
+    recordVerificationOutcome(
+      state,
+      index,
+      verifyOutcome.status,
+      verifyOutcome.checks,
+      verifyOutcome.summary,
+      1,
+    );
+
+    if (verifyOutcome.status === "failed") {
+      const verifyFailurePatch = await runOnVerifyFailureHook({
+        cwd,
+        workflow: createImmutableHookSnapshot(workflow),
+        agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+        state: createImmutableHookSnapshot(state),
+        stepIndex: index,
+        workOrder: createImmutableHookSnapshot(workOrder),
+        result: createImmutableHookSnapshot(provisionalResult),
+        verification: createImmutableHookSnapshot(verifyOutcome.checks),
+        verifySummary: verifyOutcome.summary,
+      });
+      applyOnStepErrorPatch(state, index, verifyFailurePatch);
+      finalResultRecord.diagnostics = mergeDiagnostics(
+        finalResultRecord.diagnostics,
+        verifyFailurePatch?.diagnostics,
+      );
+      if (verifyFailurePatch?.summary?.trim()) {
+        finalResultRecord.lastWork = verifyFailurePatch.summary.trim();
+      } else {
+        finalResultRecord.lastWork = verifyOutcome.summary;
+      }
+      markStepFailure(state, index, "failed");
+      results.push(finalResultRecord);
+      persistStepResult(persistence, index, step.agent, state, finalResultRecord);
+      persistRunArtifacts(persistence, workflow, state);
+      emitDetails();
       return {
         workflowName: workflow.name,
         steps: workflow.steps,
         workflowSource: workflow.source,
         workflowFilePath: workflow.filePath ?? null,
+        runDir: persistence.runDir,
         results,
         state,
         finalText: "",
         isError: true,
-        errorMessage: buildStructuredStopMessage(structuredResult, index + 1, step.agent),
+        errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}) during verify: ${verifyOutcome.summary}`,
       };
     }
+
+    const promotedResult: AgentResult = {
+      ...provisionalResult,
+      verification: verifyOutcome.checks,
+    };
+    mergeAgentResultIntoState(
+      state,
+      index,
+      promotedResult,
+      rawFinalText,
+      repairedFinalText,
+      parseError,
+    );
+
+    let afterPromotePatch: AfterPromotePatch | undefined;
+    try {
+      afterPromotePatch = await hooks.afterPromote?.({
+        cwd,
+        workflow: createImmutableHookSnapshot(workflow),
+        agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+        state: createImmutableHookSnapshot(state),
+        stepIndex: index,
+        workOrder: createImmutableHookSnapshot(workOrder),
+        result: createImmutableHookSnapshot(promotedResult),
+      }) ?? undefined;
+    } catch (error) {
+      afterPromotePatch = {
+        diagnostics: [`afterPromote hook failed: ${describeUnknownError(error)}`],
+      };
+    }
+
+    state.steps[index].diagnostics = mergeDiagnostics(
+      state.steps[index].diagnostics,
+      afterPromotePatch?.diagnostics,
+    );
+    finalResultRecord.diagnostics = mergeDiagnostics(
+      finalResultRecord.diagnostics,
+      afterPromotePatch?.diagnostics,
+    );
+    finalResultRecord.lastWork = promotedResult.summary;
+
+    results.push(finalResultRecord);
+    persistStepResult(persistence, index, step.agent, state, finalResultRecord);
+    persistRunArtifacts(persistence, workflow, state);
+    emitDetails();
   }
 
   completeWorkflowState(state);
-  persistWorkflowState(persistence, workflow, state, results);
+  persistRunArtifacts(persistence, workflow, state);
 
   return {
     workflowName: workflow.name,
     steps: workflow.steps,
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
+    runDir: persistence.runDir,
     results,
     state,
     finalText: buildFinalTextFromState(state),

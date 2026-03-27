@@ -18,16 +18,24 @@ export interface WorkflowPresentationStep {
   stepNumber: number;
   stepId: string;
   agent: string;
+  profile?: WorkflowDetails["state"]["steps"][number]["profile"];
   objective: string;
   model?: string;
   status: WorkflowPresentationStepStatus;
   rawStatus: WorkflowDetails["state"]["steps"][number]["status"];
+  verifyStatus?: WorkflowDetails["state"]["steps"][number]["verifyStatus"];
+  verifySummary?: string;
+  verificationPhase: "provisional" | "verified";
+  failedCheckCount: number;
+  passedCheckCount: number;
+  notRunCheckCount: number;
   elapsedMs: number;
   lastWork: string;
   repairAttempted?: boolean;
   currentFocus?: string;
   topPendingWorkItem?: string;
   parseError?: string;
+  newItemCount: number;
 }
 
 export interface WorkflowPresentationPayload {
@@ -141,16 +149,38 @@ export function buildWorkflowPresentation(
       stepNumber: index + 1,
       stepId: step.id,
       agent: step.agent,
+      profile: stateStep?.profile,
       objective: stateStep?.objective ?? `Run ${step.agent}`,
       model: result?.model ?? defaultModel,
       status,
       rawStatus: stepStatus,
+      verifyStatus: stateStep?.verifyStatus,
+      verifySummary: stateStep?.verifySummary,
+      verificationPhase: stateStep?.result
+        ? ("verified" as const)
+        : ("provisional" as const),
+      failedCheckCount:
+        stateStep?.verifyChecks?.filter((item) => item.status === "fail").length ?? 0,
+      passedCheckCount:
+        stateStep?.verifyChecks?.filter((item) => item.status === "pass").length ?? 0,
+      notRunCheckCount:
+        stateStep?.verifyChecks?.filter((item) => item.status === "not_run").length ?? 0,
       elapsedMs: result?.elapsedMs ?? 0,
-      lastWork: formatProgressText(result?.lastWork ?? stateStep?.result?.summary ?? ""),
+      lastWork: formatProgressText(
+        result?.lastWork ??
+          stateStep?.result?.summary ??
+          stateStep?.provisionalResult?.summary ??
+          "",
+      ),
       repairAttempted: result?.repairAttempted,
       currentFocus,
       topPendingWorkItem,
       parseError: result?.parseError ?? stateStep?.parseError,
+      newItemCount:
+        (stateStep?.result?.decisions?.length ?? stateStep?.provisionalResult?.decisions?.length ?? 0) +
+        (stateStep?.result?.learnings?.length ?? stateStep?.provisionalResult?.learnings?.length ?? 0) +
+        (stateStep?.result?.blockers?.length ?? stateStep?.provisionalResult?.blockers?.length ?? 0) +
+        (stateStep?.result?.verification?.length ?? stateStep?.provisionalResult?.verification?.length ?? 0),
     };
   });
 

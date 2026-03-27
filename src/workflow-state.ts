@@ -3,10 +3,15 @@ import type {
   AgentResult,
   ArtifactItem,
   DecisionItem,
+  EvidenceHints,
+  ExecutionProfile,
   SharedState,
   VerificationItem,
   WorkItem,
+  WorkflowCanonicalStepSnapshot,
   WorkflowConfig,
+  WorkflowPersistedStateSnapshot,
+  WorkflowSource,
   WorkflowState,
   WorkflowStepConfig,
   WorkOrder,
@@ -42,6 +47,11 @@ function uniqueBy<T>(items: T[], keyFn: (item: T) => string): T[] {
   return output;
 }
 
+function normalizeText(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function mergePriority(
   current: WorkItem["priority"],
   incoming: WorkItem["priority"],
@@ -67,6 +77,91 @@ function deriveCurrentFocus(state: WorkflowState): string | undefined {
   if (latestBlocker?.issue.trim()) return latestBlocker.issue.trim();
 
   return undefined;
+}
+
+export function normalizeDecisions(
+  decisions: DecisionItem[] | undefined,
+): DecisionItem[] | undefined {
+  if (!decisions?.length) return undefined;
+  return uniqueBy(
+    decisions
+      .map((item) => ({
+        topic: item.topic.trim(),
+        decision: item.decision.trim(),
+        rationale: normalizeText(item.rationale),
+      }))
+      .filter((item) => item.topic && item.decision),
+    (item) => `${item.topic}\u0000${item.decision}`,
+  );
+}
+
+export function normalizeArtifacts(
+  artifacts: ArtifactItem[] | undefined,
+): ArtifactItem[] | undefined {
+  if (!artifacts?.length) return undefined;
+  return uniqueBy(
+    artifacts
+      .map((item) => ({
+        kind: item.kind.trim(),
+        path: normalizeText(item.path),
+        text: normalizeText(item.text),
+      }))
+      .filter((item) => item.kind),
+    (item) => `${item.kind}\u0000${item.path ?? ""}\u0000${item.text ?? ""}`,
+  );
+}
+
+export function normalizeLearnings(learnings: string[] | undefined): string[] | undefined {
+  if (!learnings?.length) return undefined;
+  return uniqueBy(
+    learnings.map((item) => item.trim()).filter(Boolean),
+    (item) => item,
+  );
+}
+
+export function normalizeBlockers(
+  blockers: WorkflowState["shared"]["blockers"] | undefined,
+): WorkflowState["shared"]["blockers"] | undefined {
+  if (!blockers?.length) return undefined;
+  return blockers
+    .map((item) => ({
+      issue: item.issue.trim(),
+      needs: normalizeText(item.needs),
+    }))
+    .filter((item) => item.issue);
+}
+
+export function normalizeVerification(
+  verification: VerificationItem[] | undefined,
+): VerificationItem[] | undefined {
+  if (!verification?.length) return undefined;
+  return uniqueBy(
+    verification
+      .map((item) => ({
+        check: item.check.trim(),
+        status: item.status,
+        notes: normalizeText(item.notes),
+        kind: item.kind,
+        path: normalizeText(item.path),
+        source: item.source,
+      }))
+      .filter((item) => item.check),
+    (item) =>
+      `${item.check}\u0000${item.status}\u0000${item.notes ?? ""}\u0000${item.kind ?? ""}\u0000${item.path ?? ""}\u0000${item.source ?? ""}`,
+  );
+}
+
+export function normalizeEvidenceHints(
+  evidenceHints: EvidenceHints | undefined,
+): EvidenceHints | undefined {
+  if (!evidenceHints) return undefined;
+  const normalized: EvidenceHints = {
+    touchedFiles: normalizeLearnings(evidenceHints.touchedFiles),
+    artifactPaths: normalizeLearnings(evidenceHints.artifactPaths),
+    symbols: normalizeLearnings(evidenceHints.symbols),
+    commands: normalizeLearnings(evidenceHints.commands),
+  };
+  return Object.values(normalized).some(Boolean) ? normalized : undefined;
 }
 
 function buildPlanningObjective(
@@ -103,15 +198,37 @@ function buildPlanningObjective(
     .join(" ");
 }
 
-function buildGenericObjective(
+function buildVerifyContextObjective(
   step: WorkflowStepConfig,
   agent: AgentConfig | undefined,
   state: WorkflowState,
   index: number,
   total: number,
 ): string {
-  if (step.agent === "plan") {
+  const baseObjective = buildGenericObjective(
+    step,
+    agent,
+    state,
+    index,
+    total,
+    "explore",
+  );
+  return `${baseObjective} Focus on gathering concrete evidence for later runtime verification instead of self-certifying completion.`;
+}
+
+function buildGenericObjective(
+  step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+  state: WorkflowState,
+  index: number,
+  total: number,
+  profile: ExecutionProfile,
+): string {
+  if (profile === "planning" || step.agent === "plan") {
     return buildPlanningObjective(step, agent, state, index, total);
+  }
+  if (profile === "verify-context") {
+    return buildVerifyContextObjective(step, agent, state, index, total);
   }
 
   const stepLabel = `step ${index + 1} of ${total}`;
@@ -127,11 +244,15 @@ function buildGenericObjective(
     return [
       `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
       agentHint,
-      "Start by understanding the user's task and inspecting the repository or shared state that matters for this step.",
+      profile === "explore"
+        ? "Start by understanding the user's task and inspecting the repository or shared state that matters for this read-only step."
+        : "Start by understanding the user's task and inspecting the repository or shared state that matters for this step.",
       currentFocus
         ? `Keep the current focus in mind: ${currentFocus}.`
         : "Identify the most important focus that will move the workflow forward.",
-      "Make concrete progress, and when relevant return actionable newWorkItems, blockers, and a short focusSummary for the next step.",
+      profile === "explore"
+        ? "Gather concrete findings, evidence targets, and next-step guidance without modifying repository state."
+        : "Make concrete progress, and when relevant return actionable newWorkItems, blockers, and a short focusSummary for the next step.",
     ]
       .filter(Boolean)
       .join(" ");
@@ -152,10 +273,90 @@ function buildGenericObjective(
       : "If no open work items exist yet, identify and complete the next most actionable piece of work.",
     currentFocus ? `Current focus: ${currentFocus}.` : undefined,
     resolvedHint,
-    "Record newly discovered work, resolved work, blockers, and focus updates in the structured result so the next step can continue from shared state.",
+    profile === "explore"
+      ? "Record findings, blockers, and evidence hints in the structured result so a later step can act on verified context."
+      : "Record newly discovered work, resolved work, blockers, and focus updates in the structured result so the next step can continue from shared state.",
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function buildProfileGuidance(profile: ExecutionProfile): string[] {
+  switch (profile) {
+    case "planning":
+      return [
+        "Stay in planning mode and keep implementation as future work unless inspection proves it already exists.",
+        "Turn ambiguity into actionable next work instead of trying to execute everything inside this step.",
+      ];
+    case "explore":
+      return [
+        "Treat this as a read-only investigation step.",
+        "Prefer concrete file, symbol, and behavior findings over broad architectural speculation.",
+      ];
+    case "verify-context":
+      return [
+        "Gather precise evidence for later runtime verification.",
+        "Do not self-certify the outcome; return evidence hints the runtime can inspect.",
+      ];
+    case "implement":
+    default:
+      return [
+        "Treat this as execution work, not just discussion.",
+        "Prefer the smallest concrete repository change that satisfies the objective.",
+      ];
+  }
+}
+
+function buildDefinitionOfDone(profile: ExecutionProfile): string[] {
+  switch (profile) {
+    case "planning":
+      return [
+        "The next actionable work is clear, scoped, and captured in the structured result.",
+        "The step does not claim file edits or implementation unless inspection confirmed pre-existing work.",
+      ];
+    case "explore":
+      return [
+        "The relevant repository context has been inspected and summarized clearly.",
+        "The step records concrete findings, blockers, or next actions without modifying files.",
+      ];
+    case "verify-context":
+      return [
+        "The step returns concrete evidence hints the runtime can inspect later.",
+        "The step avoids claiming final verification ownership.",
+      ];
+    case "implement":
+    default:
+      return [
+        "The targeted repository work is completed or a concrete blocker is recorded.",
+        "The structured result records what changed, what remains, and evidence the runtime can verify.",
+      ];
+  }
+}
+
+function buildRequiredEvidence(profile: ExecutionProfile): string[] {
+  switch (profile) {
+    case "planning":
+      return [
+        "List any inspected files or symbols that support the planning conclusions.",
+        "If you confirm pre-existing implementation, include the relevant file paths or symbols in evidenceHints.",
+      ];
+    case "explore":
+      return [
+        "Return inspected file paths, symbols, or artifacts that support your findings.",
+        "Include evidenceHints when a later implementation or verify step should inspect specific targets.",
+      ];
+    case "verify-context":
+      return [
+        "Return precise evidenceHints for touched files, artifact paths, symbols, or commands worth checking.",
+        "Prefer concrete repository targets over narrative summaries alone.",
+      ];
+    case "implement":
+    default:
+      return [
+        "Return evidenceHints for touched files and any produced artifact paths.",
+        "When relevant, include symbols or commands that help the runtime verify the claimed work.",
+      ];
+  }
 }
 
 export function createInitialSharedState(): SharedState {
@@ -198,8 +399,16 @@ export function buildWorkOrder(
   step: WorkflowStepConfig,
   agent: AgentConfig | undefined,
   index: number,
+  profile: ExecutionProfile,
 ): WorkOrder {
-  const objective = buildGenericObjective(step, agent, state, index, state.steps.length);
+  const objective = buildGenericObjective(
+    step,
+    agent,
+    state,
+    index,
+    state.steps.length,
+    profile,
+  );
   const openWorkItems = getUnresolvedWorkItems(state.shared.workItems)
     .slice(0, MAX_PROJECTED_OPEN_ITEMS)
     .map((item) => ({ ...item }));
@@ -208,22 +417,34 @@ export function buildWorkOrder(
     MAX_PROJECTED_RESOLVED_ITEMS,
   ).map((item) => ({ ...item }));
   const currentFocus = deriveCurrentFocus(state);
+  const allowedTools =
+    agent?.tools && agent.tools.length > 0 ? [...agent.tools] : undefined;
+  const profileGuidance = buildProfileGuidance(profile);
+  const definitionOfDone = buildDefinitionOfDone(profile);
+  const requiredEvidence = buildRequiredEvidence(profile);
 
   const constraints = [
     "You are reporting to the workflow orchestrator, not speaking directly to the next agent.",
     "Return the required structured result block exactly once.",
     "Do not rely on free-form prose alone for critical workflow state.",
+    "The runtime owns final verification after this step completes.",
   ];
-  if (step.agent === "plan") {
+  if (profile === "planning" || step.agent === "plan") {
     constraints.push(
       "This is a planning step. Do not modify files, create files, or otherwise change repository state.",
       "Do not use write, edit, or implementation commands to complete the task yourself. Hand execution to a later step via newWorkItems or verified context.",
+    );
+  } else if (profile === "explore" || profile === "verify-context") {
+    constraints.push(
+      "Treat this as a read-only step unless the runtime tool policy explicitly allows writes.",
+      "Do not describe runtime verification as already complete; return evidence the runtime can inspect later.",
     );
   }
 
   return {
     stepId: step.id,
     agent: step.agent,
+    profile,
     agentDescription: agent?.description?.trim() || undefined,
     objective,
     context: {
@@ -239,6 +460,10 @@ export function buildWorkOrder(
       currentFocus,
     },
     constraints,
+    profileGuidance,
+    allowedTools,
+    definitionOfDone,
+    requiredEvidence,
     expectedOutput: [
       "summary",
       "decisions",
@@ -257,6 +482,17 @@ export function markStepRunning(state: WorkflowState, stepIndex: number): void {
   if (!step) return;
   step.status = "running";
   step.startedAt = step.startedAt ?? nowIso();
+  step.verifyStatus = "pending";
+  step.verifySummary = undefined;
+  step.verifyChecks = undefined;
+  step.verifyAttemptCount = 0;
+  step.result = undefined;
+  step.provisionalResult = undefined;
+  step.evidenceHints = undefined;
+  step.rawFinalText = undefined;
+  step.repairedFinalText = undefined;
+  step.parseError = undefined;
+  step.diagnostics = undefined;
 }
 
 export function markStepFailure(
@@ -299,35 +535,42 @@ export function mergeAgentResultIntoState(
     state.shared.focus = undefined;
   }
 
-  if (result.decisions?.length) {
+  const normalizedDecisions = normalizeDecisions(result.decisions);
+  const normalizedArtifacts = normalizeArtifacts(result.artifacts);
+  const normalizedLearnings = normalizeLearnings(result.learnings);
+  const normalizedBlockers = normalizeBlockers(result.blockers);
+  const normalizedVerification = normalizeVerification(result.verification);
+  const normalizedEvidenceHints = normalizeEvidenceHints(result.evidenceHints);
+
+  if (normalizedDecisions?.length) {
     state.shared.decisions = uniqueBy(
-      [...state.shared.decisions, ...result.decisions],
+      [...state.shared.decisions, ...normalizedDecisions],
       (item: DecisionItem) => `${item.topic}\u0000${item.decision}`,
     );
   }
 
-  if (result.artifacts?.length) {
+  if (normalizedArtifacts?.length) {
     state.shared.artifacts = uniqueBy(
-      [...state.shared.artifacts, ...result.artifacts],
+      [...state.shared.artifacts, ...normalizedArtifacts],
       (item: ArtifactItem) => `${item.kind}\u0000${item.path ?? ""}\u0000${item.text ?? ""}`,
     );
   }
 
-  if (result.learnings?.length) {
+  if (normalizedLearnings?.length) {
     state.shared.learnings = uniqueBy(
-      [...state.shared.learnings, ...result.learnings],
+      [...state.shared.learnings, ...normalizedLearnings],
       (item) => item,
     );
   }
 
-  if (result.blockers?.length) {
-    state.shared.blockers = [...state.shared.blockers, ...result.blockers];
+  if (normalizedBlockers?.length) {
+    state.shared.blockers = [...state.shared.blockers, ...normalizedBlockers];
   }
 
-  if (result.verification?.length) {
+  if (normalizedVerification?.length) {
     state.shared.verification = [
       ...state.shared.verification,
-      ...result.verification,
+      ...normalizedVerification,
     ];
   }
 
@@ -384,8 +627,8 @@ export function mergeAgentResultIntoState(
     }
   }
 
-  if (result.blockers?.length) {
-    for (const blocker of result.blockers) {
+  if (normalizedBlockers?.length) {
+    for (const blocker of normalizedBlockers) {
       const matchingWorkItem = findWorkItemForBlocker(state.shared.workItems, blocker.issue);
       if (!matchingWorkItem || matchingWorkItem.status === "done") continue;
       matchingWorkItem.status = "blocked";
@@ -393,7 +636,17 @@ export function mergeAgentResultIntoState(
     }
   }
 
-  step.result = result;
+  step.result = {
+    ...result,
+    decisions: normalizedDecisions,
+    artifacts: normalizedArtifacts,
+    learnings: normalizedLearnings,
+    blockers: normalizedBlockers,
+    verification: normalizedVerification,
+    evidenceHints: normalizedEvidenceHints,
+  };
+  step.provisionalResult = step.provisionalResult ?? step.result;
+  step.evidenceHints = normalizedEvidenceHints;
   step.rawFinalText = rawFinalText;
   step.repairedFinalText = repairedFinalText;
   step.parseError = parseError;
@@ -409,6 +662,98 @@ export function mergeAgentResultIntoState(
     state.status = result.status;
     state.finishedAt = finishedAt;
   }
+}
+
+export function deriveProvisionalResult(result: AgentResult): AgentResult {
+  return {
+    ...result,
+    summary: result.summary.trim(),
+    decisions: normalizeDecisions(result.decisions),
+    artifacts: normalizeArtifacts(result.artifacts),
+    learnings: normalizeLearnings(result.learnings),
+    blockers: normalizeBlockers(result.blockers),
+    verification: normalizeVerification(result.verification),
+    evidenceHints: normalizeEvidenceHints(result.evidenceHints),
+    focusSummary: normalizeText(result.focusSummary),
+    nextStepHint: normalizeText(result.nextStepHint),
+  };
+}
+
+export function setProvisionalStepResult(
+  state: WorkflowState,
+  stepIndex: number,
+  result: AgentResult,
+  rawFinalText: string,
+  repairedFinalText?: string,
+  parseError?: string,
+): void {
+  const step = state.steps[stepIndex];
+  if (!step) return;
+  step.provisionalResult = deriveProvisionalResult(result);
+  step.evidenceHints = normalizeEvidenceHints(result.evidenceHints);
+  step.rawFinalText = rawFinalText;
+  step.repairedFinalText = repairedFinalText;
+  step.parseError = parseError;
+}
+
+export function recordVerificationOutcome(
+  state: WorkflowState,
+  stepIndex: number,
+  verifyStatus: NonNullable<WorkflowState["steps"][number]["verifyStatus"]>,
+  verifyChecks: VerificationItem[] | undefined,
+  verifySummary: string | undefined,
+  verifyAttemptCount: number,
+): void {
+  const step = state.steps[stepIndex];
+  if (!step) return;
+  step.verifyStatus = verifyStatus;
+  step.verifyChecks = normalizeVerification(verifyChecks);
+  step.verifySummary = normalizeText(verifySummary);
+  step.verifyAttemptCount = verifyAttemptCount;
+}
+
+export function buildCanonicalStepSnapshot(
+  step: WorkflowState["steps"][number],
+): WorkflowCanonicalStepSnapshot {
+  return {
+    stepId: step.stepId,
+    agent: step.agent,
+    profile: step.profile,
+    objective: step.objective,
+    status: step.status,
+    verifyStatus: step.verifyStatus,
+    verifySummary: step.verifySummary,
+    startedAt: step.startedAt,
+    finishedAt: step.finishedAt,
+    summary: step.result?.summary,
+  };
+}
+
+export function buildPersistedWorkflowStateSnapshot(
+  state: WorkflowState,
+  workflowSource: WorkflowSource,
+  workflowFilePath?: string | null,
+): WorkflowPersistedStateSnapshot {
+  return {
+    runId: state.runId,
+    workflowName: state.workflowName,
+    workflowSource,
+    workflowFilePath: workflowFilePath ?? null,
+    userTask: state.userTask,
+    status: state.status,
+    currentStepIndex: state.currentStepIndex,
+    startedAt: state.startedAt,
+    finishedAt: state.finishedAt,
+    shared: {
+      ...state.shared,
+      decisions: normalizeDecisions(state.shared.decisions) ?? [],
+      artifacts: normalizeArtifacts(state.shared.artifacts) ?? [],
+      learnings: normalizeLearnings(state.shared.learnings) ?? [],
+      blockers: normalizeBlockers(state.shared.blockers) ?? [],
+      verification: normalizeVerification(state.shared.verification) ?? [],
+    },
+    steps: state.steps.map(buildCanonicalStepSnapshot),
+  };
 }
 
 function formatVerificationLine(item: VerificationItem): string {

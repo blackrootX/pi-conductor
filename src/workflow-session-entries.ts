@@ -110,6 +110,7 @@ export function createInitialWorkflowDetails(
     steps: workflow.steps,
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
+    runDir: "",
     results: [],
     state: createWorkflowState(workflow, task, runId),
   };

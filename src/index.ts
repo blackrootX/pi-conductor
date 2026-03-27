@@ -669,6 +669,18 @@ function renderDisplayItems(
   return text.trimEnd();
 }
 
+function buildWorkflowVerificationSummary(details: WorkflowDetails): string {
+  const counts = { passed: 0, failed: 0, skipped: 0, pending: 0 };
+  for (const step of details.state.steps) {
+    const status = step.verifyStatus ?? "pending";
+    if (status === "passed") counts.passed += 1;
+    else if (status === "failed") counts.failed += 1;
+    else if (status === "skipped") counts.skipped += 1;
+    else counts.pending += 1;
+  }
+  return `Verification: passed:${counts.passed} failed:${counts.failed} skipped:${counts.skipped} pending:${counts.pending}`;
+}
+
 function renderWorkflowResult(
   result: AgentToolResult<WorkflowDetails>,
   expanded: boolean,
@@ -727,6 +739,12 @@ function renderWorkflowResult(
         new Text(theme.fg("dim", `Top pending: ${topPendingWorkItem}`), 0, 0),
       );
     }
+    container.addChild(
+      new Text(theme.fg("dim", buildWorkflowVerificationSummary(details)), 0, 0),
+    );
+    container.addChild(
+      new Text(theme.fg("dim", `Run artifacts: ${details.runDir}`), 0, 0),
+    );
 
     for (let index = 0; index < details.results.length; index++) {
       const step = details.results[index];
@@ -758,6 +776,44 @@ function renderWorkflowResult(
           0,
         ),
       );
+      if (stateStep?.profile) {
+        container.addChild(
+          new Text(theme.fg("dim", `Profile: ${stateStep.profile}`), 0, 0),
+        );
+      }
+      container.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            `Verification: ${stateStep?.verifyStatus ?? "pending"} | phase: ${stateStep?.result ? "verified" : "provisional"} | p:${stateStep?.verifyChecks?.filter((item) => item.status === "pass").length ?? 0} f:${stateStep?.verifyChecks?.filter((item) => item.status === "fail").length ?? 0} n:${stateStep?.verifyChecks?.filter((item) => item.status === "not_run").length ?? 0}`,
+          ),
+          0,
+          0,
+        ),
+      );
+      if (stateStep?.verifySummary?.trim()) {
+        container.addChild(
+          new Text(theme.fg("dim", `Verify summary: ${stateStep.verifySummary.trim()}`), 0, 0),
+        );
+      }
+      const newThisStep =
+        (stateStep?.result?.decisions?.length ??
+          stateStep?.provisionalResult?.decisions?.length ??
+          0) +
+        (stateStep?.result?.learnings?.length ??
+          stateStep?.provisionalResult?.learnings?.length ??
+          0) +
+        (stateStep?.result?.blockers?.length ??
+          stateStep?.provisionalResult?.blockers?.length ??
+          0) +
+        (stateStep?.result?.verification?.length ??
+          stateStep?.provisionalResult?.verification?.length ??
+          0);
+      if (newThisStep > 0) {
+        container.addChild(
+          new Text(theme.fg("dim", `New this step: ${newThisStep}`), 0, 0),
+        );
+      }
 
       const stepFocus = stateStep?.result?.focusSummary?.trim();
       if (stepFocus) {
@@ -824,13 +880,15 @@ function renderWorkflowResult(
   }
 
   const topPendingWorkItem = getTopPendingWorkItem(details.state.shared);
-  if (topPendingWorkItem) {
-    text += `\n${theme.fg("dim", `Top pending: ${topPendingWorkItem}`)}`;
-  }
+	  if (topPendingWorkItem) {
+	    text += `\n${theme.fg("dim", `Top pending: ${topPendingWorkItem}`)}`;
+	  }
+	  text += `\n${theme.fg("dim", buildWorkflowVerificationSummary(details))}`;
+	  text += `\n${theme.fg("dim", `Run artifacts: ${details.runDir}`)}`;
 
-  for (let index = 0; index < details.results.length; index++) {
-    const step = details.results[index];
-    const stateStep = details.state.steps[index];
+	  for (let index = 0; index < details.results.length; index++) {
+	    const step = details.results[index];
+	    const stateStep = details.state.steps[index];
     const stepIcon = isErrorResult(step)
       ? theme.fg("error", "✗")
       : theme.fg("success", "✓");
@@ -841,11 +899,18 @@ function renderWorkflowResult(
       step.repairedFinalText ||
       step.rawFinalText ||
       getFinalOutput(step.messages);
-    text += `\n\n${theme.fg("muted", `─── Step ${step.step}: `)}${theme.fg("accent", step.agent)}${theme.fg("muted", ` (${step.agentSource}) `)}${stepIcon}`;
-    text += `\n${theme.fg("muted", "Objective: ")}${theme.fg("dim", step.objective || stateStep?.objective || step.task)}`;
-    if (stateStep?.result?.focusSummary?.trim()) {
-      text += `\n${theme.fg("dim", `Focus: ${stateStep.result.focusSummary.trim()}`)}`;
-    }
+	    text += `\n\n${theme.fg("muted", `─── Step ${step.step}: `)}${theme.fg("accent", step.agent)}${theme.fg("muted", ` (${step.agentSource}) `)}${stepIcon}`;
+	    text += `\n${theme.fg("muted", "Objective: ")}${theme.fg("dim", step.objective || stateStep?.objective || step.task)}`;
+	    if (stateStep?.profile) {
+	      text += `\n${theme.fg("dim", `Profile: ${stateStep.profile}`)}`;
+	    }
+	    text += `\n${theme.fg("dim", `Verification: ${stateStep?.verifyStatus ?? "pending"} | phase: ${stateStep?.result ? "verified" : "provisional"}`)}`;
+	    if (stateStep?.verifySummary?.trim()) {
+	      text += `\n${theme.fg("dim", `Verify summary: ${stateStep.verifySummary.trim()}`)}`;
+	    }
+	    if (stateStep?.result?.focusSummary?.trim()) {
+	      text += `\n${theme.fg("dim", `Focus: ${stateStep.result.focusSummary.trim()}`)}`;
+	    }
     if (step.parseError) {
       text += `\n${theme.fg("warning", `Parse repair: ${step.parseError}`)}`;
     }
@@ -1038,6 +1103,7 @@ export default function registerExtension(pi: ExtensionAPI) {
           steps: result.steps,
           workflowSource: result.workflowSource,
           workflowFilePath: result.workflowFilePath,
+          runDir: result.runDir,
           results: result.results,
           state: result.state,
         };

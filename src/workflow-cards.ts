@@ -140,6 +140,9 @@ function renderCard(
   const objective = state.objective.trim()
     ? truncateText(state.objective.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
+  const profile = state.profile
+    ? truncateText(`profile: ${state.profile}`, innerWidth - 1)
+    : "profile: —";
   const focus = state.currentFocus?.trim()
     ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
     : "focus: —";
@@ -147,6 +150,19 @@ function renderCard(
     state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
   const repairLabel = state.repairAttempted ? " repair" : "";
   const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${repairLabel}${elapsed}`;
+  const verificationPhase = truncateText(
+    `phase: ${state.verificationPhase}`,
+    innerWidth - 1,
+  );
+  const verifyLabel = truncateText(
+    state.verifyStatus
+      ? `verify: ${state.verifyStatus} p:${state.passedCheckCount} f:${state.failedCheckCount} n:${state.notRunCheckCount}`
+      : "verify: pending",
+    innerWidth - 1,
+  );
+  const verifySummary = state.verifySummary?.trim()
+    ? truncateText(state.verifySummary.trim().replace(/\s+/g, " "), innerWidth - 1)
+    : "verify summary: —";
   const pending = state.topPendingWorkItem?.trim()
     ? truncateText(`pending: ${state.topPendingWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
     : "pending: —";
@@ -162,6 +178,14 @@ function renderCard(
     top,
     stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
     stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${styler.muted(profile)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${styler.muted(verificationPhase)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${styler.muted(verifyLabel)}`, innerWidth, borderStyle),
+    stylePaddedLine(
+      ` ${verifySummary === "verify summary: —" ? styler.dim(verifySummary) : styler.muted(verifySummary)}`,
+      innerWidth,
+      borderStyle,
+    ),
     stylePaddedLine(` ${styler.muted(focus)}`, innerWidth, borderStyle),
     stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
     stylePaddedLine(` ${state.topPendingWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, borderStyle),
@@ -216,7 +240,7 @@ function renderRows(
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
     const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
-    const connectorRow = 4;
+    const connectorRow = 7;
 
     for (let line = 0; line < cards[0].length; line++) {
       let row = cards[0][line];

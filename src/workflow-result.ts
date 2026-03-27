@@ -3,6 +3,7 @@ import type {
   ArtifactItem,
   BlockerItem,
   DecisionItem,
+  EvidenceHints,
   NewWorkItemInput,
   ResolvedWorkItemInput,
   VerificationItem,
@@ -71,6 +72,18 @@ function normalizeVerificationItem(value: unknown): VerificationItem | undefined
     check,
     status,
     notes: normalizeText(value.notes),
+    kind:
+      normalizeText(value.kind) === "file_exists" ||
+      normalizeText(value.kind) === "grep_assertion" ||
+      normalizeText(value.kind) === "diagnostic" ||
+      normalizeText(value.kind) === "claimed"
+        ? (normalizeText(value.kind) as VerificationItem["kind"])
+        : undefined,
+    path: normalizeText(value.path),
+    source:
+      normalizeText(value.source) === "worker" || normalizeText(value.source) === "runtime"
+        ? (normalizeText(value.source) as VerificationItem["source"])
+        : undefined,
   };
 }
 
@@ -105,6 +118,17 @@ function normalizeStringArray(value: unknown): string[] | undefined {
     .map((item) => normalizeText(item))
     .filter((item): item is string => Boolean(item));
   return items.length > 0 ? items : undefined;
+}
+
+function normalizeEvidenceHints(value: unknown): EvidenceHints | undefined {
+  if (!isObject(value)) return undefined;
+  const evidenceHints: EvidenceHints = {
+    touchedFiles: normalizeStringArray(value.touchedFiles),
+    artifactPaths: normalizeStringArray(value.artifactPaths),
+    symbols: normalizeStringArray(value.symbols),
+    commands: normalizeStringArray(value.commands),
+  };
+  return Object.values(evidenceHints).some(Boolean) ? evidenceHints : undefined;
 }
 
 function normalizeObjectArray<T>(
@@ -177,6 +201,7 @@ export function validateAgentResultShape(
       resolvedWorkItems: normalizeObjectArray(value.resolvedWorkItems, normalizeResolvedWorkItem),
       focusSummary: normalizeText(value.focusSummary),
       nextStepHint: normalizeText(value.nextStepHint),
+      evidenceHints: normalizeEvidenceHints(value.evidenceHints),
       rawText,
     },
   };

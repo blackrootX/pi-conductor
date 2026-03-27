@@ -39,11 +39,8 @@ function formatWorkItem(item: WorkItem): string {
   return `- ${parts.join(" | ")}`;
 }
 
-function renderListSection(
-  title: string,
-  values: string[],
-): string[] {
-  if (values.length === 0) return [];
+function renderListSection(title: string, values: string[]): string[] {
+  if (values.length === 0) return [title, "- None", ""];
   const shown = values.slice(0, MAX_CONTEXT_ITEMS);
   const lines = [title, ...shown];
   if (values.length > shown.length) {
@@ -53,57 +50,56 @@ function renderListSection(
   return lines;
 }
 
+function renderRequiredSection(title: string, values: string[]): string[] {
+  const lines = [title];
+  if (values.length === 0) {
+    lines.push("- None");
+  } else {
+    for (const value of values) lines.push(`- ${value}`);
+  }
+  lines.push("");
+  return lines;
+}
+
 export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
-  const isPlanningStep = workOrder.agent === "plan";
+  const isPlanningStep = workOrder.profile === "planning" || workOrder.agent === "plan";
   const lines: string[] = [
     "TASK",
     workOrder.context.userTask,
     "",
-    "STEP OBJECTIVE",
+    "OBJECTIVE",
     workOrder.objective,
+    "",
+    "CURRENT FOCUS",
+    workOrder.context.currentFocus?.trim() || "No explicit focus yet.",
     "",
   ];
 
-  if (workOrder.agentDescription?.trim()) {
-    lines.push("AGENT SPECIALTY");
-    lines.push(workOrder.agentDescription.trim());
-    lines.push("");
-  }
-
-  if (workOrder.constraints.length > 0) {
-    lines.push("STEP CONSTRAINTS");
-    for (const constraint of workOrder.constraints) {
-      lines.push(`- ${constraint}`);
-    }
-    lines.push("");
-  }
-
-  lines.push("CURRENT CONTEXT");
-
-  if (workOrder.context.summary?.trim()) {
-    lines.push("Summary:");
-    lines.push(workOrder.context.summary.trim());
-    lines.push("");
-  }
-
-  if (workOrder.context.currentFocus?.trim()) {
-    lines.push("Current focus:");
-    lines.push(workOrder.context.currentFocus.trim());
-    lines.push("");
-  }
-
   lines.push(
     ...renderListSection(
-      "Open work items:",
+      "READY WORK ITEMS",
       (workOrder.context.openWorkItems ?? []).map(formatWorkItem),
     ),
   );
   lines.push(
     ...renderListSection(
-      "Recently resolved work items:",
+      "RECENTLY RESOLVED WORK",
       (workOrder.context.recentResolvedWorkItems ?? []).map(formatWorkItem),
     ),
   );
+
+  lines.push("CONTEXT");
+  if (workOrder.agentDescription?.trim()) {
+    lines.push(`Agent specialty: ${workOrder.agentDescription.trim()}`);
+  }
+  if (workOrder.profile?.trim()) {
+    lines.push(`Resolved profile: ${workOrder.profile}`);
+  }
+  if (workOrder.context.summary?.trim()) {
+    lines.push(`Shared summary: ${workOrder.context.summary.trim()}`);
+  }
+  lines.push("");
+
   lines.push(
     ...renderListSection(
       "Decisions:",
@@ -136,66 +132,83 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
   );
 
   lines.push(
-    "MUST DO",
-    "- You are completing one workflow step for the orchestrator.",
-    "- Return a structured workflow result even if you also include human-readable explanation.",
-    "- Include at least `status` and `summary` in the required result block.",
-    "- Include `artifacts`, `decisions`, `learnings`, `blockers`, and `verification` when they are materially relevant.",
-    "- When you discover actionable follow-up work, include `newWorkItems`.",
-    "- When you finish previously open work, include `resolvedWorkItems`.",
-    "- Include `focusSummary` when it would help the next step stay focused.",
-    ...(isPlanningStep
-      ? [
-          "- For planning steps, describe implementation as future work unless you verified it already exists through repository inspection.",
-          "- If you verified an implementation already exists, say that it was pre-existing and confirmed by inspection.",
-        ]
-      : []),
-    "",
-    "MUST NOT DO",
-    "- Do not address the next agent directly.",
-    "- Do not omit the required result block.",
-    "- Do not rely on free-form prose alone for important workflow state.",
-    ...(isPlanningStep
-      ? [
-          "- For planning steps, do not claim you created, edited, or completed files unless read-only inspection proves they already exist.",
-          "- For planning steps, do not say the user's task is done when you only inspected or planned the work.",
-        ]
-      : []),
-    "",
-    "EXPECTED OUTPUT CHANNELS",
-    workOrder.expectedOutput.join(", "),
-    "",
-    "RESPONSE CONTRACT",
-    `Return exactly one JSON object between ${WORKFLOW_RESULT_BEGIN} and ${WORKFLOW_RESULT_END}.`,
-    "Marker block template:",
-    WORKFLOW_RESULT_BEGIN,
-    "{",
-    '  "status": "success",',
-    '  "summary": "Short summary of the step outcome",',
-    '  "decisions": [],',
-    '  "artifacts": [],',
-    '  "learnings": [],',
-    '  "blockers": [],',
-    '  "verification": [],',
-    '  "newWorkItems": [',
-    '    {',
-    '      "title": "Actionable follow-up task",',
-    '      "details": "Optional detail",',
-    '      "priority": "medium"',
-    "    }",
-    "  ],",
-    '  "resolvedWorkItems": [',
-    '    {',
-    '      "title": "Completed task title",',
-    '      "resolution": "Optional completion note"',
-    "    }",
-    "  ],",
-    '  "focusSummary": "Short note about the best next focus"',
-    "}",
-    WORKFLOW_RESULT_END,
-    "",
-    "You may include additional natural-language explanation after the marker block.",
+    ...renderRequiredSection("CONSTRAINTS", [
+      ...workOrder.constraints,
+      ...(workOrder.profileGuidance ?? []),
+      ...(isPlanningStep
+        ? [
+            "For planning steps, describe implementation as future work unless inspection confirmed it already exists.",
+            "Do not claim file edits or task completion from planning-only inspection.",
+          ]
+        : []),
+    ]),
   );
+  lines.push(
+    ...renderRequiredSection(
+      "ALLOWED TOOLS",
+      workOrder.allowedTools?.length
+        ? workOrder.allowedTools
+        : ["Use the agent's normal runtime tool policy."],
+    ),
+  );
+  lines.push(
+    ...renderRequiredSection("DEFINITION OF DONE", [
+      ...(workOrder.definitionOfDone ?? []),
+      "Return the structured workflow result block exactly once.",
+    ]),
+  );
+  lines.push(
+    ...renderRequiredSection("REQUIRED EVIDENCE", [
+      ...(workOrder.requiredEvidence ?? []),
+      "Use evidenceHints when files, artifacts, symbols, or commands would help the runtime verify this step.",
+    ]),
+  );
+
+  lines.push("RESPONSE CONTRACT");
+  lines.push(
+    `Return exactly one JSON object between ${WORKFLOW_RESULT_BEGIN} and ${WORKFLOW_RESULT_END}.`,
+  );
+  lines.push(`Expected output channels: ${workOrder.expectedOutput.join(", ")}`);
+  lines.push("Required fields: `status`, `summary`.");
+  lines.push(
+    "Optional fields when materially relevant: `decisions`, `artifacts`, `learnings`, `blockers`, `verification`, `newWorkItems`, `resolvedWorkItems`, `focusSummary`, `nextStepHint`, `evidenceHints`.",
+  );
+  lines.push("");
+  lines.push("Marker block template:");
+  lines.push(WORKFLOW_RESULT_BEGIN);
+  lines.push("{");
+  lines.push('  "status": "success",');
+  lines.push('  "summary": "Short summary of the step outcome",');
+  lines.push('  "decisions": [],');
+  lines.push('  "artifacts": [],');
+  lines.push('  "learnings": [],');
+  lines.push('  "blockers": [],');
+  lines.push('  "verification": [],');
+  lines.push('  "newWorkItems": [');
+  lines.push("    {");
+  lines.push('      "title": "Actionable follow-up task",');
+  lines.push('      "details": "Optional detail",');
+  lines.push('      "priority": "medium"');
+  lines.push("    }");
+  lines.push("  ],");
+  lines.push('  "resolvedWorkItems": [');
+  lines.push("    {");
+  lines.push('      "title": "Completed task title",');
+  lines.push('      "resolution": "Optional completion note"');
+  lines.push("    }");
+  lines.push("  ],");
+  lines.push('  "focusSummary": "Short note about the best next focus",');
+  lines.push('  "nextStepHint": "Optional hint for the workflow orchestrator",');
+  lines.push('  "evidenceHints": {');
+  lines.push('    "touchedFiles": [],');
+  lines.push('    "artifactPaths": [],');
+  lines.push('    "symbols": [],');
+  lines.push('    "commands": []');
+  lines.push("  }");
+  lines.push("}");
+  lines.push(WORKFLOW_RESULT_END);
+  lines.push("");
+  lines.push("You may include additional natural-language explanation after the marker block.");
 
   return lines.join("\n");
 }
@@ -226,13 +239,16 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "- `newWorkItems`",
     "- `resolvedWorkItems`",
     "- `focusSummary`",
+    "- `nextStepHint`",
+    "- `evidenceHints` with `touchedFiles`, `artifactPaths`, `symbols`, `commands`",
     "",
     WORKFLOW_RESULT_BEGIN,
     "{",
     '  "status": "success",',
     '  "summary": "...",',
     '  "newWorkItems": [],',
-    '  "resolvedWorkItems": []',
+    '  "resolvedWorkItems": [],',
+    '  "evidenceHints": { "touchedFiles": [] }',
     "}",
     WORKFLOW_RESULT_END,
   ].join("\n");
