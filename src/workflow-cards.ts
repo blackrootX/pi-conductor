@@ -1,4 +1,10 @@
 import type { Theme } from "@mariozechner/pi-coding-agent";
+import {
+  getBlockedWorkItems,
+  getDoneWorkItems,
+  getOpenWorkItems,
+  getUnresolvedWorkItems,
+} from "./workflow-work-items.js";
 import type { WorkflowDetails } from "./workflow-runtime.js";
 
 export type WorkflowCardStatus = "pending" | "running" | "done" | "error";
@@ -11,14 +17,19 @@ export interface WorkflowCardState {
   elapsedMs: number;
   lastWork: string;
   repairAttempted?: boolean;
+  currentFocus?: string;
+  topPendingWorkItem?: string;
 }
 
 export interface WorkflowCardPayload {
   workflowName: string;
   summary: {
+    openWorkItems: number;
+    doneWorkItems: number;
+    blockedWorkItems: number;
+    blockers: number;
     decisions: number;
     learnings: number;
-    blockers: number;
     verification: number;
   };
   steps: WorkflowCardState[];
@@ -153,10 +164,16 @@ function renderCard(
   const objective = state.objective.trim()
     ? truncateText(state.objective.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
+  const focus = state.currentFocus?.trim()
+    ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
+    : "focus: —";
   const elapsed =
     state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
   const repairLabel = state.repairAttempted ? " repair" : "";
   const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${repairLabel}${elapsed}`;
+  const pending = state.topPendingWorkItem?.trim()
+    ? truncateText(`pending: ${state.topPendingWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
+    : "pending: —";
   const lastWork = state.lastWork.trim()
     ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
@@ -169,7 +186,9 @@ function renderCard(
     top,
     stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
     stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${styler.muted(focus)}`, innerWidth, borderStyle),
     stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${state.topPendingWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, borderStyle),
     stylePaddedLine(
       ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
       innerWidth,
@@ -221,7 +240,7 @@ function renderRows(
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
     const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
-    const connectorRow = 3;
+    const connectorRow = 4;
 
     for (let line = 0; line < cards[0].length; line++) {
       let row = cards[0][line];
@@ -241,11 +260,28 @@ function renderRows(
   return output;
 }
 
+function deriveCurrentFocus(details: WorkflowDetails): string | undefined {
+  const explicitFocus = details.state.shared.focus?.trim();
+  if (explicitFocus) return explicitFocus;
+  return getUnresolvedWorkItems(details.state.shared.workItems)[0]?.title;
+}
+
+function formatTopPendingWorkItem(details: WorkflowDetails): string | undefined {
+  const item = getUnresolvedWorkItems(details.state.shared.workItems)[0];
+  if (!item) return undefined;
+  const parts = [item.title, item.status];
+  if (item.priority) parts.push(item.priority);
+  return parts.join(" | ");
+}
+
 export function buildWorkflowCardPayload(
   details: WorkflowDetails,
   _isRunning: boolean,
   defaultModel?: string,
 ): WorkflowCardPayload {
+  const currentFocus = deriveCurrentFocus(details);
+  const topPendingWorkItem = formatTopPendingWorkItem(details);
+
   const steps = details.steps.map((step, index) => {
     const result = details.results.find((item) => item.stepId === step.id || item.step === index + 1);
     const stateStep = details.state.steps[index];
@@ -267,15 +303,20 @@ export function buildWorkflowCardPayload(
       elapsedMs: result?.elapsedMs ?? 0,
       lastWork: result?.lastWork ?? stateStep?.result?.summary ?? "",
       repairAttempted: result?.repairAttempted,
+      currentFocus,
+      topPendingWorkItem,
     };
   });
 
   return {
     workflowName: details.workflowName,
     summary: {
+      openWorkItems: getOpenWorkItems(details.state.shared.workItems).length,
+      doneWorkItems: getDoneWorkItems(details.state.shared.workItems).length,
+      blockedWorkItems: getBlockedWorkItems(details.state.shared.workItems).length,
+      blockers: details.state.shared.blockers.length,
       decisions: details.state.shared.decisions.length,
       learnings: details.state.shared.learnings.length,
-      blockers: details.state.shared.blockers.length,
       verification: details.state.shared.verification.length,
     },
     steps,
@@ -294,7 +335,7 @@ export function renderWorkflowCardLines(
     styler.dim("Workflow"),
     styler.accent(styler.bold(payload.workflowName)),
     styler.muted(
-      `decisions:${payload.summary.decisions} learnings:${payload.summary.learnings} blockers:${payload.summary.blockers} verification:${payload.summary.verification}`,
+      `open:${payload.summary.openWorkItems} done:${payload.summary.doneWorkItems} blocked:${payload.summary.blockedWorkItems} blockers:${payload.summary.blockers} decisions:${payload.summary.decisions} learnings:${payload.summary.learnings} verification:${payload.summary.verification}`,
     ),
     "",
     ...renderRows(payload.steps, width, styler, animationTick),

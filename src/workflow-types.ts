@@ -46,6 +46,28 @@ export interface VerificationItem {
   notes?: string;
 }
 
+export interface WorkItem {
+  id: string;
+  title: string;
+  details?: string;
+  status: "open" | "in_progress" | "done" | "blocked";
+  priority?: "low" | "medium" | "high";
+  sourceStepId: string;
+  sourceAgent: string;
+  updatedAt: string;
+}
+
+export interface NewWorkItemInput {
+  title: string;
+  details?: string;
+  priority?: "low" | "medium" | "high";
+}
+
+export interface ResolvedWorkItemInput {
+  title: string;
+  resolution?: string;
+}
+
 export interface AgentResult {
   status: "success" | "blocked" | "failed";
   summary: string;
@@ -54,17 +76,22 @@ export interface AgentResult {
   learnings?: string[];
   blockers?: BlockerItem[];
   verification?: VerificationItem[];
+  newWorkItems?: NewWorkItemInput[];
+  resolvedWorkItems?: ResolvedWorkItemInput[];
+  focusSummary?: string;
   nextStepHint?: string;
   rawText?: string;
 }
 
 export interface SharedState {
   summary?: string;
+  focus?: string;
   decisions: DecisionItem[];
   artifacts: ArtifactItem[];
   learnings: string[];
   blockers: BlockerItem[];
   verification: VerificationItem[];
+  workItems: WorkItem[];
 }
 
 export interface StepRunState {
@@ -95,6 +122,7 @@ export interface WorkflowState {
 export interface WorkOrder {
   stepId: string;
   agent: string;
+  agentDescription?: string;
   objective: string;
   context: {
     userTask: string;
@@ -104,6 +132,9 @@ export interface WorkOrder {
     learnings?: string[];
     blockers?: BlockerItem[];
     verification?: VerificationItem[];
+    openWorkItems?: WorkItem[];
+    recentResolvedWorkItems?: WorkItem[];
+    currentFocus?: string;
   };
   constraints: string[];
   expectedOutput: WorkflowChannel[];

@@ -1,14 +1,30 @@
+import type { AgentConfig } from "./agents.js";
 import type {
   AgentResult,
   ArtifactItem,
   DecisionItem,
   SharedState,
   VerificationItem,
+  WorkItem,
   WorkflowConfig,
   WorkflowState,
   WorkflowStepConfig,
   WorkOrder,
 } from "./workflow-types.js";
+import {
+  createWorkItemId,
+  findWorkItemByTitle,
+  findWorkItemForBlocker,
+  getBlockedWorkItems,
+  getDoneWorkItems,
+  getOpenWorkItems,
+  getRecentResolvedWorkItems,
+  getUnresolvedWorkItems,
+} from "./workflow-work-items.js";
+
+const MAX_OBJECTIVE_OPEN_ITEMS = 3;
+const MAX_PROJECTED_OPEN_ITEMS = 6;
+const MAX_PROJECTED_RESOLVED_ITEMS = 4;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -26,28 +42,94 @@ function uniqueBy<T>(items: T[], keyFn: (item: T) => string): T[] {
   return output;
 }
 
-function defaultObjectiveForStep(
+function mergePriority(
+  current: WorkItem["priority"],
+  incoming: WorkItem["priority"],
+): WorkItem["priority"] {
+  if (!current) return incoming;
+  if (!incoming) return current;
+
+  const rank = { high: 3, medium: 2, low: 1 } as const;
+  return rank[incoming] > rank[current] ? incoming : current;
+}
+
+function deriveCurrentFocus(state: WorkflowState): string | undefined {
+  const explicitFocus = state.shared.focus?.trim();
+  if (explicitFocus) return explicitFocus;
+
+  const topOpenWorkItem = getOpenWorkItems(state.shared.workItems)[0];
+  if (topOpenWorkItem) return topOpenWorkItem.title;
+
+  const topBlockedWorkItem = getBlockedWorkItems(state.shared.workItems)[0];
+  if (topBlockedWorkItem) return `Unblock: ${topBlockedWorkItem.title}`;
+
+  const latestBlocker = state.shared.blockers.at(-1);
+  if (latestBlocker?.issue.trim()) return latestBlocker.issue.trim();
+
+  return undefined;
+}
+
+function buildGenericObjective(
   step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+  state: WorkflowState,
   index: number,
   total: number,
 ): string {
-  if (step.agent === "plan") {
-    return `Inspect the repository and produce implementation-ready guidance for step ${index + 1} of ${total}.`;
+  const stepLabel = `step ${index + 1} of ${total}`;
+  const agentHint = agent?.description?.trim()
+    ? `Use the agent specialty as a hint, not as a rigid role: ${agent.description.trim()}.`
+    : undefined;
+  const currentFocus = deriveCurrentFocus(state);
+  const openWorkItems = getOpenWorkItems(state.shared.workItems);
+  const recentResolvedWorkItems = getRecentResolvedWorkItems(state.shared.workItems, 2);
+  const hasCompletedSteps = state.steps.slice(0, index).some((item) => item.status === "done");
+
+  if (!hasCompletedSteps && openWorkItems.length === 0) {
+    return [
+      `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
+      agentHint,
+      "Start by understanding the user's task and inspecting the repository or shared state that matters for this step.",
+      currentFocus
+        ? `Keep the current focus in mind: ${currentFocus}.`
+        : "Identify the most important focus that will move the workflow forward.",
+      "Make concrete progress, and when relevant return actionable newWorkItems, blockers, and a short focusSummary for the next step.",
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
-  if (step.agent === "build") {
-    return `Execute the implementation work for step ${index + 1} of ${total} and report the concrete outcome.`;
-  }
-  return `Execute the "${step.agent}" workflow step and report the most important result for the workflow.`;
+
+  const topOpenWorkTitles = openWorkItems
+    .slice(0, MAX_OBJECTIVE_OPEN_ITEMS)
+    .map((item) => item.title);
+  const resolvedHint = recentResolvedWorkItems.length > 0
+    ? `Avoid repeating recently resolved work unless you found a regression or a follow-up dependency: ${recentResolvedWorkItems.map((item) => item.title).join("; ")}.`
+    : undefined;
+
+  return [
+    `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
+    agentHint,
+    topOpenWorkTitles.length > 0
+      ? `Prioritize the currently open work items before starting unrelated work: ${topOpenWorkTitles.join("; ")}.`
+      : "If no open work items exist yet, identify and complete the next most actionable piece of work.",
+    currentFocus ? `Current focus: ${currentFocus}.` : undefined,
+    resolvedHint,
+    "Record newly discovered work, resolved work, blockers, and focus updates in the structured result so the next step can continue from shared state.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 export function createInitialSharedState(): SharedState {
   return {
     summary: undefined,
+    focus: undefined,
     decisions: [],
     artifacts: [],
     learnings: [],
     blockers: [],
     verification: [],
+    workItems: [],
   };
 }
 
@@ -67,7 +149,7 @@ export function createWorkflowState(
     steps: workflow.steps.map((step, index) => ({
       stepId: step.id,
       agent: step.agent,
-      objective: defaultObjectiveForStep(step, index, workflow.steps.length),
+      objective: `Prepare ${step.agent} for step ${index + 1} of ${workflow.steps.length}.`,
       status: "pending",
     })),
   };
@@ -76,14 +158,23 @@ export function createWorkflowState(
 export function buildWorkOrder(
   state: WorkflowState,
   step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
   index: number,
 ): WorkOrder {
-  const objective = state.steps[index]?.objective
-    ?? defaultObjectiveForStep(step, index, state.steps.length);
+  const objective = buildGenericObjective(step, agent, state, index, state.steps.length);
+  const openWorkItems = getUnresolvedWorkItems(state.shared.workItems)
+    .slice(0, MAX_PROJECTED_OPEN_ITEMS)
+    .map((item) => ({ ...item }));
+  const recentResolvedWorkItems = getRecentResolvedWorkItems(
+    state.shared.workItems,
+    MAX_PROJECTED_RESOLVED_ITEMS,
+  ).map((item) => ({ ...item }));
+  const currentFocus = deriveCurrentFocus(state);
 
   return {
     stepId: step.id,
     agent: step.agent,
+    agentDescription: agent?.description?.trim() || undefined,
     objective,
     context: {
       userTask: state.userTask,
@@ -93,6 +184,9 @@ export function buildWorkOrder(
       learnings: state.shared.learnings,
       blockers: state.shared.blockers,
       verification: state.shared.verification,
+      openWorkItems,
+      recentResolvedWorkItems,
+      currentFocus,
     },
     constraints: [
       "You are reporting to the workflow orchestrator, not speaking directly to the next agent.",
@@ -144,9 +238,20 @@ export function mergeAgentResultIntoState(
   const step = state.steps[stepIndex];
   if (!step) return;
   const finishedAt = nowIso();
+  const stepId = step.stepId;
+  const agentName = step.agent;
+  const touchedWorkProgression =
+    Boolean(result.newWorkItems?.length) ||
+    Boolean(result.resolvedWorkItems?.length) ||
+    Boolean(result.blockers?.length);
 
   const summary = result.summary.trim();
   if (summary) state.shared.summary = summary;
+  if (result.focusSummary?.trim()) {
+    state.shared.focus = result.focusSummary.trim();
+  } else if (touchedWorkProgression) {
+    state.shared.focus = undefined;
+  }
 
   if (result.decisions?.length) {
     state.shared.decisions = uniqueBy(
@@ -180,6 +285,68 @@ export function mergeAgentResultIntoState(
     ];
   }
 
+  if (result.newWorkItems?.length) {
+    for (const newWorkItem of result.newWorkItems) {
+      const existing = findWorkItemByTitle(state.shared.workItems, newWorkItem.title);
+      if (existing) {
+        existing.title = newWorkItem.title;
+        existing.details = newWorkItem.details ?? existing.details;
+        existing.priority = mergePriority(existing.priority, newWorkItem.priority);
+        existing.status =
+          existing.status === "done"
+            ? "open"
+            : existing.status === "in_progress"
+              ? "in_progress"
+              : existing.status === "blocked"
+                ? "blocked"
+                : "open";
+        existing.updatedAt = finishedAt;
+        continue;
+      }
+
+      state.shared.workItems.push({
+        id: createWorkItemId(newWorkItem.title),
+        title: newWorkItem.title,
+        details: newWorkItem.details,
+        status: "open",
+        priority: newWorkItem.priority,
+        sourceStepId: stepId,
+        sourceAgent: agentName,
+        updatedAt: finishedAt,
+      });
+    }
+  }
+
+  if (result.resolvedWorkItems?.length) {
+    for (const resolvedWorkItem of result.resolvedWorkItems) {
+      const existing = findWorkItemByTitle(state.shared.workItems, resolvedWorkItem.title);
+      if (existing) {
+        existing.title = resolvedWorkItem.title;
+        existing.status = "done";
+        existing.updatedAt = finishedAt;
+        continue;
+      }
+
+      state.shared.workItems.push({
+        id: createWorkItemId(resolvedWorkItem.title),
+        title: resolvedWorkItem.title,
+        status: "done",
+        sourceStepId: stepId,
+        sourceAgent: agentName,
+        updatedAt: finishedAt,
+      });
+    }
+  }
+
+  if (result.blockers?.length) {
+    for (const blocker of result.blockers) {
+      const matchingWorkItem = findWorkItemForBlocker(state.shared.workItems, blocker.issue);
+      if (!matchingWorkItem || matchingWorkItem.status === "done") continue;
+      matchingWorkItem.status = "blocked";
+      matchingWorkItem.updatedAt = finishedAt;
+    }
+  }
+
   step.result = result;
   step.rawFinalText = rawFinalText;
   step.repairedFinalText = repairedFinalText;
@@ -206,6 +373,23 @@ export function buildFinalTextFromState(state: WorkflowState): string {
   const sections: string[] = [];
   const summary = state.shared.summary?.trim();
   if (summary) sections.push(summary);
+
+  const focus = deriveCurrentFocus(state);
+  if (focus) {
+    sections.push(`Current focus: ${focus}`);
+  }
+
+  const unresolvedWorkItems = getUnresolvedWorkItems(state.shared.workItems);
+  if (unresolvedWorkItems.length > 0) {
+    sections.push(
+      [
+        "Unresolved work:",
+        ...unresolvedWorkItems.map((item) =>
+          `- ${item.title} [${item.status}]${item.details ? ` (${item.details})` : ""}`,
+        ),
+      ].join("\n"),
+    );
+  }
 
   if (state.shared.blockers.length > 0) {
     sections.push(
@@ -243,5 +427,8 @@ export function getStateSummaryCounts(state: WorkflowState) {
     learnings: state.shared.learnings.length,
     blockers: state.shared.blockers.length,
     verification: state.shared.verification.length,
+    openWorkItems: getOpenWorkItems(state.shared.workItems).length,
+    doneWorkItems: getDoneWorkItems(state.shared.workItems).length,
+    blockedWorkItems: getBlockedWorkItems(state.shared.workItems).length,
   };
 }

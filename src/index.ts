@@ -26,6 +26,13 @@ import {
   buildWorkflowCardPayload,
   renderWorkflowCardLines,
 } from "./workflow-cards.js";
+import {
+  getBlockedWorkItems,
+  getDoneWorkItems,
+  getOpenWorkItems,
+  getUnresolvedWorkItems,
+} from "./workflow-work-items.js";
+import type { SharedState } from "./workflow-types.js";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -201,6 +208,32 @@ function aggregateUsage(results: SingleResult[]) {
     total.turns += result.usage.turns;
   }
   return total;
+}
+
+function buildSharedSummaryLine(shared: SharedState): string {
+  return [
+    `open:${getOpenWorkItems(shared.workItems).length}`,
+    `done:${getDoneWorkItems(shared.workItems).length}`,
+    `blocked:${getBlockedWorkItems(shared.workItems).length}`,
+    `blockers:${shared.blockers.length}`,
+    `decisions:${shared.decisions.length}`,
+    `learnings:${shared.learnings.length}`,
+    `verification:${shared.verification.length}`,
+  ].join(" ");
+}
+
+function getCurrentFocus(shared: SharedState): string | undefined {
+  const explicitFocus = shared.focus?.trim();
+  if (explicitFocus) return explicitFocus;
+  return getUnresolvedWorkItems(shared.workItems)[0]?.title;
+}
+
+function getTopPendingWorkItem(shared: SharedState): string | undefined {
+  const item = getUnresolvedWorkItems(shared.workItems)[0];
+  if (!item) return undefined;
+  const parts = [item.title, item.status];
+  if (item.priority) parts.push(item.priority);
+  return parts.join(" | ");
 }
 
 function tokenizeCommandArgs(input: string): string[] {
@@ -545,14 +578,25 @@ function renderWorkflowResult(
     const shared = details.state.shared;
     container.addChild(
       new Text(
-        theme.fg(
-          "muted",
-          `decisions:${shared.decisions.length} learnings:${shared.learnings.length} blockers:${shared.blockers.length} verification:${shared.verification.length}`,
-        ),
+        theme.fg("muted", buildSharedSummaryLine(shared)),
         0,
         0,
       ),
     );
+
+    const currentFocus = getCurrentFocus(shared);
+    if (currentFocus) {
+      container.addChild(
+        new Text(theme.fg("dim", `Focus: ${currentFocus}`), 0, 0),
+      );
+    }
+
+    const topPendingWorkItem = getTopPendingWorkItem(shared);
+    if (topPendingWorkItem) {
+      container.addChild(
+        new Text(theme.fg("dim", `Top pending: ${topPendingWorkItem}`), 0, 0),
+      );
+    }
 
     for (let index = 0; index < details.results.length; index++) {
       const step = details.results[index];
@@ -584,6 +628,13 @@ function renderWorkflowResult(
           0,
         ),
       );
+
+      const stepFocus = stateStep?.result?.focusSummary?.trim();
+      if (stepFocus) {
+        container.addChild(
+          new Text(theme.fg("dim", `Focus: ${stepFocus}`), 0, 0),
+        );
+      }
 
       if (step.parseError) {
         container.addChild(
@@ -635,10 +686,17 @@ function renderWorkflowResult(
 
   text +=
     "\n" +
-    theme.fg(
-      "muted",
-      `decisions:${details.state.shared.decisions.length} learnings:${details.state.shared.learnings.length} blockers:${details.state.shared.blockers.length} verification:${details.state.shared.verification.length}`,
-    );
+    theme.fg("muted", buildSharedSummaryLine(details.state.shared));
+
+  const currentFocus = getCurrentFocus(details.state.shared);
+  if (currentFocus) {
+    text += `\n${theme.fg("dim", `Focus: ${currentFocus}`)}`;
+  }
+
+  const topPendingWorkItem = getTopPendingWorkItem(details.state.shared);
+  if (topPendingWorkItem) {
+    text += `\n${theme.fg("dim", `Top pending: ${topPendingWorkItem}`)}`;
+  }
 
   for (let index = 0; index < details.results.length; index++) {
     const step = details.results[index];
@@ -655,6 +713,9 @@ function renderWorkflowResult(
       getFinalOutput(step.messages);
     text += `\n\n${theme.fg("muted", `─── Step ${step.step}: `)}${theme.fg("accent", step.agent)}${theme.fg("muted", ` (${step.agentSource}) `)}${stepIcon}`;
     text += `\n${theme.fg("muted", "Objective: ")}${theme.fg("dim", step.objective || stateStep?.objective || step.task)}`;
+    if (stateStep?.result?.focusSummary?.trim()) {
+      text += `\n${theme.fg("dim", `Focus: ${stateStep.result.focusSummary.trim()}`)}`;
+    }
     if (step.parseError) {
       text += `\n${theme.fg("warning", `Parse repair: ${step.parseError}`)}`;
     }
@@ -821,9 +882,12 @@ export default function registerExtension(pi: ExtensionAPI) {
             setWorkflowCardsWidget(ctx, {
               workflowName,
               summary: {
+                openWorkItems: 0,
+                doneWorkItems: 0,
+                blockedWorkItems: 0,
+                blockers: 0,
                 decisions: 0,
                 learnings: 0,
-                blockers: 0,
                 verification: 0,
               },
               steps: workflowConfig.steps.map((step) => ({
@@ -833,6 +897,8 @@ export default function registerExtension(pi: ExtensionAPI) {
                 status: "pending",
                 elapsedMs: 0,
                 lastWork: "",
+                currentFocus: undefined,
+                topPendingWorkItem: undefined,
               })),
             });
           }

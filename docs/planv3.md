@@ -191,6 +191,7 @@ export interface SharedState {
 
 - `open` / `in_progress` / `blocked` 都属于未完成工作
 - `done` 属于已完成工作
+- `blocked` 虽然会单独体现在 blocker 视图里，但仍然必须继续出现在后续 step 的 unresolved work projection 中
 
 ---
 
@@ -261,6 +262,12 @@ export interface WorkOrder {
   expectedOutput: WorkflowChannel[];
 }
 ```
+
+补充语义：
+
+- `currentFocus` 是 advisory hint，不应该永久覆盖 shared state
+- 当更晚的 step 没有继续确认旧 focus，或者旧 focus 对应的工作已经解决时，orchestrator 应该回退到基于 unresolved work 的 focus
+- `openWorkItems` 的 projection 需要继续让后续 step 看见 blocked work item，而不是把它们从未完成工作里“隐藏掉”
 
 ---
 

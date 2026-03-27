@@ -500,11 +500,13 @@ export async function runWorkflowByName(
 
   for (let index = 0; index < workflow.steps.length; index++) {
     const step = workflow.steps[index];
+    const agent = agents.find((item) => item.name === step.agent);
+    const workOrder = buildWorkOrder(state, step, agent, index);
+    state.steps[index].objective = workOrder.objective;
     markStepRunning(state, index);
     persistWorkflowState(persistence, workflow, state, results);
     emitDetails();
 
-    const workOrder = buildWorkOrder(state, step, index);
     const stepPrompt = renderStructuredStepPrompt(workOrder);
 
     const primaryResult = await runSingleAgent({

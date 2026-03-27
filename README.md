@@ -17,6 +17,7 @@ The public authoring model stays intentionally simple:
 - agents stay as normal Pi markdown agents
 - the plugin injects a structured workflow contract at runtime
 - step-to-step handoff goes through orchestrator state, not raw previous-step text
+- shared state can carry optional work items and a current focus across steps
 - if a step fails to produce structured output, the runtime does one repair retry
 
 ## Usage
@@ -78,6 +79,7 @@ Agents are loaded from:
 
 Built-in agents can be overridden by project or global agents with the same name.
 User-defined agents do not need extra workflow-specific frontmatter.
+`v3` still does not require new frontmatter for work-item support.
 
 ## Execution Model
 
@@ -92,6 +94,14 @@ For each step, `pi-conductor`:
 5. uses the updated state to prepare the next step
 
 This keeps the public authoring model small while making the runtime handoff more reliable.
+
+In `v3`, that shared state can also carry:
+
+- open / done / blocked work items
+- recent resolved work
+- a workflow-level current focus
+
+These work-item fields are a soft contract. Agents may return them when useful, but older agents that only return the original `v2` fields still continue to work.
 
 The structured contract is enforced by the runtime. Agents are asked to return a JSON block between:
 
@@ -121,12 +131,15 @@ Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 
 ## Current Scope
 
-`v2` is still sequential only. It does not add:
+`v3` is still sequential only. It does not add:
 
 - parallel steps
 - DAG workflows
 - resume
 - automatic agent selection
+- auto-skip
+- auto-reorder
+- dynamic step insertion
 - teams or team-workflow
 - config, hooks, or skill/include loading
 
@@ -176,3 +189,5 @@ pi remove https://github.com/blackrootX/pi-conductor
 - [Workflow plan](./docs/workflow-plan.md)
 - [v2 plan](./docs/planv2.md)
 - [v2 tasks](./docs/taskv2.md)
+- [v3 plan](./docs/planv3.md)
+- [v3 tasks](./docs/taskv3.md)

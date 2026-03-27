@@ -3,6 +3,8 @@ import type {
   ArtifactItem,
   BlockerItem,
   DecisionItem,
+  NewWorkItemInput,
+  ResolvedWorkItemInput,
   VerificationItem,
 } from "./workflow-types.js";
 import { WORKFLOW_RESULT_BEGIN, WORKFLOW_RESULT_END } from "./workflow-prompts.js";
@@ -69,6 +71,31 @@ function normalizeVerificationItem(value: unknown): VerificationItem | undefined
     check,
     status,
     notes: normalizeText(value.notes),
+  };
+}
+
+function normalizeNewWorkItem(value: unknown): NewWorkItemInput | undefined {
+  if (!isObject(value)) return undefined;
+  const title = normalizeText(value.title);
+  if (!title) return undefined;
+  const priority = normalizeText(value.priority);
+  return {
+    title,
+    details: normalizeText(value.details),
+    priority:
+      priority === "low" || priority === "medium" || priority === "high"
+        ? priority
+        : undefined,
+  };
+}
+
+function normalizeResolvedWorkItem(value: unknown): ResolvedWorkItemInput | undefined {
+  if (!isObject(value)) return undefined;
+  const title = normalizeText(value.title);
+  if (!title) return undefined;
+  return {
+    title,
+    resolution: normalizeText(value.resolution),
   };
 }
 
@@ -146,6 +173,9 @@ export function validateAgentResultShape(
       learnings: normalizeStringArray(value.learnings),
       blockers: normalizeObjectArray(value.blockers, normalizeBlockerItem),
       verification: normalizeObjectArray(value.verification, normalizeVerificationItem),
+      newWorkItems: normalizeObjectArray(value.newWorkItems, normalizeNewWorkItem),
+      resolvedWorkItems: normalizeObjectArray(value.resolvedWorkItems, normalizeResolvedWorkItem),
+      focusSummary: normalizeText(value.focusSummary),
       nextStepHint: normalizeText(value.nextStepHint),
       rawText,
     },
