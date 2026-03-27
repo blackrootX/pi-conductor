@@ -15,6 +15,8 @@ export interface WorkflowCardRenderOptions {
   animationTick?: number;
 }
 
+type WorkflowOverviewStatus = WorkflowCardPayload["status"];
+
 type Styler = {
   accent(text: string): string;
   bold(text: string): string;
@@ -115,6 +117,148 @@ function getStatusText(
   }
 }
 
+function getBorderStyle(
+  status: WorkflowCardStatus,
+  styler: Styler,
+): (text: string) => string {
+  switch (status) {
+    case "running":
+      return styler.highlight;
+    case "done":
+      return styler.success;
+    case "error":
+      return styler.error;
+    default:
+      return styler.dim;
+  }
+}
+
+function getOverviewStatusIcon(
+  status: WorkflowOverviewStatus,
+  animationTick: number,
+): string {
+  switch (status) {
+    case "running":
+      return getSpinnerFrame(animationTick);
+    case "done":
+      return "✓";
+    case "blocked":
+    case "failed":
+      return "✗";
+    default:
+      return "○";
+  }
+}
+
+function getOverviewStatusStyle(
+  status: WorkflowOverviewStatus,
+  styler: Styler,
+): (text: string) => string {
+  switch (status) {
+    case "running":
+      return styler.highlight;
+    case "done":
+      return styler.success;
+    case "blocked":
+    case "failed":
+      return styler.error;
+    default:
+      return styler.dim;
+  }
+}
+
+function formatStatusLabel(
+  state: WorkflowCardState,
+  animationTick: number,
+): string {
+  const elapsed =
+    state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
+  const base =
+    state.rawStatus === "failed"
+      ? "FAILED"
+      : state.rawStatus === "blocked"
+        ? "BLOCKED"
+        : state.status.toUpperCase();
+  return `${getStatusIcon(state.status, animationTick)} ${base}${elapsed}`;
+}
+
+function formatOverviewStatusLabel(
+  status: WorkflowOverviewStatus,
+  animationTick: number,
+): string {
+  const label =
+    status === "failed"
+      ? "FAILED"
+      : status === "blocked"
+        ? "BLOCKED"
+        : status.toUpperCase();
+  return `${getOverviewStatusIcon(status, animationTick)} ${label}`;
+}
+
+function formatVerifyStatus(state: WorkflowCardState): string {
+  const status = state.verifyStatus ?? "pending";
+  const label =
+    status === "passed"
+      ? "passed"
+      : status === "failed"
+        ? "failed"
+        : status === "skipped"
+          ? "skipped"
+          : "pending";
+  return `${label} p:${state.passedCheckCount} f:${state.failedCheckCount} n:${state.notRunCheckCount}`;
+}
+
+function buildProgressRail(
+  state: WorkflowCardState,
+  width: number,
+  styler: Styler,
+  animationTick: number,
+): string {
+  const railWidth = Math.max(8, width);
+
+  switch (state.status) {
+    case "done":
+      return styler.success("█".repeat(railWidth));
+    case "error": {
+      const completed = Math.max(2, Math.floor(railWidth * 0.45));
+      return styler.error("█".repeat(completed) + "░".repeat(railWidth - completed));
+    }
+    case "running": {
+      const frames = ["█", "▓", "▒"];
+      const cells = new Array<string>(railWidth).fill("░");
+      const head = Math.floor(animationTick / 150) % railWidth;
+      cells[head] = frames[Math.floor(animationTick / 250) % frames.length];
+      if (head > 0) cells[head - 1] = "▓";
+      if (head > 1) cells[head - 2] = "▒";
+      return styler.highlight(cells.join(""));
+    }
+    default:
+      return styler.dim("·".repeat(railWidth));
+  }
+}
+
+function buildOverviewSubline(payload: WorkflowCardPayload, width: number): string {
+  const stepSummary =
+    payload.currentStepNumber && payload.currentStepAgent
+      ? `Step ${payload.currentStepNumber}/${payload.steps.length} ${displayName(payload.currentStepAgent)}`
+      : `${payload.steps.length} step${payload.steps.length === 1 ? "" : "s"} queued`;
+  const focus = payload.currentFocus?.trim()
+    ? truncateText(payload.currentFocus.trim().replace(/\s+/g, " "), 30)
+    : payload.topPendingWorkItem?.trim()
+      ? truncateText(payload.topPendingWorkItem.trim().replace(/\s+/g, " "), 30)
+      : "";
+
+  const combined = focus ? `${stepSummary}  •  ${focus}` : stepSummary;
+  return truncateText(combined, width);
+}
+
+function buildOverviewMetrics(payload: WorkflowCardPayload, width: number): string {
+  return truncateText(
+    `open ${payload.summary.openWorkItems}  done ${payload.summary.doneWorkItems}  blocked ${payload.summary.blockedWorkItems}  blockers ${payload.summary.blockers}  verify ${payload.summary.verification}`,
+    width,
+  );
+}
+
 function stylePaddedLine(
   content: string,
   width: number,
@@ -129,6 +273,44 @@ function stylePaddedLine(
   );
 }
 
+function styleJustifiedLine(
+  left: string,
+  right: string,
+  width: number,
+  borderStyle: (text: string) => string,
+  leftStyle: (text: string) => string = (text) => text,
+  rightStyle: (text: string) => string = (text) => text,
+): string {
+  const needsGap = left && right ? 1 : 0;
+  const safeRight = truncateText(right, width);
+  const maxLeft = Math.max(0, width - safeRight.length - needsGap);
+  const safeLeft = truncateText(left, maxLeft);
+  const gapWidth = Math.max(needsGap, width - safeLeft.length - safeRight.length);
+
+  return (
+    borderStyle("│") +
+    leftStyle(safeLeft) +
+    " ".repeat(gapWidth) +
+    rightStyle(safeRight) +
+    borderStyle("│")
+  );
+}
+
+function renderOverviewLine(
+  left: string,
+  right: string,
+  width: number,
+  leftStyle: (text: string) => string = (text) => text,
+  rightStyle: (text: string) => string = (text) => text,
+): string {
+  const needsGap = left && right ? 1 : 0;
+  const safeRight = truncateText(right, width);
+  const maxLeft = Math.max(0, width - safeRight.length - needsGap);
+  const safeLeft = truncateText(left, maxLeft);
+  const gapWidth = Math.max(needsGap, width - safeLeft.length - safeRight.length);
+  return leftStyle(safeLeft) + " ".repeat(gapWidth) + rightStyle(safeRight);
+}
+
 function renderCard(
   state: WorkflowCardState,
   columnWidth: number,
@@ -136,63 +318,76 @@ function renderCard(
   animationTick: number,
 ): string[] {
   const innerWidth = Math.max(18, columnWidth - 2);
-  const title = truncateText(buildTitle(state.agent, state.model), innerWidth - 1);
+  const cardBorder = getBorderStyle(state.status, styler);
+  const title = truncateText(buildTitle(state.agent, state.model), innerWidth);
   const objective = state.objective.trim()
-    ? truncateText(state.objective.trim().replace(/\s+/g, " "), innerWidth - 1)
-    : "—";
-  const profile = state.profile
-    ? truncateText(`profile: ${state.profile}`, innerWidth - 1)
-    : "profile: —";
-  const focus = state.currentFocus?.trim()
-    ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
-    : "focus: —";
-  const elapsed =
-    state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
-  const repairLabel = state.repairAttempted ? " repair" : "";
-  const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${repairLabel}${elapsed}`;
-  const verificationPhase = truncateText(
-    `phase: ${state.verificationPhase}`,
-    innerWidth - 1,
-  );
+    ? truncateText(`goal: ${state.objective.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
+    : "goal: —";
+  const profile = state.profile ? `profile: ${state.profile}` : "profile: —";
+  const statusLabel = formatStatusLabel(state, animationTick);
   const verifyLabel = truncateText(
-    state.verifyStatus
-      ? `verify: ${state.verifyStatus} p:${state.passedCheckCount} f:${state.failedCheckCount} n:${state.notRunCheckCount}`
-      : "verify: pending",
+    `verify: ${state.verificationPhase} · ${formatVerifyStatus(state)}`,
     innerWidth - 1,
   );
   const verifySummary = state.verifySummary?.trim()
-    ? truncateText(state.verifySummary.trim().replace(/\s+/g, " "), innerWidth - 1)
+    ? truncateText(
+        `verify summary: ${state.verifySummary.trim().replace(/\s+/g, " ")}`,
+        innerWidth - 1,
+      )
     : "verify summary: —";
   const pending = state.topPendingWorkItem?.trim()
     ? truncateText(`pending: ${state.topPendingWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
     : "pending: —";
+  const focus = state.currentFocus?.trim()
+    ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
+    : "focus: —";
   const lastWork = state.lastWork.trim()
     ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
-
-  const borderStyle = state.status === "running" ? styler.highlight : styler.dim;
-  const top = borderStyle(`┌${"─".repeat(innerWidth)}┐`);
-  const bottom = borderStyle(`└${"─".repeat(innerWidth)}┘`);
+  const updateLabel = state.newItemCount > 0 ? `+${state.newItemCount} updates` : "";
+  const repairLabel = state.repairAttempted ? "repair" : "";
+  const rightMeta = repairLabel || updateLabel;
+  const top = cardBorder(`╭${"─".repeat(innerWidth)}╮`);
+  const bottom = cardBorder(`╰${"─".repeat(innerWidth)}╯`);
 
   return [
     top,
-    stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${styler.muted(profile)}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${styler.muted(verificationPhase)}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${styler.muted(verifyLabel)}`, innerWidth, borderStyle),
+    styleJustifiedLine(
+      ` STEP ${String(state.stepNumber).padStart(2, "0")}`,
+      statusLabel,
+      innerWidth,
+      cardBorder,
+      (text) => styler.dim(text),
+      (text) => getStatusText(state.status, text, styler),
+    ),
+    stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, cardBorder),
+    stylePaddedLine(
+      ` ${buildProgressRail(state, innerWidth - 1, styler, animationTick)}`,
+      innerWidth,
+      cardBorder,
+    ),
+    stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, cardBorder),
+    styleJustifiedLine(
+      ` ${truncateText(profile, innerWidth - 2)}`,
+      rightMeta,
+      innerWidth,
+      cardBorder,
+      (text) => styler.muted(text),
+      (text) => (repairLabel ? styler.highlight(text) : styler.accent(text)),
+    ),
+    stylePaddedLine(` ${styler.muted(verifyLabel)}`, innerWidth, cardBorder),
     stylePaddedLine(
       ` ${verifySummary === "verify summary: —" ? styler.dim(verifySummary) : styler.muted(verifySummary)}`,
       innerWidth,
-      borderStyle,
+      cardBorder,
     ),
-    stylePaddedLine(` ${styler.muted(focus)}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
-    stylePaddedLine(` ${state.topPendingWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${state.currentFocus ? styler.muted(focus) : styler.dim(focus)}`, innerWidth, cardBorder),
+    stylePaddedLine(` ${state.topPendingWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, cardBorder),
+    stylePaddedLine(` ${styler.accent("latest")}`, innerWidth, cardBorder),
     stylePaddedLine(
       ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
       innerWidth,
-      borderStyle,
+      cardBorder,
     ),
     bottom,
   ];
@@ -240,7 +435,7 @@ function renderRows(
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
     const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
-    const connectorRow = 7;
+    const connectorRow = Math.floor(cards[0].length / 2);
 
     for (let line = 0; line < cards[0].length; line++) {
       let row = cards[0][line];
@@ -276,12 +471,19 @@ export function renderWorkflowCardLines(
 ): string[] {
   const styler = theme ? createThemeStyler(theme) : createPlainStyler();
   const animationTick = options?.animationTick ?? 0;
+  const statusStyle = getOverviewStatusStyle(payload.status, styler);
+  const statusLabel = formatOverviewStatusLabel(payload.status, animationTick);
   return [
     styler.dim("Workflow"),
-    styler.accent(styler.bold(payload.workflowName)),
-    styler.muted(
-      `open:${payload.summary.openWorkItems} done:${payload.summary.doneWorkItems} blocked:${payload.summary.blockedWorkItems} blockers:${payload.summary.blockers} decisions:${payload.summary.decisions} learnings:${payload.summary.learnings} verification:${payload.summary.verification}`,
+    renderOverviewLine(
+      payload.workflowName,
+      statusLabel,
+      width,
+      (text) => styler.accent(styler.bold(text)),
+      (text) => statusStyle(text),
     ),
+    styler.muted(buildOverviewSubline(payload, width)),
+    styler.dim(buildOverviewMetrics(payload, width)),
     "",
     ...renderRows(payload.steps, width, styler, animationTick),
   ];
