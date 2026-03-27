@@ -4,6 +4,8 @@ import {
   getOpenWorkItems,
   getUnresolvedWorkItems,
 } from "./workflow-work-items.js";
+import { WORKFLOW_RESULT_BEGIN } from "./workflow-prompts.js";
+import { extractStructuredBlock } from "./workflow-result.js";
 import type { WorkflowDetails } from "./workflow-runtime.js";
 
 export type WorkflowPresentationStepStatus =
@@ -86,6 +88,32 @@ function formatWorkItemLine(
   return parts.join(" | ");
 }
 
+function extractStructuredSummary(text: string): string | undefined {
+  const block = extractStructuredBlock(text);
+  if (!block) return undefined;
+
+  try {
+    const parsed = JSON.parse(block) as { summary?: unknown };
+    return typeof parsed.summary === "string" && parsed.summary.trim()
+      ? parsed.summary.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatProgressText(text: string | undefined): string {
+  const trimmed = text?.trim() ?? "";
+  if (!trimmed) return "";
+
+  const summary = extractStructuredSummary(trimmed);
+  if (summary) return summary;
+  if (trimmed.includes(WORKFLOW_RESULT_BEGIN)) {
+    return "Finalizing structured workflow result...";
+  }
+  return trimmed;
+}
+
 export function buildWorkflowPresentation(
   details: WorkflowDetails,
   defaultModel?: string,
@@ -118,7 +146,7 @@ export function buildWorkflowPresentation(
       status,
       rawStatus: stepStatus,
       elapsedMs: result?.elapsedMs ?? 0,
-      lastWork: result?.lastWork ?? stateStep?.result?.summary ?? "",
+      lastWork: formatProgressText(result?.lastWork ?? stateStep?.result?.summary ?? ""),
       repairAttempted: result?.repairAttempted,
       currentFocus,
       topPendingWorkItem,
@@ -126,9 +154,13 @@ export function buildWorkflowPresentation(
     };
   });
 
+  const currentStepLastWork = steps[details.state.currentStepIndex]?.lastWork;
+  const latestResultLastWork = formatProgressText(
+    details.results[details.results.length - 1]?.lastWork,
+  );
   const lastProgress =
-    steps[details.state.currentStepIndex]?.lastWork ||
-    details.results[details.results.length - 1]?.lastWork ||
+    currentStepLastWork ||
+    (currentStateStep?.status === "running" ? "" : latestResultLastWork) ||
     details.state.shared.summary ||
     "";
 

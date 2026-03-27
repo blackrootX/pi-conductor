@@ -52,7 +52,6 @@ import {
   buildWorkflowMessageContent,
   createInitialWorkflowDetails,
   createWorkflowMessageDetails,
-  createWorkflowSessionSnapshot,
   getLatestWorkflowSnapshot,
 } from "./workflow-session-entries.js";
 import type { WorkflowRuntimeHooks } from "./workflow-hooks.js";
@@ -512,7 +511,6 @@ function buildMainSessionSummary(
 
 type WorkflowProgressTracker = {
   previousDetails?: WorkflowDetails;
-  lastPresentationFingerprint?: string;
 };
 
 function buildWorkflowSessionName(workflowName: string, task: string): string {
@@ -530,45 +528,6 @@ function describeUnknownError(error: unknown): string {
     return error.message.trim() || error.name;
   }
   return typeof error === "string" ? error.trim() || "Unknown error" : "Unknown error";
-}
-
-function getWorkflowPresentationFingerprint(
-  snapshot: ReturnType<typeof createWorkflowSessionSnapshot>,
-): string {
-  return JSON.stringify({
-    workflowName: snapshot.presentation.workflowName,
-    runId: snapshot.presentation.runId,
-    status: snapshot.presentation.status,
-    currentStepIndex: snapshot.presentation.currentStepIndex,
-    currentStepNumber: snapshot.presentation.currentStepNumber,
-    currentStepAgent: snapshot.presentation.currentStepAgent,
-    currentStepObjective: snapshot.presentation.currentStepObjective,
-    currentFocus: snapshot.presentation.currentFocus,
-    topPendingWorkItem: snapshot.presentation.topPendingWorkItem,
-    lastProgress: snapshot.presentation.lastProgress,
-    summary: snapshot.presentation.summary,
-    blockers: snapshot.presentation.blockers,
-    decisions: snapshot.presentation.decisions,
-    learnings: snapshot.presentation.learnings,
-    verification: snapshot.presentation.verification,
-    openWorkItems: snapshot.presentation.openWorkItems,
-    doneWorkItems: snapshot.presentation.doneWorkItems,
-    blockedWorkItems: snapshot.presentation.blockedWorkItems,
-    steps: snapshot.presentation.steps.map((step) => ({
-      stepNumber: step.stepNumber,
-      stepId: step.stepId,
-      agent: step.agent,
-      objective: step.objective,
-      model: step.model,
-      status: step.status,
-      rawStatus: step.rawStatus,
-      lastWork: step.lastWork,
-      repairAttempted: step.repairAttempted,
-      currentFocus: step.currentFocus,
-      topPendingWorkItem: step.topPendingWorkItem,
-      parseError: step.parseError,
-    })),
-  });
 }
 
 function emitWorkflowMessage(
@@ -600,18 +559,6 @@ function syncWorkflowProgress(
     return;
   }
 
-  let liveSnapshot: ReturnType<typeof createWorkflowSessionSnapshot> | undefined;
-  const ensureLiveSnapshot = () => {
-    liveSnapshot ??= createWorkflowSessionSnapshot(details, currentModel);
-    return liveSnapshot;
-  };
-  const recordEmission = (
-    snapshot: ReturnType<typeof createWorkflowSessionSnapshot>,
-  ) => {
-    tracker.lastPresentationFingerprint = getWorkflowPresentationFingerprint(snapshot);
-  };
-  let emittedTransitionUpdate = false;
-
   for (let index = 0; index < details.state.steps.length; index++) {
     const previousStatus = previous.state.steps[index]?.status;
     const nextStatus = details.state.steps[index]?.status;
@@ -619,9 +566,7 @@ function syncWorkflowProgress(
 
     if (nextStatus === "running") {
       const snapshot = appendWorkflowStepUpdated(pi, details, currentModel);
-      recordEmission(snapshot);
       emitWorkflowMessage(pi, "step-updated", snapshot);
-      emittedTransitionUpdate = true;
       continue;
     }
 
@@ -631,19 +576,7 @@ function syncWorkflowProgress(
       nextStatus === "failed"
     ) {
       const snapshot = appendWorkflowStepFinished(pi, details, currentModel);
-      recordEmission(snapshot);
       emitWorkflowMessage(pi, "step-finished", snapshot);
-      emittedTransitionUpdate = true;
-    }
-  }
-
-  const currentStep = details.state.steps[details.state.currentStepIndex];
-  if (!emittedTransitionUpdate && currentStep?.status === "running") {
-    const snapshot = ensureLiveSnapshot();
-    const nextFingerprint = getWorkflowPresentationFingerprint(snapshot);
-    if (nextFingerprint !== tracker.lastPresentationFingerprint) {
-      recordEmission(snapshot);
-      emitWorkflowMessage(pi, "step-updated", snapshot);
     }
   }
 
@@ -1062,7 +995,6 @@ export default function registerExtension(pi: ExtensionAPI) {
           buildWorkflowCardPayload(initialDetails, true, currentModel),
         );
         const snapshot = appendWorkflowRunStarted(pi, initialDetails, currentModel);
-        tracker.lastPresentationFingerprint = getWorkflowPresentationFingerprint(snapshot);
         emitWorkflowMessage(pi, "run-started", snapshot);
       }
 
@@ -1074,19 +1006,17 @@ export default function registerExtension(pi: ExtensionAPI) {
           defaultModel: currentModel,
         });
         const handleWorkflowUpdate = (details: WorkflowDetails) => {
+          const payload = buildWorkflowCardPayload(details, true, currentModel);
           setWorkflowCardsWidget(
             ctx,
-            buildWorkflowCardPayload(details, true, currentModel),
+            payload,
           );
           syncWorkflowProgress(pi, tracker, details, currentModel);
           onUpdate?.({
             content: [
               {
                 type: "text",
-                text: details.results.length > 0
-                  ? details.results[details.results.length - 1].lastWork ||
-                    "(running...)"
-                  : "(running...)",
+                text: payload.lastProgress || "(running...)",
               },
             ],
             details,

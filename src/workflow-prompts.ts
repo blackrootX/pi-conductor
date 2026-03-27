@@ -54,6 +54,7 @@ function renderListSection(
 }
 
 export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
+  const isPlanningStep = workOrder.agent === "plan";
   const lines: string[] = [
     "TASK",
     workOrder.context.userTask,
@@ -143,11 +144,23 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
     "- When you discover actionable follow-up work, include `newWorkItems`.",
     "- When you finish previously open work, include `resolvedWorkItems`.",
     "- Include `focusSummary` when it would help the next step stay focused.",
+    ...(isPlanningStep
+      ? [
+          "- For planning steps, describe implementation as future work unless you verified it already exists through repository inspection.",
+          "- If you verified an implementation already exists, say that it was pre-existing and confirmed by inspection.",
+        ]
+      : []),
     "",
     "MUST NOT DO",
     "- Do not address the next agent directly.",
     "- Do not omit the required result block.",
     "- Do not rely on free-form prose alone for important workflow state.",
+    ...(isPlanningStep
+      ? [
+          "- For planning steps, do not claim you created, edited, or completed files unless read-only inspection proves they already exist.",
+          "- For planning steps, do not say the user's task is done when you only inspected or planned the work.",
+        ]
+      : []),
     "",
     "EXPECTED OUTPUT CHANNELS",
     workOrder.expectedOutput.join(", "),
