@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -5,8 +6,26 @@ import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig, AgentSource } from "./agents.js";
 import { discoverAgents } from "./agents.js";
-import type { WorkflowSource } from "./workflows.js";
+import { renderRepairPrompt, renderStructuredStepPrompt } from "./workflow-prompts.js";
+import { parseAgentResult } from "./workflow-result.js";
+import {
+  buildFinalTextFromState,
+  buildWorkOrder,
+  completeWorkflowState,
+  createWorkflowState,
+  markStepFailure,
+  markStepRunning,
+  mergeAgentResultIntoState,
+} from "./workflow-state.js";
+import type { AgentResult, WorkflowConfig, WorkflowState } from "./workflow-types.js";
 import { discoverWorkflows } from "./workflows.js";
+
+const REPAIR_SYSTEM_PROMPT = [
+  "You repair workflow step outputs into a structured result contract.",
+  "Do not invent repository changes or verification that are not supported by the provided text.",
+  "Preserve the most faithful interpretation of the original step output.",
+  "Return the required structured result block exactly once.",
+].join("\n");
 
 export interface UsageStats {
   input: number;
@@ -22,6 +41,7 @@ export interface SingleResult {
   agent: string;
   agentSource: AgentSource | "unknown";
   task: string;
+  objective?: string;
   exitCode: number;
   elapsedMs: number;
   lastWork: string;
@@ -32,30 +52,58 @@ export interface SingleResult {
   stopReason?: string;
   errorMessage?: string;
   step?: number;
+  stepId?: string;
+  rawFinalText?: string;
+  repairedFinalText?: string;
+  parseError?: string;
+  repairAttempted?: boolean;
+  structuredStatus?: AgentResult["status"];
 }
 
 export interface WorkflowDetails {
   workflowName: string;
-  agentNames: string[];
-  workflowSource: WorkflowSource;
+  steps: WorkflowConfig["steps"];
+  workflowSource: WorkflowConfig["source"];
   workflowFilePath: string | null;
   results: SingleResult[];
+  state: WorkflowState;
 }
 
 export type WorkflowUpdate = WorkflowDetails;
 
 export interface WorkflowRunResult {
   workflowName: string;
-  agentNames: string[];
-  workflowSource: WorkflowSource;
+  steps: WorkflowConfig["steps"];
+  workflowSource: WorkflowConfig["source"];
   workflowFilePath: string | null;
   results: SingleResult[];
+  state: WorkflowState;
   finalText: string;
   isError: boolean;
   errorMessage?: string;
 }
 
 export type WorkflowUpdateCallback = (details: WorkflowUpdate) => void;
+
+type RunSingleAgentOptions = {
+  defaultCwd: string;
+  agents: AgentConfig[];
+  agentName: string;
+  task: string;
+  defaultModel: string | undefined;
+  step: number;
+  stepId: string;
+  objective: string;
+  signal: AbortSignal | undefined;
+  onUpdate: ((result: SingleResult) => void) | undefined;
+  systemPromptOverride?: string;
+  toolsOverride?: string[];
+};
+
+type WorkflowPersistence = {
+  runDir: string;
+  stepsDir: string;
+};
 
 function writePromptToTempFile(
   agentName: string,
@@ -83,48 +131,154 @@ export function isErrorResult(result: SingleResult): boolean {
   return (
     result.exitCode !== 0 ||
     result.stopReason === "error" ||
-    result.stopReason === "aborted"
+    result.stopReason === "aborted" ||
+    result.structuredStatus === "failed" ||
+    result.structuredStatus === "blocked"
   );
 }
 
-async function runSingleAgent(
-  defaultCwd: string,
-  agents: AgentConfig[],
+function makeEmptyUsage(): UsageStats {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    contextTokens: 0,
+    turns: 0,
+  };
+}
+
+function createPersistence(cwd: string, runId: string): WorkflowPersistence {
+  const runDir = path.join(cwd, ".pi", "workflow-runs", runId);
+  const stepsDir = path.join(runDir, "steps");
+  fs.mkdirSync(stepsDir, { recursive: true });
+  return { runDir, stepsDir };
+}
+
+function sanitizeFileNamePart(input: string): string {
+  return input.replace(/[^\w.-]+/g, "-");
+}
+
+function writeJsonFile(filePath: string, value: unknown): void {
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
+}
+
+function persistWorkflowState(
+  persistence: WorkflowPersistence,
+  workflow: WorkflowConfig,
+  state: WorkflowState,
+  results: SingleResult[],
+): void {
+  writeJsonFile(path.join(persistence.runDir, "state.json"), {
+    runId: state.runId,
+    workflowName: workflow.name,
+    workflowSource: workflow.source,
+    workflowFilePath: workflow.filePath ?? null,
+    status: state.status,
+    startedAt: state.startedAt,
+    finishedAt: state.finishedAt,
+    resultCount: results.length,
+    state,
+  });
+}
+
+function persistStepResult(
+  persistence: WorkflowPersistence,
+  stepIndex: number,
+  stepAgent: string,
+  result: SingleResult,
+  parsedResult?: AgentResult,
+): void {
+  const fileName = `${String(stepIndex + 1).padStart(2, "0")}-${sanitizeFileNamePart(stepAgent)}.result.json`;
+  writeJsonFile(path.join(persistence.stepsDir, fileName), {
+    step: result.step,
+    stepId: result.stepId,
+    agent: result.agent,
+    agentSource: result.agentSource,
+    objective: result.objective,
+    exitCode: result.exitCode,
+    structuredStatus: result.structuredStatus,
+    parseError: result.parseError,
+    repairAttempted: result.repairAttempted,
+    rawFinalText: result.rawFinalText,
+    repairedFinalText: result.repairedFinalText,
+    parsedResult: parsedResult ?? null,
+    usage: result.usage,
+    model: result.model,
+    stderr: result.stderr,
+    errorMessage: result.errorMessage,
+    lastWork: result.lastWork,
+  });
+}
+
+function makeWorkflowDetails(
+  workflow: WorkflowConfig,
+  results: SingleResult[],
+  state: WorkflowState,
+): WorkflowDetails {
+  return {
+    workflowName: workflow.name,
+    steps: workflow.steps,
+    workflowSource: workflow.source,
+    workflowFilePath: workflow.filePath ?? null,
+    results,
+    state,
+  };
+}
+
+function buildStructuredStopMessage(
+  result: AgentResult,
+  stepNumber: number,
   agentName: string,
-  task: string,
-  defaultModel: string | undefined,
-  step: number,
-  signal: AbortSignal | undefined,
-  onUpdate: ((result: SingleResult) => void) | undefined,
-): Promise<SingleResult> {
+): string {
+  const blockerDetails =
+    result.blockers?.map((item) => item.issue).filter(Boolean).join("; ") ?? "";
+  const suffix = blockerDetails ? ` ${blockerDetails}` : "";
+  return `Workflow stopped at step ${stepNumber} (${agentName}): ${result.status}.${suffix}`.trim();
+}
+
+async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleResult> {
+  const {
+    defaultCwd,
+    agents,
+    agentName,
+    task,
+    defaultModel,
+    step,
+    stepId,
+    objective,
+    signal,
+    onUpdate,
+    systemPromptOverride,
+    toolsOverride,
+  } = options;
+
   const agent = agents.find((item) => item.name === agentName);
   if (!agent) {
     return {
       agent: agentName,
       agentSource: "unknown",
       task,
+      objective,
       exitCode: 1,
       elapsedMs: 0,
       lastWork: "",
       messages: [],
       stderr: `Unknown agent: "${agentName}"`,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        contextTokens: 0,
-        turns: 0,
-      },
+      usage: makeEmptyUsage(),
       step,
+      stepId,
     };
   }
 
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) args.push("--model", agent.model);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
+  const resolvedModel = agent.model ?? defaultModel;
+  if (resolvedModel) args.push("--model", resolvedModel);
+
+  const tools = toolsOverride ?? agent.tools;
+  if (tools && tools.length > 0) {
+    args.push("--tools", tools.join(","));
   }
 
   let tempPromptDir: string | null = null;
@@ -134,22 +288,16 @@ async function runSingleAgent(
     agent: agentName,
     agentSource: agent.source,
     task,
+    objective,
     exitCode: 0,
     elapsedMs: 0,
     lastWork: "",
     messages: [],
     stderr: "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      contextTokens: 0,
-      turns: 0,
-    },
-    model: agent.model ?? defaultModel,
+    usage: makeEmptyUsage(),
+    model: resolvedModel,
     step,
+    stepId,
   };
 
   const emitUpdate = () => {
@@ -160,8 +308,9 @@ async function runSingleAgent(
   const startTime = Date.now();
 
   try {
-    if (agent.systemPrompt.trim()) {
-      const tempPrompt = writePromptToTempFile(agent.name, agent.systemPrompt);
+    const systemPrompt = systemPromptOverride ?? agent.systemPrompt;
+    if (systemPrompt.trim()) {
+      const tempPrompt = writePromptToTempFile(agent.name, systemPrompt);
       tempPromptDir = tempPrompt.dir;
       tempPromptPath = tempPrompt.filePath;
       args.push("--append-system-prompt", tempPromptPath);
@@ -180,15 +329,22 @@ async function runSingleAgent(
 
       const processLine = (line: string) => {
         if (!line.trim()) return;
-        let event: any;
+        let event: unknown;
         try {
           event = JSON.parse(line);
         } catch {
           return;
         }
 
-        if (event.type === "message_end" && event.message) {
-          const message = event.message as Message;
+        if (
+          typeof event === "object" &&
+          event !== null &&
+          "type" in event &&
+          "message" in event &&
+          (event as { type?: string }).type === "message_end"
+        ) {
+          const message = (event as { message?: Message }).message;
+          if (!message) return;
           currentResult.messages.push(message);
 
           if (message.role === "assistant") {
@@ -206,15 +362,21 @@ async function runSingleAgent(
               currentResult.model = message.model;
             }
             if (message.stopReason) currentResult.stopReason = message.stopReason;
-            if (message.errorMessage) {
-              currentResult.errorMessage = message.errorMessage;
-            }
+            if (message.errorMessage) currentResult.errorMessage = message.errorMessage;
           }
           emitUpdate();
         }
 
-        if (event.type === "tool_result_end" && event.message) {
-          currentResult.messages.push(event.message as Message);
+        if (
+          typeof event === "object" &&
+          event !== null &&
+          "type" in event &&
+          "message" in event &&
+          (event as { type?: string }).type === "tool_result_end"
+        ) {
+          const message = (event as { message?: Message }).message;
+          if (!message) return;
+          currentResult.messages.push(message);
           emitUpdate();
         }
       };
@@ -294,92 +456,263 @@ export async function runWorkflowByName(
   if (!workflow) {
     return {
       workflowName,
-      agentNames: [],
+      steps: [],
       workflowSource: "built-in",
       workflowFilePath: null,
       results: [],
+      state: createWorkflowState(
+        { name: workflowName, steps: [], source: "built-in" },
+        task,
+        randomUUID(),
+      ),
       finalText: "",
       isError: true,
       errorMessage: `Unknown workflow: "${workflowName}"`,
     };
   }
 
-  const makeDetails = (results: SingleResult[]): WorkflowDetails => ({
-    workflowName: workflow.name,
-    agentNames: [...workflow.agentNames],
-    workflowSource: workflow.source,
-    workflowFilePath: workflow.filePath ?? null,
-    results,
-  });
-
-  const missingAgents = workflow.agentNames.filter(
-    (agentName) => !agents.some((agent) => agent.name === agentName),
-  );
+  const missingAgents = workflow.steps
+    .map((step) => step.agent)
+    .filter((agentName) => !agents.some((agent) => agent.name === agentName));
   if (missingAgents.length > 0) {
     return {
       workflowName: workflow.name,
-      agentNames: [...workflow.agentNames],
+      steps: workflow.steps,
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
       results: [],
+      state: createWorkflowState(workflow, task, randomUUID()),
       finalText: "",
       isError: true,
       errorMessage: `Workflow "${workflow.name}" cannot start. Missing agents: ${missingAgents.join(", ")}.`,
     };
   }
 
+  const state = createWorkflowState(workflow, task, randomUUID());
+  const persistence = createPersistence(cwd, state.runId);
   const results: SingleResult[] = [];
-  let currentInput = task;
 
-  for (let index = 0; index < workflow.agentNames.length; index++) {
-    const agentName = workflow.agentNames[index];
-    const result = await runSingleAgent(
-      cwd,
+  const emitDetails = (partialResults = results) => {
+    onUpdate?.(makeWorkflowDetails(workflow, partialResults, state));
+  };
+
+  persistWorkflowState(persistence, workflow, state, results);
+
+  for (let index = 0; index < workflow.steps.length; index++) {
+    const step = workflow.steps[index];
+    markStepRunning(state, index);
+    persistWorkflowState(persistence, workflow, state, results);
+    emitDetails();
+
+    const workOrder = buildWorkOrder(state, step, index);
+    const stepPrompt = renderStructuredStepPrompt(workOrder);
+
+    const primaryResult = await runSingleAgent({
+      defaultCwd: cwd,
       agents,
-      agentName,
-      currentInput,
+      agentName: step.agent,
+      task: stepPrompt,
       defaultModel,
-      index + 1,
+      step: index + 1,
+      stepId: step.id,
+      objective: workOrder.objective,
       signal,
-      onUpdate
+      onUpdate: onUpdate
         ? (partialResult) => {
-            onUpdate(makeDetails([...results, partialResult]));
+            emitDetails([...results, partialResult]);
           }
         : undefined,
-    );
-    results.push(result);
+    });
 
-    if (isErrorResult(result)) {
+    const rawFinalText = getFinalOutput(primaryResult.messages);
+    primaryResult.rawFinalText = rawFinalText;
+    primaryResult.objective = workOrder.objective;
+
+    if (primaryResult.exitCode !== 0 || primaryResult.stopReason === "error" || primaryResult.stopReason === "aborted") {
+      markStepFailure(state, index, "failed");
+      results.push(primaryResult);
+      persistStepResult(
+        persistence,
+        index,
+        step.agent,
+        primaryResult,
+        state.steps[index]?.result,
+      );
+      persistWorkflowState(persistence, workflow, state, results);
+      emitDetails();
       const errorMessage =
-        result.errorMessage ||
-        result.stderr ||
-        getFinalOutput(result.messages) ||
+        primaryResult.errorMessage ||
+        primaryResult.stderr ||
+        rawFinalText ||
         "(no output)";
       return {
         workflowName: workflow.name,
-        agentNames: [...workflow.agentNames],
+        steps: workflow.steps,
         workflowSource: workflow.source,
         workflowFilePath: workflow.filePath ?? null,
         results,
+        state,
         finalText: "",
         isError: true,
-        errorMessage: `Workflow stopped at step ${index + 1} (${agentName}): ${errorMessage}`,
+        errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}): ${errorMessage}`,
       };
     }
 
-    currentInput = getFinalOutput(result.messages);
+    let parseOutcome = parseAgentResult(rawFinalText);
+    let finalResultRecord = primaryResult;
+    let repairedFinalText: string | undefined;
+    let parseError: string | undefined;
+
+    if (!parseOutcome.ok) {
+      parseError = parseOutcome.error;
+      state.steps[index].parseError = parseError;
+      emitDetails();
+
+      const repairResult = await runSingleAgent({
+        defaultCwd: cwd,
+        agents,
+        agentName: step.agent,
+        task: renderRepairPrompt(rawFinalText, parseError),
+        defaultModel,
+        step: index + 1,
+        stepId: step.id,
+        objective: `${workOrder.objective} (repair structured output)`,
+        signal,
+        onUpdate: onUpdate
+          ? (partialResult) => {
+              partialResult.parseError = parseError;
+              partialResult.repairAttempted = true;
+              partialResult.rawFinalText = rawFinalText;
+              emitDetails([...results, partialResult]);
+            }
+          : undefined,
+        systemPromptOverride: REPAIR_SYSTEM_PROMPT,
+        toolsOverride: [],
+      });
+
+      repairedFinalText = getFinalOutput(repairResult.messages);
+      repairResult.rawFinalText = rawFinalText;
+      repairResult.repairedFinalText = repairedFinalText;
+      repairResult.parseError = parseError;
+      repairResult.repairAttempted = true;
+      repairResult.objective = workOrder.objective;
+      finalResultRecord = repairResult;
+
+      if (repairResult.exitCode !== 0 || repairResult.stopReason === "error" || repairResult.stopReason === "aborted") {
+        markStepFailure(state, index, "failed");
+        results.push(finalResultRecord);
+        persistStepResult(
+          persistence,
+          index,
+          step.agent,
+          finalResultRecord,
+          state.steps[index]?.result,
+        );
+        persistWorkflowState(persistence, workflow, state, results);
+        emitDetails();
+        const errorMessage =
+          repairResult.errorMessage ||
+          repairResult.stderr ||
+          repairedFinalText ||
+          "(no output)";
+        return {
+          workflowName: workflow.name,
+          steps: workflow.steps,
+          workflowSource: workflow.source,
+          workflowFilePath: workflow.filePath ?? null,
+          results,
+          state,
+          finalText: "",
+          isError: true,
+          errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}) during structured output repair: ${errorMessage}`,
+        };
+      }
+
+      parseOutcome = parseAgentResult(repairedFinalText);
+    }
+
+    if (!parseOutcome.ok) {
+      finalResultRecord.parseError = parseOutcome.error;
+      finalResultRecord.repairAttempted = true;
+      finalResultRecord.rawFinalText = rawFinalText;
+      finalResultRecord.repairedFinalText = repairedFinalText;
+      markStepFailure(state, index, "failed");
+      results.push(finalResultRecord);
+      persistStepResult(
+        persistence,
+        index,
+        step.agent,
+        finalResultRecord,
+        state.steps[index]?.result,
+      );
+      persistWorkflowState(persistence, workflow, state, results);
+      emitDetails();
+      return {
+        workflowName: workflow.name,
+        steps: workflow.steps,
+        workflowSource: workflow.source,
+        workflowFilePath: workflow.filePath ?? null,
+        results,
+        state,
+        finalText: "",
+        isError: true,
+        errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}): ${parseOutcome.error}`,
+      };
+    }
+
+    const structuredResult = parseOutcome.result;
+    finalResultRecord.structuredStatus = structuredResult.status;
+    finalResultRecord.rawFinalText = rawFinalText;
+    finalResultRecord.repairedFinalText = repairedFinalText;
+    finalResultRecord.parseError = parseError;
+    finalResultRecord.repairAttempted = Boolean(parseError);
+    finalResultRecord.lastWork = structuredResult.summary;
+
+    mergeAgentResultIntoState(
+      state,
+      index,
+      structuredResult,
+      rawFinalText,
+      repairedFinalText,
+      parseError,
+    );
+    results.push(finalResultRecord);
+    persistStepResult(
+      persistence,
+      index,
+      step.agent,
+      finalResultRecord,
+      state.steps[index]?.result,
+    );
+    persistWorkflowState(persistence, workflow, state, results);
+    emitDetails();
+
+    if (structuredResult.status === "blocked" || structuredResult.status === "failed") {
+      return {
+        workflowName: workflow.name,
+        steps: workflow.steps,
+        workflowSource: workflow.source,
+        workflowFilePath: workflow.filePath ?? null,
+        results,
+        state,
+        finalText: "",
+        isError: true,
+        errorMessage: buildStructuredStopMessage(structuredResult, index + 1, step.agent),
+      };
+    }
   }
+
+  completeWorkflowState(state);
+  persistWorkflowState(persistence, workflow, state, results);
 
   return {
     workflowName: workflow.name,
-    agentNames: [...workflow.agentNames],
+    steps: workflow.steps,
     workflowSource: workflow.source,
     workflowFilePath: workflow.filePath ?? null,
     results,
-    finalText:
-      results.length > 0
-        ? getFinalOutput(results[results.length - 1].messages) || "(no output)"
-        : "(no output)",
+    state,
+    finalText: buildFinalTextFromState(state),
     isError: false,
   };
 }

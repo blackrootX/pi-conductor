@@ -542,12 +542,31 @@ function renderWorkflowResult(
       ),
     );
 
-    for (const step of details.results) {
+    const shared = details.state.shared;
+    container.addChild(
+      new Text(
+        theme.fg(
+          "muted",
+          `decisions:${shared.decisions.length} learnings:${shared.learnings.length} blockers:${shared.blockers.length} verification:${shared.verification.length}`,
+        ),
+        0,
+        0,
+      ),
+    );
+
+    for (let index = 0; index < details.results.length; index++) {
+      const step = details.results[index];
+      const stateStep = details.state.steps[index];
       const stepIcon = isErrorResult(step)
         ? theme.fg("error", "✗")
         : theme.fg("success", "✓");
       const displayItems = getDisplayItems(step.messages);
-      const finalOutput = getFinalOutput(step.messages);
+      const finalOutput =
+        step.lastWork ||
+        stateStep?.result?.summary ||
+        step.repairedFinalText ||
+        step.rawFinalText ||
+        getFinalOutput(step.messages);
 
       container.addChild(new Spacer(1));
       container.addChild(
@@ -558,8 +577,19 @@ function renderWorkflowResult(
         ),
       );
       container.addChild(
-        new Text(theme.fg("muted", "Input: ") + theme.fg("dim", step.task), 0, 0),
+        new Text(
+          theme.fg("muted", "Objective: ") +
+            theme.fg("dim", step.objective || stateStep?.objective || step.task),
+          0,
+          0,
+        ),
       );
+
+      if (step.parseError) {
+        container.addChild(
+          new Text(theme.fg("warning", `Parse repair: ${step.parseError}`), 0, 0),
+        );
+      }
 
       for (const item of displayItems) {
         if (item.type !== "toolCall") continue;
@@ -603,13 +633,41 @@ function renderWorkflowResult(
     theme.fg("accent", details.workflowName) +
     theme.fg("muted", ` (${details.workflowSource})`);
 
-  for (const step of details.results) {
+  text +=
+    "\n" +
+    theme.fg(
+      "muted",
+      `decisions:${details.state.shared.decisions.length} learnings:${details.state.shared.learnings.length} blockers:${details.state.shared.blockers.length} verification:${details.state.shared.verification.length}`,
+    );
+
+  for (let index = 0; index < details.results.length; index++) {
+    const step = details.results[index];
+    const stateStep = details.state.steps[index];
     const stepIcon = isErrorResult(step)
       ? theme.fg("error", "✗")
       : theme.fg("success", "✓");
     const displayItems = getDisplayItems(step.messages);
+    const finalOutput =
+      step.lastWork ||
+      stateStep?.result?.summary ||
+      step.repairedFinalText ||
+      step.rawFinalText ||
+      getFinalOutput(step.messages);
     text += `\n\n${theme.fg("muted", `─── Step ${step.step}: `)}${theme.fg("accent", step.agent)}${theme.fg("muted", ` (${step.agentSource}) `)}${stepIcon}`;
-    if (displayItems.length === 0) {
+    text += `\n${theme.fg("muted", "Objective: ")}${theme.fg("dim", step.objective || stateStep?.objective || step.task)}`;
+    if (step.parseError) {
+      text += `\n${theme.fg("warning", `Parse repair: ${step.parseError}`)}`;
+    }
+    if (finalOutput) {
+      text += `\n${theme.fg("toolOutput", finalOutput.trim())}`;
+      const toolItems = displayItems.filter((item) => item.type === "toolCall");
+      if (toolItems.length > 0) {
+        text += `\n${renderDisplayItems(toolItems, false, theme, COLLAPSED_ITEM_COUNT)}`;
+        if (toolItems.length > COLLAPSED_ITEM_COUNT) {
+          text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+        }
+      }
+    } else if (displayItems.length === 0) {
       text += `\n${theme.fg("muted", "(no output)")}`;
     } else {
       text += `\n${renderDisplayItems(displayItems, false, theme, COLLAPSED_ITEM_COUNT)}`;
@@ -676,11 +734,9 @@ export default function registerExtension(pi: ExtensionAPI) {
                 content: [
                   {
                     type: "text",
-                    text:
-                      details.results.length > 0
-                        ? getFinalOutput(details.results[details.results.length - 1].messages) ||
-                          "(running...)"
-                        : "(running...)",
+                    text: details.results.length > 0
+                      ? details.results[details.results.length - 1].lastWork || "(running...)"
+                      : "(running...)",
                   },
                 ],
                 details,
@@ -688,16 +744,17 @@ export default function registerExtension(pi: ExtensionAPI) {
             }
           : undefined,
       );
-      if (result.agentNames.length > 0) {
+      if (result.steps.length > 0) {
         setWorkflowCardsWidget(
           ctx,
           buildWorkflowCardPayload(
             {
               workflowName: result.workflowName,
-              agentNames: result.agentNames,
+              steps: result.steps,
               workflowSource: result.workflowSource,
               workflowFilePath: result.workflowFilePath,
               results: result.results,
+              state: result.state,
             },
             false,
             getCurrentModelLabel(ctx),
@@ -715,10 +772,11 @@ export default function registerExtension(pi: ExtensionAPI) {
         ],
         details: {
           workflowName: result.workflowName,
-          agentNames: result.agentNames,
+          steps: result.steps,
           workflowSource: result.workflowSource,
           workflowFilePath: result.workflowFilePath,
           results: result.results,
+          state: result.state,
         },
         isError: result.isError,
       };
@@ -762,8 +820,15 @@ export default function registerExtension(pi: ExtensionAPI) {
           if (workflowConfig) {
             setWorkflowCardsWidget(ctx, {
               workflowName,
-              steps: workflowConfig.agentNames.map((agent) => ({
-                agent,
+              summary: {
+                decisions: 0,
+                learnings: 0,
+                blockers: 0,
+                verification: 0,
+              },
+              steps: workflowConfig.steps.map((step) => ({
+                agent: step.agent,
+                objective: `Run ${step.agent}`,
                 model: getCurrentModelLabel(ctx),
                 status: "pending",
                 elapsedMs: 0,

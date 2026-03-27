@@ -2,16 +2,16 @@
 
 ## Summary
 
-`pi-conductor` should focus first on a workflow-first experience built on top of the imported `subagent` execution and rendering ideas.
+`pi-conductor` should keep a low-opinion workflow authoring model while upgrading the runtime into a small orchestrator.
 
-The user-facing entrypoint is `/workflow`. The internal orchestration layer can still reuse and refactor the current `subagent` code, but `subagent` is not part of the public product surface.
+The user-facing entrypoint remains `/workflow`. The internal orchestration layer is `conductor`, but users should not need to learn a new workflow DSL or rewrite their agents to adopt the current model.
 
-The first shipped experience is a built-in sequential workflow:
+The shipped baseline is still a sequential workflow system:
 
 - built-in agents: `plan`, `build`
 - built-in workflow: `plan-build`
 
-The goal is to let a user run:
+The goal is still to let a user run:
 
 ```text
 /workflow "implement auth"
@@ -23,13 +23,13 @@ or:
 /workflow plan-build "implement auth"
 ```
 
-with a strong live UI in Pi, and with optional automatic Zellij mirroring when Pi is already running inside Zellij.
+with a strong live UI in Pi, optional automatic Zellij mirroring, and more reliable step handoff inside the runtime.
 
 ## Public UX
 
 ### Slash command
 
-`/workflow` should be implemented as a real extension slash command, not just a prompt alias.
+`/workflow` is a real extension slash command.
 
 Supported behavior:
 
@@ -58,11 +58,9 @@ Precedence:
 
 If the same workflow name exists in multiple places, the higher-precedence source wins.
 
-Built-in workflows should still appear in the picker and be labeled with source `built-in`.
-
 ## Workflow File Format
 
-`workflow.yaml` should stay intentionally small.
+`workflow.yaml` stays intentionally small.
 
 Example:
 
@@ -81,12 +79,12 @@ Rules:
 
 - one file can define multiple named workflows
 - each workflow is a mapping from workflow name to ordered agent names
-- v1 does not include per-step config in YAML
+- the current version still does not include per-step config in YAML
 - if a referenced agent does not exist, validation fails before execution starts
 
 ## Agent Sources
 
-Agents are loaded from normal Pi locations and should not use the old symlink installation pattern from the upstream example.
+Agents are loaded from normal Pi locations.
 
 Agent lookup sources:
 
@@ -100,51 +98,35 @@ Precedence:
 2. global
 3. built-in
 
-Built-in agent names for v1:
+Built-in agent names:
 
 - `plan`
 - `build`
 
-User-defined or project-defined agents may override those names.
+User-defined or project-defined agents may override those names. They do not need extra workflow-specific frontmatter.
 
 ## Workflow Execution Semantics
 
-The execution model is sequential.
-
-The workflow definition:
-
-```yaml
-plan-build:
-  - plan
-  - build
-```
-
-means:
+The execution model is sequential. The workflow file still only describes order:
 
 1. `plan` runs first
 2. `build` runs second
 
-Step input rules:
+Inside the runtime, the handoff is orchestrated:
 
-- first step receives the user task
-- each later step receives only the previous step's output
-
-So for:
-
-```text
-/workflow "implement auth"
-```
-
-the handoff is:
-
-1. `plan` receives `implement auth`
-2. `build` receives only the text output from `plan`
+1. the runtime builds a `WorkOrder` from `WorkflowState`
+2. the step receives a runtime-injected structured response contract
+3. the step returns a marker-block JSON result plus optional natural language
+4. the runtime parses and validates the result
+5. if parsing fails, the runtime does one repair retry
+6. the parsed result is merged into shared workflow state
+7. the next step receives a projection of that shared state
 
 Failure behavior:
 
 - validate the entire workflow before starting
-- fail fast on the first missing or failing step
-- final tool result should emphasize the final step output plus a workflow step summary
+- fail fast on the first missing, blocked, invalid, or failing step
+- final tool result comes from aggregated workflow state, not just the last assistant message
 
 ## Built-in Agent Intent
 
@@ -152,32 +134,31 @@ Failure behavior:
 
 Purpose:
 
-- transform the user task into implementation-ready instructions for the next step
+- transform the user task into implementation-ready guidance for the workflow
 
 Expected output style:
 
 - concise
 - code-oriented
-- directly usable by `build`
-- free-form text, not a rigid schema
+- still flexible in prose
+- compliant with the runtime-injected structured result contract
 
 ### `build`
 
 Purpose:
 
-- execute from the previous step's output
+- execute from the orchestrator-provided workflow context
 
 Expected behavior:
 
 - inspect the repository
-- implement the change
+- implement the change when implementation is actually requested
 - report the outcome clearly
-
-`build` should assume planner output is normal free-form text.
+- return the structured result block required by the runtime
 
 ## UI and Rendering
 
-The current upstream `subagent` rendering is the baseline for workflow UI.
+The current subagent rendering is still the baseline for workflow UI.
 
 Reuse heavily:
 
@@ -186,6 +167,7 @@ Reuse heavily:
 - per-step text updates
 - final rendered markdown output
 - usage summaries where helpful
+- workflow-state summaries where helpful
 
 Outside Zellij:
 
@@ -199,13 +181,11 @@ Inside Zellij:
 - do not create one pane per step
 - keep the pane open after completion with final status visible
 
-The side pane should display a real live Pi/subagent-style workflow view, not a simplified text mirror.
+The side pane should display a real live workflow view, not a simplified text mirror.
 
 ## Zellij Behavior
 
-Zellij support is visualization only in v1.
-
-The workflow still runs as one orchestrated extension execution.
+Zellij support is visualization only in the current version.
 
 Rules:
 
@@ -213,10 +193,10 @@ Rules:
 - if Pi is not running inside Zellij, do not try to launch external Zellij UI
 - show a lightweight completion notification
 - support clean abort behavior
-- pause, resume, and step retry are out of scope for v1
+- pause, resume, and manual step retry are out of scope
 
 ## Notes
 
 - `conductor` is an internal orchestration layer, not the user-facing command
-- `/team` is deferred and should not drive the first implementation
-- the first milestone should prioritize a strong `/workflow` experience over broader multi-agent features
+- parallel steps, DAGs, resume, automatic agent selection, teams, and team-workflow are out of scope here
+- config, hooks, and skill/include loading are deferred to later versions

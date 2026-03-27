@@ -28,10 +28,11 @@ const BUILT_IN_AGENTS: AgentConfig[] = [
     source: "built-in",
     systemPrompt: [
       "You are the planning step in a coding workflow.",
-      "Your job is to inspect the repository and turn the input into a concise implementation plan for the next agent.",
+      "Inspect the repository and turn the task into concise, implementation-ready guidance.",
+      "You are reporting to the workflow orchestrator, not directly to the next agent.",
       "Be concrete and code-oriented.",
       "Do not modify files.",
-      "Output plain text that another agent can directly execute.",
+      "Follow the runtime response contract exactly.",
     ].join("\n"),
   },
   {
@@ -41,9 +42,11 @@ const BUILT_IN_AGENTS: AgentConfig[] = [
     source: "built-in",
     systemPrompt: [
       "You are the build step in a coding workflow.",
-      "Treat the provided input as the implementation instructions from the previous workflow step.",
+      "Treat the provided context as the current workflow state and execute the required implementation work.",
+      "You are reporting to the workflow orchestrator, not directly to the next agent.",
       "Inspect the repository, make the required changes, and explain what you completed.",
       "Prefer concrete execution over high-level planning.",
+      "Follow the runtime response contract exactly.",
     ].join("\n"),
   },
 ];

@@ -36,12 +36,18 @@ function renderWorkflow(details, finalMessage, isRunning = false, animationTick 
   const lines = [];
   lines.push(`workflow: ${details.workflowName} (${details.workflowSource})`);
   if (details.workflowFilePath) lines.push(`source: ${details.workflowFilePath}`);
+  lines.push(
+    `state: decisions=${details.state.shared.decisions.length} learnings=${details.state.shared.learnings.length} blockers=${details.state.shared.blockers.length} verification=${details.state.shared.verification.length}`,
+  );
   lines.push("");
 
-  for (const result of details.results) {
+  for (let index = 0; index < details.results.length; index++) {
+    const result = details.results[index];
+    const stateStep = details.state.steps[index];
     const icon = isErrorResult(result) ? "[x]" : "[✓]";
     lines.push(`${icon} step ${result.step}: ${result.agent} (${result.agentSource})`);
-    lines.push(`input: ${result.task}`);
+    lines.push(`objective: ${result.objective || stateStep?.objective || result.task}`);
+    if (result.parseError) lines.push(`repair: ${result.parseError}`);
 
     const assistantMessages = result.messages.filter((message) => message.role === "assistant");
     const latestMessage = assistantMessages[assistantMessages.length - 1];
@@ -52,7 +58,12 @@ function renderWorkflow(details, finalMessage, isRunning = false, animationTick 
           lines.push(`  -> ${part.name} ${preview}`);
         }
       }
-      const finalOutput = getFinalOutput(result.messages);
+      const finalOutput =
+        result.lastWork ||
+        stateStep?.result?.summary ||
+        result.repairedFinalText ||
+        result.rawFinalText ||
+        getFinalOutput(result.messages);
       if (finalOutput) {
         const preview = finalOutput.split("\n").slice(0, 8);
         for (const line of preview) {
@@ -137,7 +148,7 @@ function buildWorkflowSummary(details, finalMessage, isRunning) {
   }
 
   const output =
-    truncateSummary(finalMessage || (latestStep ? getFinalOutput(latestStep.messages) : ""));
+    truncateSummary(finalMessage || details.state.shared.summary || (latestStep ? latestStep.lastWork : ""));
   if (output) parts.push(output);
 
   return parts.join("\n\n");
@@ -218,10 +229,11 @@ async function main() {
     buildWorkflowCardPayload(
       {
         workflowName: result.workflowName,
-        agentNames: result.agentNames,
+        steps: result.steps,
         workflowSource: result.workflowSource,
         workflowFilePath: result.workflowFilePath,
         results: result.results,
+        state: result.state,
       },
       false,
       defaultModel,
@@ -230,10 +242,11 @@ async function main() {
   latestRenderState = {
     details: {
       workflowName: result.workflowName,
-      agentNames: result.agentNames,
+      steps: result.steps,
       workflowSource: result.workflowSource,
       workflowFilePath: result.workflowFilePath,
       results: result.results,
+      state: result.state,
     },
     finalMessage: result.isError ? result.errorMessage : result.finalText,
     isRunning: false,

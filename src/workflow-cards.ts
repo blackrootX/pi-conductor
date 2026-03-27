@@ -5,14 +5,22 @@ export type WorkflowCardStatus = "pending" | "running" | "done" | "error";
 
 export interface WorkflowCardState {
   agent: string;
+  objective: string;
   model?: string;
   status: WorkflowCardStatus;
   elapsedMs: number;
   lastWork: string;
+  repairAttempted?: boolean;
 }
 
 export interface WorkflowCardPayload {
   workflowName: string;
+  summary: {
+    decisions: number;
+    learnings: number;
+    blockers: number;
+    verification: number;
+  };
   steps: WorkflowCardState[];
 }
 
@@ -140,11 +148,15 @@ function renderCard(
   styler: Styler,
   animationTick: number,
 ): string[] {
-  const innerWidth = Math.max(16, columnWidth - 2);
+  const innerWidth = Math.max(18, columnWidth - 2);
   const title = truncateText(buildTitle(state.agent, state.model), innerWidth - 1);
+  const objective = state.objective.trim()
+    ? truncateText(state.objective.trim().replace(/\s+/g, " "), innerWidth - 1)
+    : "—";
   const elapsed =
     state.status === "pending" ? "" : ` ${Math.max(0, Math.round(state.elapsedMs / 1000))}s`;
-  const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${elapsed}`;
+  const repairLabel = state.repairAttempted ? " repair" : "";
+  const statusLabel = `${getStatusIcon(state.status, animationTick)} ${state.status}${repairLabel}${elapsed}`;
   const lastWork = state.lastWork.trim()
     ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
     : "—";
@@ -156,6 +168,7 @@ function renderCard(
   return [
     top,
     stylePaddedLine(` ${styler.accent(styler.bold(title))}`, innerWidth, borderStyle),
+    stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, borderStyle),
     stylePaddedLine(` ${getStatusText(state.status, statusLabel, styler)}`, innerWidth, borderStyle),
     stylePaddedLine(
       ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
@@ -186,7 +199,7 @@ function renderRows(
   if (steps.length === 0) return [styler.dim("No workflow steps yet.")];
 
   const arrowWidth = 5;
-  const minCardWidth = 20;
+  const minCardWidth = 26;
   const cardsPerRow = Math.max(
     1,
     Math.min(
@@ -208,7 +221,7 @@ function renderRows(
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
     const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
-    const connectorRow = 2;
+    const connectorRow = 3;
 
     for (let line = 0; line < cards[0].length; line++) {
       let row = cards[0][line];
@@ -230,40 +243,41 @@ function renderRows(
 
 export function buildWorkflowCardPayload(
   details: WorkflowDetails,
-  isRunning: boolean,
+  _isRunning: boolean,
   defaultModel?: string,
 ): WorkflowCardPayload {
-  const steps = details.agentNames.map((agentName, index) => {
-    const result = details.results.find((item) => item.step === index + 1);
-    if (!result) {
-      return {
-        agent: agentName,
-        model: defaultModel,
-        status: "pending" as const,
-        elapsedMs: 0,
-        lastWork: "",
-      };
-    }
-
-    const isLatestResult = details.results[details.results.length - 1]?.step === result.step;
+  const steps = details.steps.map((step, index) => {
+    const result = details.results.find((item) => item.stepId === step.id || item.step === index + 1);
+    const stateStep = details.state.steps[index];
+    const stepStatus = stateStep?.status ?? "pending";
     const status: WorkflowCardStatus =
-      result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"
+      stepStatus === "failed" || stepStatus === "blocked"
         ? "error"
-        : isRunning && isLatestResult
+        : stepStatus === "running"
           ? "running"
-          : "done";
+          : stepStatus === "done"
+            ? "done"
+            : "pending";
 
     return {
-      agent: agentName,
-      model: result.model ?? defaultModel,
+      agent: step.agent,
+      objective: stateStep?.objective ?? `Run ${step.agent}`,
+      model: result?.model ?? defaultModel,
       status,
-      elapsedMs: result.elapsedMs ?? 0,
-      lastWork: result.lastWork ?? "",
+      elapsedMs: result?.elapsedMs ?? 0,
+      lastWork: result?.lastWork ?? stateStep?.result?.summary ?? "",
+      repairAttempted: result?.repairAttempted,
     };
   });
 
   return {
     workflowName: details.workflowName,
+    summary: {
+      decisions: details.state.shared.decisions.length,
+      learnings: details.state.shared.learnings.length,
+      blockers: details.state.shared.blockers.length,
+      verification: details.state.shared.verification.length,
+    },
     steps,
   };
 }
@@ -279,6 +293,9 @@ export function renderWorkflowCardLines(
   return [
     styler.dim("Workflow"),
     styler.accent(styler.bold(payload.workflowName)),
+    styler.muted(
+      `decisions:${payload.summary.decisions} learnings:${payload.summary.learnings} blockers:${payload.summary.blockers} verification:${payload.summary.verification}`,
+    ),
     "",
     ...renderRows(payload.steps, width, styler, animationTick),
   ];

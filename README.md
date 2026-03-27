@@ -1,17 +1,23 @@
 # pi-conductor
 
-Workflow-first Pi extension built on top of the upstream subagent execution model.
+Workflow-first Pi extension for running user-defined agents as lightweight sequential workflows.
 
 ## What It Does
 
-`pi-conductor` turns the imported subagent chain execution into a workflow product:
+`pi-conductor` adds a small orchestration layer on top of Pi agents:
 
 - public command: `/workflow`
 - internal tool/orchestrator: `conductor`
 - built-in agents: `plan`, `build`
 - built-in workflow: `plan-build`
 
-The first version focuses on sequential workflows.
+The public authoring model stays intentionally simple:
+
+- workflows stay as ordered `string[]` lists in YAML
+- agents stay as normal Pi markdown agents
+- the plugin injects a structured workflow contract at runtime
+- step-to-step handoff goes through orchestrator state, not raw previous-step text
+- if a step fails to produce structured output, the runtime does one repair retry
 
 ## Usage
 
@@ -60,7 +66,7 @@ review-fix:
   - review
 ```
 
-Each workflow is just a name mapped to an ordered list of agent names.
+Each workflow is still just a name mapped to an ordered list of agent names.
 
 ## Agent Definitions
 
@@ -71,27 +77,38 @@ Agents are loaded from:
 - built-in defaults
 
 Built-in agents can be overridden by project or global agents with the same name.
+User-defined agents do not need extra workflow-specific frontmatter.
 
 ## Execution Model
 
-Workflow steps run sequentially.
+Workflow steps run sequentially, but the internal handoff is orchestrated.
 
-Input handoff is intentionally simple:
+For each step, `pi-conductor`:
 
-- step 1 receives the user task
-- each later step receives only the previous step's output
+1. builds a `WorkOrder` from the current shared workflow state
+2. wraps the step with a structured response contract
+3. parses the step output into a structured `AgentResult`
+4. merges that result back into orchestrator-owned state
+5. uses the updated state to prepare the next step
 
-That means the built-in `plan-build` flow behaves like this:
+This keeps the public authoring model small while making the runtime handoff more reliable.
 
-1. `plan` receives the user task
-2. `build` receives the planner output
+The structured contract is enforced by the runtime. Agents are asked to return a JSON block between:
+
+```text
+[WORKFLOW_RESULT_BEGIN]
+{ ... }
+[WORKFLOW_RESULT_END]
+```
+
+Free-form explanation outside the marker block is allowed. If parsing fails, the runtime attempts one repair retry before stopping the workflow.
 
 ## UI Behavior
 
 Outside Zellij:
 
 - the workflow runs in the current Pi session
-- UI reuses the upstream subagent-style streaming workflow display
+- UI shows workflow state, step objectives, and per-step progress
 
 Inside Zellij:
 
@@ -99,6 +116,19 @@ Inside Zellij:
 - the left Pi session stays blocked until the workflow finishes
 - the right pane shows one unified live workflow view for the workflow run
 - when the workflow finishes, the right pane asks whether to close or stay open
+
+Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
+
+## Current Scope
+
+`v2` is still sequential only. It does not add:
+
+- parallel steps
+- DAG workflows
+- resume
+- automatic agent selection
+- teams or team-workflow
+- config, hooks, or skill/include loading
 
 ## Development
 
@@ -144,3 +174,5 @@ pi remove https://github.com/blackrootX/pi-conductor
 ## Docs
 
 - [Workflow plan](./docs/workflow-plan.md)
+- [v2 plan](./docs/planv2.md)
+- [v2 tasks](./docs/taskv2.md)

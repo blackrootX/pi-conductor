@@ -2,17 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { parse as parseYaml } from "yaml";
+import type {
+  WorkflowConfig,
+  WorkflowSource,
+  WorkflowStepConfig,
+} from "./workflow-types.js";
+
+export { type WorkflowConfig, type WorkflowSource, type WorkflowStepConfig } from "./workflow-types.js";
 
 export const DEFAULT_WORKFLOW_NAME = "plan-build";
-
-export type WorkflowSource = "built-in" | "global" | "project";
-
-export interface WorkflowConfig {
-  name: string;
-  agentNames: string[];
-  source: WorkflowSource;
-  filePath?: string;
-}
 
 export interface WorkflowDiscoveryResult {
   workflows: WorkflowConfig[];
@@ -20,10 +18,17 @@ export interface WorkflowDiscoveryResult {
   globalWorkflowFile: string;
 }
 
+function normalizeWorkflowSteps(agentNames: string[]): WorkflowStepConfig[] {
+  return agentNames.map((agent, index) => ({
+    id: `step-${String(index + 1).padStart(2, "0")}`,
+    agent,
+  }));
+}
+
 const BUILT_IN_WORKFLOWS: WorkflowConfig[] = [
   {
     name: DEFAULT_WORKFLOW_NAME,
-    agentNames: ["plan", "build"],
+    steps: normalizeWorkflowSteps(["plan", "build"]),
     source: "built-in",
   },
 ];
@@ -46,6 +51,24 @@ function findNearestProjectWorkflowFile(cwd: string): string | null {
     if (parentDir === currentDir) return null;
     currentDir = parentDir;
   }
+}
+
+export function normalizeWorkflowConfig(
+  name: string,
+  agentNames: string[],
+  source: WorkflowSource,
+  filePath?: string,
+): WorkflowConfig | undefined {
+  const normalizedAgentNames = agentNames.filter(
+    (item): item is string => typeof item === "string" && item.trim().length > 0,
+  );
+  if (normalizedAgentNames.length === 0) return undefined;
+  return {
+    name,
+    steps: normalizeWorkflowSteps(normalizedAgentNames),
+    source,
+    filePath,
+  };
 }
 
 function loadWorkflowsFromFile(
@@ -73,16 +96,8 @@ function loadWorkflowsFromFile(
   const workflows: WorkflowConfig[] = [];
   for (const [name, value] of Object.entries(data)) {
     if (!name || !Array.isArray(value)) continue;
-    const agentNames = value.filter(
-      (item): item is string => typeof item === "string" && item.trim().length > 0,
-    );
-    if (agentNames.length === 0) continue;
-    workflows.push({
-      name,
-      agentNames,
-      source,
-      filePath,
-    });
+    const workflow = normalizeWorkflowConfig(name, value, source, filePath);
+    if (workflow) workflows.push(workflow);
   }
 
   return workflows;
