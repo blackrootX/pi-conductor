@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig, AgentSource } from "./agents.js";
 import { discoverAgents } from "./agents.js";
+import { runWorkflowAgentSession } from "./workflow-agent-session.js";
 import {
   applyOnStepErrorPatch,
   createImmutableHookSnapshot,
@@ -117,20 +116,6 @@ type WorkflowPersistence = {
   runDir: string;
   stepsDir: string;
 };
-
-const TOOL_POLICY_ENV = "PI_CONDUCTOR_ENFORCE_TOOLS";
-const ALLOWED_TOOLS_ENV = "PI_CONDUCTOR_ALLOWED_TOOLS";
-
-function writePromptToTempFile(
-  agentName: string,
-  prompt: string,
-): { dir: string; filePath: string } {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tempDir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-  return { dir: tempDir, filePath };
-}
 
 export function getFinalOutput(messages: Message[]): string {
   for (let index = messages.length - 1; index >= 0; index--) {
@@ -350,181 +335,19 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
     };
   }
 
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  const resolvedModel = agent.model ?? defaultModel;
-  if (resolvedModel) args.push("--model", resolvedModel);
-
-  const tools = toolsOverride ?? agent.tools;
-  const hasExplicitToolPolicy = toolsOverride !== undefined || agent.tools !== undefined;
-  if (tools && tools.length > 0) {
-    args.push("--tools", tools.join(","));
-  }
-
-  let tempPromptDir: string | null = null;
-  let tempPromptPath: string | null = null;
-
-  const currentResult: SingleResult = {
-    agent: agentName,
-    agentSource: agent.source,
+  return runWorkflowAgentSession({
+    cwd: defaultCwd,
+    agent,
     task,
-    objective,
-    exitCode: 0,
-    elapsedMs: 0,
-    lastWork: "",
-    messages: [],
-    stderr: "",
-    usage: makeEmptyUsage(),
-    model: resolvedModel,
+    defaultModel,
     step,
     stepId,
-  };
-
-  const emitUpdate = () => {
-    currentResult.elapsedMs = Date.now() - startTime;
-    currentResult.lastWork = getFinalOutput(currentResult.messages);
-    onUpdate?.({ ...currentResult, messages: [...currentResult.messages] });
-  };
-  const startTime = Date.now();
-
-  try {
-    const systemPrompt = systemPromptOverride ?? agent.systemPrompt;
-    if (systemPrompt.trim()) {
-      const tempPrompt = writePromptToTempFile(agent.name, systemPrompt);
-      tempPromptDir = tempPrompt.dir;
-      tempPromptPath = tempPrompt.filePath;
-      args.push("--append-system-prompt", tempPromptPath);
-    }
-
-    args.push(task);
-    let wasAborted = false;
-
-    const exitCode = await new Promise<number>((resolve) => {
-      const proc = spawn("pi", args, {
-        cwd: defaultCwd,
-        env: hasExplicitToolPolicy
-          ? {
-              ...process.env,
-              [TOOL_POLICY_ENV]: "1",
-              [ALLOWED_TOOLS_ENV]: tools?.join(",") ?? "",
-            }
-          : process.env,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let buffer = "";
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: unknown;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-
-        if (
-          typeof event === "object" &&
-          event !== null &&
-          "type" in event &&
-          "message" in event &&
-          (event as { type?: string }).type === "message_end"
-        ) {
-          const message = (event as { message?: Message }).message;
-          if (!message) return;
-          currentResult.messages.push(message);
-
-          if (message.role === "assistant") {
-            currentResult.usage.turns++;
-            const usage = message.usage;
-            if (usage) {
-              currentResult.usage.input += usage.input || 0;
-              currentResult.usage.output += usage.output || 0;
-              currentResult.usage.cacheRead += usage.cacheRead || 0;
-              currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-              currentResult.usage.cost += usage.cost?.total || 0;
-              currentResult.usage.contextTokens = usage.totalTokens || 0;
-            }
-            if (!currentResult.model && message.model) {
-              currentResult.model = message.model;
-            }
-            if (message.stopReason) currentResult.stopReason = message.stopReason;
-            if (message.errorMessage) currentResult.errorMessage = message.errorMessage;
-          }
-          emitUpdate();
-        }
-
-        if (
-          typeof event === "object" &&
-          event !== null &&
-          "type" in event &&
-          "message" in event &&
-          (event as { type?: string }).type === "tool_result_end"
-        ) {
-          const message = (event as { message?: Message }).message;
-          if (!message) return;
-          currentResult.messages.push(message);
-          emitUpdate();
-        }
-      };
-
-      proc.stdout.on("data", (data) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
-      });
-
-      proc.stderr.on("data", (data) => {
-        currentResult.stderr += data.toString();
-      });
-
-      const interval = onUpdate ? setInterval(() => emitUpdate(), 1000) : null;
-
-      proc.on("close", (code) => {
-        if (interval) clearInterval(interval);
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
-      });
-
-      proc.on("error", () => {
-        if (interval) clearInterval(interval);
-        resolve(1);
-      });
-
-      if (signal) {
-        const killProc = () => {
-          wasAborted = true;
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 5000);
-        };
-        if (signal.aborted) killProc();
-        else signal.addEventListener("abort", killProc, { once: true });
-      }
-    });
-
-    currentResult.exitCode = exitCode;
-    currentResult.elapsedMs = Date.now() - startTime;
-    currentResult.lastWork = getFinalOutput(currentResult.messages);
-    if (wasAborted) throw new Error("Workflow step was aborted");
-    return currentResult;
-  } finally {
-    if (tempPromptPath) {
-      try {
-        fs.unlinkSync(tempPromptPath);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (tempPromptDir) {
-      try {
-        fs.rmdirSync(tempPromptDir);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
+    objective,
+    signal,
+    onUpdate,
+    systemPromptOverride,
+    toolsOverride,
+  });
 }
 
 export async function runWorkflowByName(
@@ -535,6 +358,7 @@ export async function runWorkflowByName(
   signal?: AbortSignal,
   onUpdate?: WorkflowUpdateCallback,
   runtimeHooks: WorkflowRuntimeHooks = {},
+  runId = randomUUID(),
 ): Promise<WorkflowRunResult> {
   const { agents } = discoverAgents(cwd);
   const { workflows } = discoverWorkflows(cwd);
@@ -550,7 +374,7 @@ export async function runWorkflowByName(
       state: createWorkflowState(
         { name: workflowName, steps: [], source: "built-in" },
         task,
-        randomUUID(),
+        runId,
       ),
       finalText: "",
       isError: true,
@@ -568,14 +392,14 @@ export async function runWorkflowByName(
       workflowSource: workflow.source,
       workflowFilePath: workflow.filePath ?? null,
       results: [],
-      state: createWorkflowState(workflow, task, randomUUID()),
+      state: createWorkflowState(workflow, task, runId),
       finalText: "",
       isError: true,
       errorMessage: `Workflow "${workflow.name}" cannot start. Missing agents: ${missingAgents.join(", ")}.`,
     };
   }
 
-  const state = createWorkflowState(workflow, task, randomUUID());
+  const state = createWorkflowState(workflow, task, runId);
   const persistence = createPersistence(cwd, state.runId);
   const results: SingleResult[] = [];
   const hooks = runtimeHooks;

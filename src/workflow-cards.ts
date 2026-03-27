@@ -1,39 +1,15 @@
 import type { Theme } from "@mariozechner/pi-coding-agent";
-import {
-  getBlockedWorkItems,
-  getDoneWorkItems,
-  getOpenWorkItems,
-  getUnresolvedWorkItems,
-} from "./workflow-work-items.js";
 import type { WorkflowDetails } from "./workflow-runtime.js";
+import {
+  buildWorkflowPresentation,
+  type WorkflowPresentationPayload,
+  type WorkflowPresentationStep,
+  type WorkflowPresentationStepStatus,
+} from "./workflow-presentation.js";
 
-export type WorkflowCardStatus = "pending" | "running" | "done" | "error";
-
-export interface WorkflowCardState {
-  agent: string;
-  objective: string;
-  model?: string;
-  status: WorkflowCardStatus;
-  elapsedMs: number;
-  lastWork: string;
-  repairAttempted?: boolean;
-  currentFocus?: string;
-  topPendingWorkItem?: string;
-}
-
-export interface WorkflowCardPayload {
-  workflowName: string;
-  summary: {
-    openWorkItems: number;
-    doneWorkItems: number;
-    blockedWorkItems: number;
-    blockers: number;
-    decisions: number;
-    learnings: number;
-    verification: number;
-  };
-  steps: WorkflowCardState[];
-}
+export type WorkflowCardStatus = WorkflowPresentationStepStatus;
+export type WorkflowCardState = WorkflowPresentationStep;
+export type WorkflowCardPayload = WorkflowPresentationPayload;
 
 export interface WorkflowCardRenderOptions {
   animationTick?: number;
@@ -260,67 +236,12 @@ function renderRows(
   return output;
 }
 
-function deriveCurrentFocus(details: WorkflowDetails): string | undefined {
-  const explicitFocus = details.state.shared.focus?.trim();
-  if (explicitFocus) return explicitFocus;
-  return getUnresolvedWorkItems(details.state.shared.workItems)[0]?.title;
-}
-
-function formatTopPendingWorkItem(details: WorkflowDetails): string | undefined {
-  const item = getUnresolvedWorkItems(details.state.shared.workItems)[0];
-  if (!item) return undefined;
-  const parts = [item.title, item.status];
-  if (item.priority) parts.push(item.priority);
-  return parts.join(" | ");
-}
-
 export function buildWorkflowCardPayload(
   details: WorkflowDetails,
   _isRunning: boolean,
   defaultModel?: string,
 ): WorkflowCardPayload {
-  const currentFocus = deriveCurrentFocus(details);
-  const topPendingWorkItem = formatTopPendingWorkItem(details);
-
-  const steps = details.steps.map((step, index) => {
-    const result = details.results.find((item) => item.stepId === step.id || item.step === index + 1);
-    const stateStep = details.state.steps[index];
-    const stepStatus = stateStep?.status ?? "pending";
-    const status: WorkflowCardStatus =
-      stepStatus === "failed" || stepStatus === "blocked"
-        ? "error"
-        : stepStatus === "running"
-          ? "running"
-          : stepStatus === "done"
-            ? "done"
-            : "pending";
-
-    return {
-      agent: step.agent,
-      objective: stateStep?.objective ?? `Run ${step.agent}`,
-      model: result?.model ?? defaultModel,
-      status,
-      elapsedMs: result?.elapsedMs ?? 0,
-      lastWork: result?.lastWork ?? stateStep?.result?.summary ?? "",
-      repairAttempted: result?.repairAttempted,
-      currentFocus,
-      topPendingWorkItem,
-    };
-  });
-
-  return {
-    workflowName: details.workflowName,
-    summary: {
-      openWorkItems: getOpenWorkItems(details.state.shared.workItems).length,
-      doneWorkItems: getDoneWorkItems(details.state.shared.workItems).length,
-      blockedWorkItems: getBlockedWorkItems(details.state.shared.workItems).length,
-      blockers: details.state.shared.blockers.length,
-      decisions: details.state.shared.decisions.length,
-      learnings: details.state.shared.learnings.length,
-      verification: details.state.shared.verification.length,
-    },
-    steps,
-  };
+  return buildWorkflowPresentation(details, defaultModel);
 }
 
 export function renderWorkflowCardLines(

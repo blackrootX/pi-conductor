@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -34,12 +35,26 @@ import {
   buildWorkflowCardPayload,
   renderWorkflowCardLines,
 } from "./workflow-cards.js";
+import { registerWorkflowMessageRenderer } from "./workflow-message-renderer.js";
 import {
   getBlockedWorkItems,
   getDoneWorkItems,
   getOpenWorkItems,
   getUnresolvedWorkItems,
 } from "./workflow-work-items.js";
+import {
+  WORKFLOW_MESSAGE_TYPE,
+  appendWorkflowRunFinished,
+  appendWorkflowRunStarted,
+  appendWorkflowSelection,
+  appendWorkflowStepFinished,
+  appendWorkflowStepUpdated,
+  buildWorkflowMessageContent,
+  createInitialWorkflowDetails,
+  createWorkflowMessageDetails,
+  createWorkflowSessionSnapshot,
+  getLatestWorkflowSnapshot,
+} from "./workflow-session-entries.js";
 import type { WorkflowRuntimeHooks } from "./workflow-hooks.js";
 import type { SharedState } from "./workflow-types.js";
 
@@ -258,6 +273,28 @@ function tokenizeCommandArgs(input: string): string[] {
   return tokens;
 }
 
+function getWorkflowArgumentCompletions(
+  cwd: string,
+  prefix: string,
+): Array<{ value: string; label: string }> | null {
+  const trimmedPrefix = prefix.trimStart();
+  const tokens = tokenizeCommandArgs(trimmedPrefix);
+  const isCompletingWorkflowName =
+    trimmedPrefix.length === 0 || !/\s/.test(trimmedPrefix);
+
+  if (!isCompletingWorkflowName) return null;
+
+  const workflowPrefix = tokens[0] ?? "";
+  const completions = discoverWorkflows(cwd).workflows
+    .filter((workflow) => workflow.name.startsWith(workflowPrefix))
+    .map((workflow) => ({
+      value: workflow.name,
+      label: `${workflow.name} (${workflow.source})`,
+    }));
+
+  return completions.length > 0 ? completions : null;
+}
+
 function isInsideZellij(): boolean {
   return Boolean(
     process.env.ZELLIJ ||
@@ -330,7 +367,11 @@ function setWorkflowCardsWidget(
   ctx: ExtensionContext,
   payload: WorkflowCardPayload | undefined,
 ) {
-  if (!payload || !ctx.hasUI) return;
+  if (!ctx.hasUI) return;
+  if (!payload) {
+    ctx.ui.setWidget("workflow-cards", undefined);
+    return;
+  }
 
   ctx.ui.setWidget(
     "workflow-cards",
@@ -467,6 +508,151 @@ function buildMainSessionSummary(
       : `Workflow ${workflowName} failed.`,
     type: "error",
   };
+}
+
+type WorkflowProgressTracker = {
+  previousDetails?: WorkflowDetails;
+  lastPresentationFingerprint?: string;
+};
+
+function buildWorkflowSessionName(workflowName: string, task: string): string {
+  const normalizedTask = task.trim().replace(/\s+/g, " ");
+  if (!normalizedTask) return `workflow:${workflowName}`;
+  const preview =
+    normalizedTask.length > 48
+      ? `${normalizedTask.slice(0, 45).trimEnd()}...`
+      : normalizedTask;
+  return `workflow:${workflowName} - ${preview}`;
+}
+
+function describeUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.trim() || error.name;
+  }
+  return typeof error === "string" ? error.trim() || "Unknown error" : "Unknown error";
+}
+
+function getWorkflowPresentationFingerprint(
+  snapshot: ReturnType<typeof createWorkflowSessionSnapshot>,
+): string {
+  return JSON.stringify({
+    workflowName: snapshot.presentation.workflowName,
+    runId: snapshot.presentation.runId,
+    status: snapshot.presentation.status,
+    currentStepIndex: snapshot.presentation.currentStepIndex,
+    currentStepNumber: snapshot.presentation.currentStepNumber,
+    currentStepAgent: snapshot.presentation.currentStepAgent,
+    currentStepObjective: snapshot.presentation.currentStepObjective,
+    currentFocus: snapshot.presentation.currentFocus,
+    topPendingWorkItem: snapshot.presentation.topPendingWorkItem,
+    lastProgress: snapshot.presentation.lastProgress,
+    summary: snapshot.presentation.summary,
+    blockers: snapshot.presentation.blockers,
+    decisions: snapshot.presentation.decisions,
+    learnings: snapshot.presentation.learnings,
+    verification: snapshot.presentation.verification,
+    openWorkItems: snapshot.presentation.openWorkItems,
+    doneWorkItems: snapshot.presentation.doneWorkItems,
+    blockedWorkItems: snapshot.presentation.blockedWorkItems,
+    steps: snapshot.presentation.steps.map((step) => ({
+      stepNumber: step.stepNumber,
+      stepId: step.stepId,
+      agent: step.agent,
+      objective: step.objective,
+      model: step.model,
+      status: step.status,
+      rawStatus: step.rawStatus,
+      lastWork: step.lastWork,
+      repairAttempted: step.repairAttempted,
+      currentFocus: step.currentFocus,
+      topPendingWorkItem: step.topPendingWorkItem,
+      parseError: step.parseError,
+    })),
+  });
+}
+
+function emitWorkflowMessage(
+  pi: ExtensionAPI,
+  event: "run-started" | "step-updated" | "step-finished" | "run-finished",
+  snapshot: ReturnType<typeof createWorkflowMessageDetails>["snapshot"],
+): void {
+  const details = createWorkflowMessageDetails(event, snapshot);
+  pi.sendMessage(
+    {
+      customType: WORKFLOW_MESSAGE_TYPE,
+      content: buildWorkflowMessageContent(details),
+      display: true,
+      details,
+    },
+    { triggerTurn: false },
+  );
+}
+
+function syncWorkflowProgress(
+  pi: ExtensionAPI,
+  tracker: WorkflowProgressTracker,
+  details: WorkflowDetails,
+  currentModel?: string,
+): void {
+  const previous = tracker.previousDetails;
+  if (!previous) {
+    tracker.previousDetails = details;
+    return;
+  }
+
+  let liveSnapshot: ReturnType<typeof createWorkflowSessionSnapshot> | undefined;
+  const ensureLiveSnapshot = () => {
+    liveSnapshot ??= createWorkflowSessionSnapshot(details, currentModel);
+    return liveSnapshot;
+  };
+  const recordEmission = (
+    snapshot: ReturnType<typeof createWorkflowSessionSnapshot>,
+  ) => {
+    tracker.lastPresentationFingerprint = getWorkflowPresentationFingerprint(snapshot);
+  };
+  let emittedTransitionUpdate = false;
+
+  for (let index = 0; index < details.state.steps.length; index++) {
+    const previousStatus = previous.state.steps[index]?.status;
+    const nextStatus = details.state.steps[index]?.status;
+    if (!nextStatus || previousStatus === nextStatus) continue;
+
+    if (nextStatus === "running") {
+      const snapshot = appendWorkflowStepUpdated(pi, details, currentModel);
+      recordEmission(snapshot);
+      emitWorkflowMessage(pi, "step-updated", snapshot);
+      emittedTransitionUpdate = true;
+      continue;
+    }
+
+    if (
+      nextStatus === "done" ||
+      nextStatus === "blocked" ||
+      nextStatus === "failed"
+    ) {
+      const snapshot = appendWorkflowStepFinished(pi, details, currentModel);
+      recordEmission(snapshot);
+      emitWorkflowMessage(pi, "step-finished", snapshot);
+      emittedTransitionUpdate = true;
+    }
+  }
+
+  const currentStep = details.state.steps[details.state.currentStepIndex];
+  if (!emittedTransitionUpdate && currentStep?.status === "running") {
+    const snapshot = ensureLiveSnapshot();
+    const nextFingerprint = getWorkflowPresentationFingerprint(snapshot);
+    if (nextFingerprint !== tracker.lastPresentationFingerprint) {
+      recordEmission(snapshot);
+      emitWorkflowMessage(pi, "step-updated", snapshot);
+    }
+  }
+
+  tracker.previousDetails = details;
+}
+
+function restoreWorkflowSummaryWidget(ctx: ExtensionContext): void {
+  const snapshot = getLatestWorkflowSnapshot(ctx.sessionManager);
+  setWorkflowCardsWidget(ctx, snapshot?.presentation);
 }
 
 async function resolveWorkflowCommandInput(
@@ -785,6 +971,33 @@ function getWorkflowAllowedToolsFromEnv(): string[] | null {
 }
 
 export default function registerExtension(pi: ExtensionAPI) {
+  let commandCompletionCwd = process.cwd();
+  const updateCommandCompletionCwd = (cwd: string) => {
+    commandCompletionCwd = cwd;
+  };
+
+  registerWorkflowMessageRenderer(pi);
+
+  pi.on("context", async (event) => ({
+    messages: event.messages.filter(
+      (message) =>
+        !(
+          message.role === "custom" &&
+          message.customType === WORKFLOW_MESSAGE_TYPE
+        ),
+    ),
+  }));
+
+  const restoreWorkflowUi = (_event: unknown, ctx: ExtensionContext) => {
+    updateCommandCompletionCwd(ctx.cwd);
+    restoreWorkflowSummaryWidget(ctx);
+  };
+
+  pi.on("session_start", restoreWorkflowUi);
+  pi.on("session_switch", restoreWorkflowUi);
+  pi.on("session_fork", restoreWorkflowUi);
+  pi.on("session_tree", restoreWorkflowUi);
+
   const workflowAllowedTools = getWorkflowAllowedToolsFromEnv();
   if (workflowAllowedTools) {
     const allowedToolSet = new Set(workflowAllowedTools);
@@ -821,76 +1034,144 @@ export default function registerExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtimeCwd = params.cwd ?? ctx.cwd;
+      updateCommandCompletionCwd(runtimeCwd);
       const currentModel = getCurrentModelLabel(ctx);
-      const runtimeHooks = await resolveWorkflowRuntimeHooks({
-        cwd: runtimeCwd,
+      const workflowConfig = discoverWorkflows(runtimeCwd).workflows.find(
+        (workflow) => workflow.name === params.workflow,
+      );
+      const runId = randomUUID();
+      const tracker: WorkflowProgressTracker = {};
+
+      pi.setSessionName(buildWorkflowSessionName(params.workflow, params.task));
+      appendWorkflowSelection(pi, {
         workflowName: params.workflow,
         task: params.task,
-        defaultModel: currentModel,
+        cwd: runtimeCwd,
+        selectedAt: new Date().toISOString(),
       });
-      const result = await runWorkflowByName(
-        runtimeCwd,
-        params.workflow,
-        params.task,
-        currentModel,
-        signal,
-        onUpdate
-          ? (details) => {
-              setWorkflowCardsWidget(
-                ctx,
-                buildWorkflowCardPayload(details, true, currentModel),
-              );
-              onUpdate({
-                content: [
-                  {
-                    type: "text",
-                    text: details.results.length > 0
-                      ? details.results[details.results.length - 1].lastWork || "(running...)"
-                      : "(running...)",
-                  },
-                ],
-                details,
-              });
-            }
-          : undefined,
-        runtimeHooks,
-      );
-      if (result.steps.length > 0) {
+
+      if (workflowConfig) {
+        const initialDetails = createInitialWorkflowDetails(
+          workflowConfig,
+          params.task,
+          runId,
+        );
+        tracker.previousDetails = initialDetails;
         setWorkflowCardsWidget(
           ctx,
-          buildWorkflowCardPayload(
-            {
-              workflowName: result.workflowName,
-              steps: result.steps,
-              workflowSource: result.workflowSource,
-              workflowFilePath: result.workflowFilePath,
-              results: result.results,
-              state: result.state,
-            },
-            false,
-            currentModel,
-          ),
+          buildWorkflowCardPayload(initialDetails, true, currentModel),
         );
+        const snapshot = appendWorkflowRunStarted(pi, initialDetails, currentModel);
+        tracker.lastPresentationFingerprint = getWorkflowPresentationFingerprint(snapshot);
+        emitWorkflowMessage(pi, "run-started", snapshot);
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: result.isError
-              ? result.errorMessage || "(workflow failed)"
-              : result.finalText,
-          },
-        ],
-        details: {
+
+      try {
+        const runtimeHooks = await resolveWorkflowRuntimeHooks({
+          cwd: runtimeCwd,
+          workflowName: params.workflow,
+          task: params.task,
+          defaultModel: currentModel,
+        });
+        const handleWorkflowUpdate = (details: WorkflowDetails) => {
+          setWorkflowCardsWidget(
+            ctx,
+            buildWorkflowCardPayload(details, true, currentModel),
+          );
+          syncWorkflowProgress(pi, tracker, details, currentModel);
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: details.results.length > 0
+                  ? details.results[details.results.length - 1].lastWork ||
+                    "(running...)"
+                  : "(running...)",
+              },
+            ],
+            details,
+          });
+        };
+
+        const result = await runWorkflowByName(
+          runtimeCwd,
+          params.workflow,
+          params.task,
+          currentModel,
+          signal,
+          handleWorkflowUpdate,
+          runtimeHooks,
+          runId,
+        );
+        const finalDetails = {
           workflowName: result.workflowName,
           steps: result.steps,
           workflowSource: result.workflowSource,
           workflowFilePath: result.workflowFilePath,
           results: result.results,
           state: result.state,
-        },
-        isError: result.isError,
-      };
+        };
+
+        if (result.steps.length > 0) {
+          setWorkflowCardsWidget(
+            ctx,
+            buildWorkflowCardPayload(finalDetails, false, currentModel),
+          );
+          const snapshot = appendWorkflowRunFinished(
+            pi,
+            finalDetails,
+            {
+              finalText: result.finalText,
+              errorMessage: result.errorMessage,
+              isError: result.isError,
+            },
+            currentModel,
+          );
+          emitWorkflowMessage(pi, "run-finished", snapshot);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: result.isError
+                ? result.errorMessage || "(workflow failed)"
+                : result.finalText,
+            },
+          ],
+          details: finalDetails,
+          isError: result.isError,
+        };
+      } catch (error) {
+        const message = describeUnknownError(error);
+        const fallbackDetails = tracker.previousDetails;
+        if (fallbackDetails) {
+          const failedDetails: WorkflowDetails = {
+            ...fallbackDetails,
+            state: {
+              ...fallbackDetails.state,
+              status: "failed",
+              finishedAt: new Date().toISOString(),
+            },
+          };
+          const snapshot = appendWorkflowRunFinished(
+            pi,
+            failedDetails,
+            {
+              finalText: "",
+              errorMessage: message,
+              isError: true,
+            },
+            currentModel,
+          );
+          emitWorkflowMessage(pi, "run-finished", snapshot);
+          setWorkflowCardsWidget(
+            ctx,
+            buildWorkflowCardPayload(failedDetails, false, currentModel),
+          );
+        }
+        throw error;
+      }
     },
 
     renderCall(args, theme) {
@@ -909,7 +1190,10 @@ export default function registerExtension(pi: ExtensionAPI) {
   pi.registerCommand("workflow", {
     description:
       'Run a workflow. Examples: `/workflow "implement auth"` or `/workflow plan-build "implement auth"`.',
+    getArgumentCompletions: (prefix) =>
+      getWorkflowArgumentCompletions(commandCompletionCwd, prefix),
     handler: async (args, ctx) => {
+      updateCommandCompletionCwd(ctx.cwd);
       const resolved = await resolveWorkflowCommandInput(args, ctx);
       if (!resolved) return;
 
@@ -929,28 +1213,19 @@ export default function registerExtension(pi: ExtensionAPI) {
             (workflow) => workflow.name === workflowName,
           );
           if (workflowConfig) {
-            setWorkflowCardsWidget(ctx, {
-              workflowName,
-              summary: {
-                openWorkItems: 0,
-                doneWorkItems: 0,
-                blockedWorkItems: 0,
-                blockers: 0,
-                decisions: 0,
-                learnings: 0,
-                verification: 0,
-              },
-              steps: workflowConfig.steps.map((step) => ({
-                agent: step.agent,
-                objective: `Run ${step.agent}`,
-                model: getCurrentModelLabel(ctx),
-                status: "pending",
-                elapsedMs: 0,
-                lastWork: "",
-                currentFocus: undefined,
-                topPendingWorkItem: undefined,
-              })),
-            });
+            const initialDetails = createInitialWorkflowDetails(
+              workflowConfig,
+              task,
+              randomUUID(),
+            );
+            setWorkflowCardsWidget(
+              ctx,
+              buildWorkflowCardPayload(
+                initialDetails,
+                true,
+                getCurrentModelLabel(ctx),
+              ),
+            );
           }
           ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
           try {
