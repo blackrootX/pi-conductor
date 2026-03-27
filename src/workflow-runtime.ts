@@ -6,6 +6,18 @@ import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig, AgentSource } from "./agents.js";
 import { discoverAgents } from "./agents.js";
+import {
+  applyOnStepErrorPatch,
+  createImmutableHookSnapshot,
+  mergeAfterStepPatch,
+  mergeBeforeStepPatch,
+  mergeOnStepErrorPatch,
+  mergeSharedStatePatch,
+  type OnStepErrorPatch,
+  type WorkflowRuntimeError,
+  type WorkflowRuntimeErrorStage,
+  type WorkflowRuntimeHooks,
+} from "./workflow-hooks.js";
 import { renderRepairPrompt, renderStructuredStepPrompt } from "./workflow-prompts.js";
 import { parseAgentResult } from "./workflow-result.js";
 import {
@@ -58,6 +70,7 @@ export interface SingleResult {
   parseError?: string;
   repairAttempted?: boolean;
   structuredStatus?: AgentResult["status"];
+  diagnostics?: string[];
 }
 
 export interface WorkflowDetails {
@@ -207,6 +220,7 @@ function persistStepResult(
     rawFinalText: result.rawFinalText,
     repairedFinalText: result.repairedFinalText,
     parsedResult: parsedResult ?? null,
+    diagnostics: result.diagnostics ?? null,
     usage: result.usage,
     model: result.model,
     stderr: result.stderr,
@@ -239,6 +253,67 @@ function buildStructuredStopMessage(
     result.blockers?.map((item) => item.issue).filter(Boolean).join("; ") ?? "";
   const suffix = blockerDetails ? ` ${blockerDetails}` : "";
   return `Workflow stopped at step ${stepNumber} (${agentName}): ${result.status}.${suffix}`.trim();
+}
+
+function describeUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    const message = error.message.trim();
+    return message || error.name || "Unknown error";
+  }
+  if (typeof error === "string") {
+    const trimmed = error.trim();
+    return trimmed || "Unknown error";
+  }
+  return "Unknown error";
+}
+
+function mergeDiagnostics(
+  current: string[] | undefined,
+  patch: string[] | undefined,
+): string[] | undefined {
+  if (!patch || patch.length === 0) return current;
+  const merged = new Set<string>();
+  for (const item of current ?? []) {
+    const trimmed = item.trim();
+    if (trimmed) merged.add(trimmed);
+  }
+  for (const item of patch) {
+    const trimmed = item.trim();
+    if (trimmed) merged.add(trimmed);
+  }
+  return Array.from(merged.values());
+}
+
+function createSyntheticFailureResult(options: {
+  agentName: string;
+  agentSource: AgentSource | "unknown";
+  task: string;
+  objective: string;
+  step: number;
+  stepId: string;
+  stderr: string;
+  model?: string;
+}): SingleResult {
+  return {
+    agent: options.agentName,
+    agentSource: options.agentSource,
+    task: options.task,
+    objective: options.objective,
+    exitCode: 1,
+    elapsedMs: 0,
+    lastWork: "",
+    messages: [],
+    stderr: options.stderr,
+    usage: makeEmptyUsage(),
+    model: options.model,
+    step: options.step,
+    stepId: options.stepId,
+  };
+}
+
+function markWorkflowFailed(state: WorkflowState): void {
+  state.status = "failed";
+  state.finishedAt = new Date().toISOString();
 }
 
 async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleResult> {
@@ -459,6 +534,7 @@ export async function runWorkflowByName(
   defaultModel?: string,
   signal?: AbortSignal,
   onUpdate?: WorkflowUpdateCallback,
+  runtimeHooks: WorkflowRuntimeHooks = {},
 ): Promise<WorkflowRunResult> {
   const { agents } = discoverAgents(cwd);
   const { workflows } = discoverWorkflows(cwd);
@@ -502,73 +578,252 @@ export async function runWorkflowByName(
   const state = createWorkflowState(workflow, task, randomUUID());
   const persistence = createPersistence(cwd, state.runId);
   const results: SingleResult[] = [];
+  const hooks = runtimeHooks;
 
   const emitDetails = (partialResults = results) => {
     onUpdate?.(makeWorkflowDetails(workflow, partialResults, state));
   };
+
+  const runOnStepErrorHook = async (
+    input: Parameters<NonNullable<WorkflowRuntimeHooks["onStepError"]>>[0],
+  ): Promise<OnStepErrorPatch | undefined> => {
+    if (!hooks.onStepError) return undefined;
+
+    try {
+      const patch = await hooks.onStepError(input);
+      return patch ?? undefined;
+    } catch (hookError) {
+      return mergeOnStepErrorPatch(undefined, {
+        diagnostics: [`onStepError hook failed: ${describeUnknownError(hookError)}`],
+      });
+    }
+  };
+
+  const failStep = async (options: {
+    index: number;
+    step: WorkflowConfig["steps"][number];
+    agent: AgentConfig | undefined;
+    workOrder?: ReturnType<typeof buildWorkOrder>;
+    stage: WorkflowRuntimeErrorStage;
+    error: unknown;
+    resultRecord?: SingleResult;
+    rawFinalText?: string;
+    repairedFinalText?: string;
+    parseError?: string;
+    messagePrefix: string;
+  }): Promise<WorkflowRunResult> => {
+    const {
+      index,
+      step,
+      agent,
+      workOrder,
+      stage,
+      error,
+      rawFinalText,
+      repairedFinalText,
+      parseError,
+      messagePrefix,
+    } = options;
+
+    const workflowError: WorkflowRuntimeError = {
+      stage,
+      workflowName: workflow.name,
+      stepIndex: index,
+      stepId: step.id,
+      agent: step.agent,
+      message: describeUnknownError(error),
+      stderr: options.resultRecord?.stderr,
+      rawFinalText,
+      repairedFinalText,
+      parseError,
+    };
+
+    let errorPatch = await runOnStepErrorHook({
+      cwd,
+      workflow: createImmutableHookSnapshot(workflow),
+      agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+      state: createImmutableHookSnapshot(state),
+      stepIndex: index,
+      workOrder: workOrder
+        ? createImmutableHookSnapshot(workOrder)
+        : undefined,
+      error: createImmutableHookSnapshot(workflowError),
+    });
+
+    applyOnStepErrorPatch(state, index, errorPatch);
+
+    const failureResult =
+      options.resultRecord ??
+      createSyntheticFailureResult({
+        agentName: step.agent,
+        agentSource: agent?.source ?? "unknown",
+        task: workOrder ? renderStructuredStepPrompt(workOrder) : task,
+        objective: workOrder?.objective ?? state.steps[index]?.objective ?? "",
+        step: index + 1,
+        stepId: step.id,
+        stderr: workflowError.message,
+        model: agent?.model ?? defaultModel,
+      });
+
+    failureResult.objective = workOrder?.objective ?? failureResult.objective;
+    failureResult.rawFinalText = rawFinalText ?? failureResult.rawFinalText;
+    failureResult.repairedFinalText =
+      repairedFinalText ?? failureResult.repairedFinalText;
+    failureResult.parseError = parseError ?? failureResult.parseError;
+    failureResult.diagnostics = mergeDiagnostics(
+      failureResult.diagnostics,
+      errorPatch?.diagnostics,
+    );
+    if (errorPatch?.summary?.trim()) {
+      failureResult.lastWork = errorPatch.summary.trim();
+    }
+
+    markStepFailure(state, index, "failed");
+    results.push(failureResult);
+    persistStepResult(
+      persistence,
+      index,
+      step.agent,
+      failureResult,
+      state.steps[index]?.result,
+    );
+    persistWorkflowState(persistence, workflow, state, results);
+    emitDetails();
+
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      results,
+      state,
+      finalText: "",
+      isError: true,
+      errorMessage: `${messagePrefix}: ${workflowError.message}`,
+    };
+  };
+
+  try {
+    const beforeWorkflowPatch = await hooks.beforeWorkflow?.({
+      cwd,
+      workflow: createImmutableHookSnapshot(workflow),
+      agents: createImmutableHookSnapshot(agents),
+      defaultModel,
+      state: createImmutableHookSnapshot(state),
+    });
+    if (beforeWorkflowPatch?.shared) {
+      state.shared = mergeSharedStatePatch(state.shared, beforeWorkflowPatch.shared);
+    }
+  } catch (error) {
+    markWorkflowFailed(state);
+    persistWorkflowState(persistence, workflow, state, results);
+    emitDetails();
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      results,
+      state,
+      finalText: "",
+      isError: true,
+      errorMessage: `Workflow "${workflow.name}" could not start: ${describeUnknownError(error)}`,
+    };
+  }
 
   persistWorkflowState(persistence, workflow, state, results);
 
   for (let index = 0; index < workflow.steps.length; index++) {
     const step = workflow.steps[index];
     const agent = agents.find((item) => item.name === step.agent);
-    const workOrder = buildWorkOrder(state, step, agent, index);
+    let workOrder = buildWorkOrder(state, step, agent, index);
     state.steps[index].objective = workOrder.objective;
     markStepRunning(state, index);
     persistWorkflowState(persistence, workflow, state, results);
     emitDetails();
 
+    try {
+      const beforeStepPatch = await hooks.beforeStep?.({
+        cwd,
+        workflow: createImmutableHookSnapshot(workflow),
+        agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+        state: createImmutableHookSnapshot(state),
+        stepIndex: index,
+        workOrder: createImmutableHookSnapshot(workOrder),
+      });
+      workOrder = mergeBeforeStepPatch(workOrder, beforeStepPatch ?? undefined);
+    } catch (error) {
+      return await failStep({
+        index,
+        step,
+        agent,
+        workOrder,
+        stage: "beforeStep",
+        error,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent}) during beforeStep hook`,
+      });
+    }
+
+    state.steps[index].objective = workOrder.objective;
+    persistWorkflowState(persistence, workflow, state, results);
+    emitDetails();
+
     const stepPrompt = renderStructuredStepPrompt(workOrder);
 
-    const primaryResult = await runSingleAgent({
-      defaultCwd: cwd,
-      agents,
-      agentName: step.agent,
-      task: stepPrompt,
-      defaultModel,
-      step: index + 1,
-      stepId: step.id,
-      objective: workOrder.objective,
-      signal,
-      onUpdate: onUpdate
-        ? (partialResult) => {
-            emitDetails([...results, partialResult]);
-          }
-        : undefined,
-    });
+    let primaryResult: SingleResult;
+    try {
+      primaryResult = await runSingleAgent({
+        defaultCwd: cwd,
+        agents,
+        agentName: step.agent,
+        task: stepPrompt,
+        defaultModel,
+        step: index + 1,
+        stepId: step.id,
+        objective: workOrder.objective,
+        signal,
+        onUpdate: onUpdate
+          ? (partialResult) => {
+              emitDetails([...results, partialResult]);
+            }
+          : undefined,
+      });
+    } catch (error) {
+      return await failStep({
+        index,
+        step,
+        agent,
+        workOrder,
+        stage: "agent",
+        error,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent})`,
+      });
+    }
 
     const rawFinalText = getFinalOutput(primaryResult.messages);
     primaryResult.rawFinalText = rawFinalText;
     primaryResult.objective = workOrder.objective;
 
-    if (primaryResult.exitCode !== 0 || primaryResult.stopReason === "error" || primaryResult.stopReason === "aborted") {
-      markStepFailure(state, index, "failed");
-      results.push(primaryResult);
-      persistStepResult(
-        persistence,
+    if (
+      primaryResult.exitCode !== 0 ||
+      primaryResult.stopReason === "error" ||
+      primaryResult.stopReason === "aborted"
+    ) {
+      return await failStep({
         index,
-        step.agent,
-        primaryResult,
-        state.steps[index]?.result,
-      );
-      persistWorkflowState(persistence, workflow, state, results);
-      emitDetails();
-      const errorMessage =
-        primaryResult.errorMessage ||
-        primaryResult.stderr ||
-        rawFinalText ||
-        "(no output)";
-      return {
-        workflowName: workflow.name,
-        steps: workflow.steps,
-        workflowSource: workflow.source,
-        workflowFilePath: workflow.filePath ?? null,
-        results,
-        state,
-        finalText: "",
-        isError: true,
-        errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}): ${errorMessage}`,
-      };
+        step,
+        agent,
+        workOrder,
+        stage: "agent",
+        error:
+          primaryResult.errorMessage ||
+          primaryResult.stderr ||
+          rawFinalText ||
+          "(no output)",
+        resultRecord: primaryResult,
+        rawFinalText,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent})`,
+      });
     }
 
     let parseOutcome = parseAgentResult(rawFinalText);
@@ -579,29 +834,45 @@ export async function runWorkflowByName(
     if (!parseOutcome.ok) {
       parseError = parseOutcome.error;
       state.steps[index].parseError = parseError;
+      persistWorkflowState(persistence, workflow, state, results);
       emitDetails();
 
-      const repairResult = await runSingleAgent({
-        defaultCwd: cwd,
-        agents,
-        agentName: step.agent,
-        task: renderRepairPrompt(rawFinalText, parseError),
-        defaultModel,
-        step: index + 1,
-        stepId: step.id,
-        objective: `${workOrder.objective} (repair structured output)`,
-        signal,
-        onUpdate: onUpdate
-          ? (partialResult) => {
-              partialResult.parseError = parseError;
-              partialResult.repairAttempted = true;
-              partialResult.rawFinalText = rawFinalText;
-              emitDetails([...results, partialResult]);
-            }
-          : undefined,
-        systemPromptOverride: REPAIR_SYSTEM_PROMPT,
-        toolsOverride: [],
-      });
+      let repairResult: SingleResult;
+      try {
+        repairResult = await runSingleAgent({
+          defaultCwd: cwd,
+          agents,
+          agentName: step.agent,
+          task: renderRepairPrompt(rawFinalText, parseError),
+          defaultModel,
+          step: index + 1,
+          stepId: step.id,
+          objective: `${workOrder.objective} (repair structured output)`,
+          signal,
+          onUpdate: onUpdate
+            ? (partialResult) => {
+                partialResult.parseError = parseError;
+                partialResult.repairAttempted = true;
+                partialResult.rawFinalText = rawFinalText;
+                emitDetails([...results, partialResult]);
+              }
+            : undefined,
+          systemPromptOverride: REPAIR_SYSTEM_PROMPT,
+          toolsOverride: [],
+        });
+      } catch (error) {
+        return await failStep({
+          index,
+          step,
+          agent,
+          workOrder,
+          stage: "repair",
+          error,
+          rawFinalText,
+          parseError,
+          messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent}) during structured output repair`,
+        });
+      }
 
       repairedFinalText = getFinalOutput(repairResult.messages);
       repairResult.rawFinalText = rawFinalText;
@@ -611,34 +882,28 @@ export async function runWorkflowByName(
       repairResult.objective = workOrder.objective;
       finalResultRecord = repairResult;
 
-      if (repairResult.exitCode !== 0 || repairResult.stopReason === "error" || repairResult.stopReason === "aborted") {
-        markStepFailure(state, index, "failed");
-        results.push(finalResultRecord);
-        persistStepResult(
-          persistence,
+      if (
+        repairResult.exitCode !== 0 ||
+        repairResult.stopReason === "error" ||
+        repairResult.stopReason === "aborted"
+      ) {
+        return await failStep({
           index,
-          step.agent,
-          finalResultRecord,
-          state.steps[index]?.result,
-        );
-        persistWorkflowState(persistence, workflow, state, results);
-        emitDetails();
-        const errorMessage =
-          repairResult.errorMessage ||
-          repairResult.stderr ||
-          repairedFinalText ||
-          "(no output)";
-        return {
-          workflowName: workflow.name,
-          steps: workflow.steps,
-          workflowSource: workflow.source,
-          workflowFilePath: workflow.filePath ?? null,
-          results,
-          state,
-          finalText: "",
-          isError: true,
-          errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}) during structured output repair: ${errorMessage}`,
-        };
+          step,
+          agent,
+          workOrder,
+          stage: "repair",
+          error:
+            repairResult.errorMessage ||
+            repairResult.stderr ||
+            repairedFinalText ||
+            "(no output)",
+          resultRecord: repairResult,
+          rawFinalText,
+          repairedFinalText,
+          parseError,
+          messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent}) during structured output repair`,
+        });
       }
 
       parseOutcome = parseAgentResult(repairedFinalText);
@@ -649,31 +914,57 @@ export async function runWorkflowByName(
       finalResultRecord.repairAttempted = true;
       finalResultRecord.rawFinalText = rawFinalText;
       finalResultRecord.repairedFinalText = repairedFinalText;
-      markStepFailure(state, index, "failed");
-      results.push(finalResultRecord);
-      persistStepResult(
-        persistence,
+      return await failStep({
         index,
-        step.agent,
-        finalResultRecord,
-        state.steps[index]?.result,
-      );
-      persistWorkflowState(persistence, workflow, state, results);
-      emitDetails();
-      return {
-        workflowName: workflow.name,
-        steps: workflow.steps,
-        workflowSource: workflow.source,
-        workflowFilePath: workflow.filePath ?? null,
-        results,
-        state,
-        finalText: "",
-        isError: true,
-        errorMessage: `Workflow stopped at step ${index + 1} (${step.agent}): ${parseOutcome.error}`,
-      };
+        step,
+        agent,
+        workOrder,
+        stage: "parse",
+        error: parseOutcome.error,
+        resultRecord: finalResultRecord,
+        rawFinalText,
+        repairedFinalText,
+        parseError: parseOutcome.error,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent})`,
+      });
     }
 
-    const structuredResult = parseOutcome.result;
+    let structuredResult = parseOutcome.result;
+    try {
+      const afterStepPatch = await hooks.afterStep?.({
+        cwd,
+        workflow: createImmutableHookSnapshot(workflow),
+        agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+        state: createImmutableHookSnapshot(state),
+        stepIndex: index,
+        workOrder: createImmutableHookSnapshot(workOrder),
+        result: createImmutableHookSnapshot(structuredResult),
+      });
+      structuredResult = mergeAfterStepPatch(
+        structuredResult,
+        afterStepPatch ?? undefined,
+      );
+    } catch (error) {
+      finalResultRecord.structuredStatus = structuredResult.status;
+      finalResultRecord.rawFinalText = rawFinalText;
+      finalResultRecord.repairedFinalText = repairedFinalText;
+      finalResultRecord.parseError = parseError;
+      finalResultRecord.repairAttempted = Boolean(parseError);
+      return await failStep({
+        index,
+        step,
+        agent,
+        workOrder,
+        stage: "afterStep",
+        error,
+        resultRecord: finalResultRecord,
+        rawFinalText,
+        repairedFinalText,
+        parseError,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent}) during afterStep hook`,
+      });
+    }
+
     finalResultRecord.structuredStatus = structuredResult.status;
     finalResultRecord.rawFinalText = rawFinalText;
     finalResultRecord.repairedFinalText = repairedFinalText;

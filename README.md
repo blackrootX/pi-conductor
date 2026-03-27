@@ -19,6 +19,7 @@ The public authoring model stays intentionally simple:
 - step-to-step handoff goes through orchestrator state, not raw previous-step text
 - shared state can carry optional work items and a current focus across steps
 - if a step fails to produce structured output, the runtime does one repair retry
+- `v4` adds internal runtime hooks plus built-in-only prompt includes without changing user-facing workflow or agent authoring
 
 ## Usage
 
@@ -80,6 +81,7 @@ Agents are loaded from:
 Built-in agents can be overridden by project or global agents with the same name.
 User-defined agents do not need extra workflow-specific frontmatter.
 `v3` still does not require new frontmatter for work-item support.
+`v4` also does not add user-editable `includes`; internal prompt fragments are reserved for built-in agents only.
 
 ## Execution Model
 
@@ -131,7 +133,7 @@ Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 
 ## Current Scope
 
-`v3` is still sequential only. It does not add:
+`v4` is still sequential only. It adds internal hooks and built-in prompt reuse, but it does not add:
 
 - parallel steps
 - DAG workflows
@@ -141,7 +143,9 @@ Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 - auto-reorder
 - dynamic step insertion
 - teams or team-workflow
-- config, hooks, or skill/include loading
+- public config loading
+- user-editable hooks
+- user-editable skill/include loading
 
 ## Development
 
@@ -191,3 +195,5 @@ pi remove https://github.com/blackrootX/pi-conductor
 - [v2 tasks](./docs/taskv2.md)
 - [v3 plan](./docs/planv3.md)
 - [v3 tasks](./docs/taskv3.md)
+- [v4 plan](./docs/planv4.md)
+- [v4 tasks](./docs/taskv4.md)

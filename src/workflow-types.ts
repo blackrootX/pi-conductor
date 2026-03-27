@@ -105,6 +105,7 @@ export interface StepRunState {
   rawFinalText?: string;
   repairedFinalText?: string;
   parseError?: string;
+  diagnostics?: string[];
 }
 
 export interface WorkflowState {

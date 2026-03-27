@@ -22,6 +22,14 @@ import {
   runWorkflowByName,
 } from "./workflow-runtime.js";
 import {
+  clearWorkflowRuntimeHooks,
+  resolveWorkflowRuntimeHooks,
+  setWorkflowRuntimeHooks,
+  setWorkflowRuntimeHooksProvider,
+  type WorkflowRuntimeHookContext,
+  type WorkflowRuntimeHooksProvider,
+} from "./workflow-hook-registry.js";
+import {
   type WorkflowCardPayload,
   buildWorkflowCardPayload,
   renderWorkflowCardLines,
@@ -32,6 +40,7 @@ import {
   getOpenWorkItems,
   getUnresolvedWorkItems,
 } from "./workflow-work-items.js";
+import type { WorkflowRuntimeHooks } from "./workflow-hooks.js";
 import type { SharedState } from "./workflow-types.js";
 
 const COLLAPSED_ITEM_COUNT = 10;
@@ -812,17 +821,24 @@ export default function registerExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtimeCwd = params.cwd ?? ctx.cwd;
+      const currentModel = getCurrentModelLabel(ctx);
+      const runtimeHooks = await resolveWorkflowRuntimeHooks({
+        cwd: runtimeCwd,
+        workflowName: params.workflow,
+        task: params.task,
+        defaultModel: currentModel,
+      });
       const result = await runWorkflowByName(
         runtimeCwd,
         params.workflow,
         params.task,
-        getCurrentModelLabel(ctx),
+        currentModel,
         signal,
         onUpdate
           ? (details) => {
               setWorkflowCardsWidget(
                 ctx,
-                buildWorkflowCardPayload(details, true, getCurrentModelLabel(ctx)),
+                buildWorkflowCardPayload(details, true, currentModel),
               );
               onUpdate({
                 content: [
@@ -837,6 +853,7 @@ export default function registerExtension(pi: ExtensionAPI) {
               });
             }
           : undefined,
+        runtimeHooks,
       );
       if (result.steps.length > 0) {
         setWorkflowCardsWidget(
@@ -851,7 +868,7 @@ export default function registerExtension(pi: ExtensionAPI) {
               state: result.state,
             },
             false,
-            getCurrentModelLabel(ctx),
+            currentModel,
           ),
         );
       }
@@ -963,3 +980,11 @@ export default function registerExtension(pi: ExtensionAPI) {
     },
   });
 }
+
+export {
+  clearWorkflowRuntimeHooks,
+  resolveWorkflowRuntimeHooks,
+  setWorkflowRuntimeHooks,
+  setWorkflowRuntimeHooksProvider,
+};
+export type { WorkflowRuntimeHookContext, WorkflowRuntimeHooks, WorkflowRuntimeHooksProvider };

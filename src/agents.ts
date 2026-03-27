@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { composeBuiltInPrompt } from "./workflow-prompt-composer.js";
 
 export type AgentSource = "built-in" | "global" | "project";
 
@@ -12,6 +13,7 @@ export interface AgentConfig {
   systemPrompt: string;
   source: AgentSource;
   filePath?: string;
+  internalIncludes?: string[];
 }
 
 export interface AgentDiscoveryResult {
@@ -20,20 +22,21 @@ export interface AgentDiscoveryResult {
   globalAgentsDir: string;
 }
 
-const BUILT_IN_AGENTS: AgentConfig[] = [
+type BuiltInAgentDefinition = Omit<AgentConfig, "systemPrompt"> & {
+  internalIncludes: string[];
+  rolePrompt: string;
+};
+
+const BUILT_IN_AGENTS: BuiltInAgentDefinition[] = [
   {
     name: "plan",
     description: "Planning specialist for the next workflow step",
     tools: ["read", "grep", "find", "ls"],
     source: "built-in",
-    systemPrompt: [
+    internalIncludes: ["workflow-role-common", "plan-style"],
+    rolePrompt: [
       "You are the planning step in a coding workflow.",
-      "Inspect the repository and turn the task into concise, implementation-ready guidance for a later execution step.",
-      "You are reporting to the workflow orchestrator, not directly to the next agent.",
-      "Be concrete and code-oriented, but stay in planning mode.",
-      "Do not modify files, create files, or execute implementation work yourself.",
-      "Use the structured result to propose newWorkItems, blockers, verification, and the next focus.",
-      "Follow the runtime response contract exactly.",
+      "Be concrete and code-oriented while staying strictly in planning mode.",
     ].join("\n"),
   },
   {
@@ -41,16 +44,21 @@ const BUILT_IN_AGENTS: AgentConfig[] = [
     description: "Implementation specialist for workflow execution",
     tools: ["read", "write", "edit", "grep", "find", "ls", "bash"],
     source: "built-in",
-    systemPrompt: [
+    internalIncludes: ["workflow-role-common", "build-style"],
+    rolePrompt: [
       "You are the build step in a coding workflow.",
       "Treat the provided context as the current workflow state and execute the required implementation work.",
-      "You are reporting to the workflow orchestrator, not directly to the next agent.",
-      "Inspect the repository, make the required changes, and explain what you completed.",
-      "Prefer concrete execution over high-level planning.",
-      "Follow the runtime response contract exactly.",
     ].join("\n"),
   },
 ];
+
+function getBuiltInAgents(): AgentConfig[] {
+  return BUILT_IN_AGENTS.map(({ rolePrompt, internalIncludes, ...agent }) => ({
+    ...agent,
+    internalIncludes: [...internalIncludes],
+    systemPrompt: composeBuiltInPrompt(rolePrompt, internalIncludes),
+  }));
+}
 
 function isDirectory(filePath: string): boolean {
   try {
@@ -131,7 +139,7 @@ export function discoverAgents(cwd: string): AgentDiscoveryResult {
 
   const agentMap = new Map<string, AgentConfig>();
 
-  for (const agent of BUILT_IN_AGENTS) agentMap.set(agent.name, agent);
+  for (const agent of getBuiltInAgents()) agentMap.set(agent.name, agent);
   for (const agent of globalAgents) agentMap.set(agent.name, agent);
   for (const agent of projectAgents) agentMap.set(agent.name, agent);
 
