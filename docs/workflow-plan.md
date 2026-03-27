@@ -23,7 +23,7 @@ or:
 /workflow plan-build "implement auth"
 ```
 
-with a strong live UI in Pi, optional automatic Zellij mirroring, and more reliable step handoff inside the runtime.
+with a strong live UI in Pi and more reliable step handoff inside the runtime.
 
 ## Public UX
 
@@ -169,34 +169,11 @@ Reuse heavily:
 - usage summaries where helpful
 - workflow-state summaries where helpful
 
-Outside Zellij:
-
 - display the workflow UI directly in the current Pi session
 - adapt the existing chain-style rendering to workflow terminology
-
-Inside Zellij:
-
-- automatically open a right-side split pane
-- show one unified live workflow view for the whole run
-- do not create one pane per step
-- keep the pane open after completion with final status visible
-
-The side pane should display a real live workflow view, not a simplified text mirror.
-
-## Zellij Behavior
-
-Zellij support is visualization only in the current version.
-
-Rules:
-
-- if Pi is already running inside Zellij, auto-open the workflow pane
-- if Pi is not running inside Zellij, do not try to launch external Zellij UI
-- show a lightweight completion notification
-- support clean abort behavior
-- pause, resume, and manual step retry are out of scope
 
 ## Notes
 
 - `conductor` is an internal orchestration layer, not the user-facing command
-- parallel steps, DAGs, resume, automatic agent selection, teams, and team-workflow are out of scope here
+- parallel steps, DAGs, resume, automatic agent selection, teams, team-workflow, and Zellij pane mirroring are out of scope here
 - config, hooks, and skill/include loading are deferred to later versions

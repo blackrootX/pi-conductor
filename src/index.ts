@@ -1,8 +1,5 @@
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import {
@@ -58,8 +55,6 @@ import type { WorkflowRuntimeHooks } from "./workflow-hooks.js";
 import type { SharedState } from "./workflow-types.js";
 
 const COLLAPSED_ITEM_COUNT = 10;
-const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ZELLIJ_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "workflow-pane.mjs");
 const TOOL_POLICY_ENV = "PI_CONDUCTOR_ENFORCE_TOOLS";
 const ALLOWED_TOOLS_ENV = "PI_CONDUCTOR_ALLOWED_TOOLS";
 
@@ -294,14 +289,6 @@ function getWorkflowArgumentCompletions(
   return completions.length > 0 ? completions : null;
 }
 
-function isInsideZellij(): boolean {
-  return Boolean(
-    process.env.ZELLIJ ||
-      process.env.ZELLIJ_SESSION_NAME ||
-      process.env.ZELLIJ_PANE_ID,
-  );
-}
-
 function buildConductorInstruction(workflowName: string, task: string): string {
   return [
     "Use the `conductor` tool immediately.",
@@ -314,52 +301,6 @@ function buildConductorInstruction(workflowName: string, task: string): string {
 
 function getCurrentModelLabel(ctx: ExtensionContext): string | undefined {
   return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-}
-
-async function launchWorkflowInZellijPane(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  workflowName: string,
-  task: string,
-): Promise<{ launched: boolean; progressFile?: string; statusFile?: string }> {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-zellij-"));
-  const statusFile = path.join(tempDir, "workflow-status.json");
-  const progressFile = path.join(tempDir, "workflow-progress.json");
-  const paneName = `workflow:${workflowName}`;
-
-  try {
-    await pi.exec(
-      "zellij",
-      [
-        "run",
-        "--direction",
-        "right",
-        "--name",
-        paneName,
-        "--cwd",
-        ctx.cwd,
-        "--",
-        process.execPath,
-        ZELLIJ_PANE_SCRIPT,
-        "--workflow",
-        workflowName,
-        "--task",
-        task,
-        "--cwd",
-        ctx.cwd,
-        "--default-model",
-        getCurrentModelLabel(ctx) ?? "",
-        "--progress-file",
-        progressFile,
-        "--status-file",
-        statusFile,
-      ],
-      { cwd: ctx.cwd },
-    );
-    return { launched: true, progressFile, statusFile };
-  } catch {
-    return { launched: false };
-  }
 }
 
 function setWorkflowCardsWidget(
@@ -404,110 +345,6 @@ function setWorkflowCardsWidget(
   );
 }
 
-function tryReadWorkflowCardPayload(progressFile: string): WorkflowCardPayload | undefined {
-  try {
-    const content = fs.readFileSync(progressFile, "utf8");
-    return JSON.parse(content) as WorkflowCardPayload;
-  } catch {
-    return undefined;
-  }
-}
-
-async function waitForWorkflowStatusFile(
-  statusFile: string,
-  progressFile: string | undefined,
-  onProgress?: (payload: WorkflowCardPayload) => void,
-): Promise<{
-  success: boolean;
-  message?: string;
-  summary?: string;
-  closedByUser?: boolean;
-}> {
-  let lastProgressContent = "";
-  while (true) {
-    if (progressFile) {
-      try {
-        const content = fs.readFileSync(progressFile, "utf8");
-        if (content !== lastProgressContent) {
-          lastProgressContent = content;
-          onProgress?.(JSON.parse(content) as WorkflowCardPayload);
-        }
-      } catch {
-        /* still waiting */
-      }
-    }
-
-    try {
-      const content = fs.readFileSync(statusFile, "utf8");
-      const data = JSON.parse(content) as {
-        done?: boolean;
-        success?: boolean;
-        message?: string;
-        summary?: string;
-        closedByUser?: boolean;
-      };
-      if (data.done) {
-        return {
-          success: Boolean(data.success),
-          message: data.message,
-          summary: data.summary,
-          closedByUser: data.closedByUser,
-        };
-      }
-    } catch {
-      /* still waiting */
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-}
-
-function blockMainSessionInput(ctx: ExtensionCommandContext): () => void {
-  if (!ctx.hasUI) return () => {};
-
-  const restoreInput = ctx.ui.onTerminalInput(() => ({ consume: true }));
-  ctx.ui.setWorkingMessage("Workflow running in Zellij. Input is blocked until it finishes.");
-
-  return () => {
-    restoreInput();
-    ctx.ui.setWorkingMessage();
-  };
-}
-
-function buildMainSessionSummary(
-  workflowName: string,
-  status: {
-    success: boolean;
-    message?: string;
-    summary?: string;
-    closedByUser?: boolean;
-  },
-): { text: string; type: "info" | "warning" | "error" } {
-  const summary = status.summary?.trim() || status.message?.trim();
-  if (status.success) {
-    return {
-      text: summary
-        ? `Workflow ${workflowName} finished.\n\n${summary}`
-        : `Workflow ${workflowName} finished.`,
-      type: "info",
-    };
-  }
-
-  if (status.closedByUser) {
-    return {
-      text: summary
-        ? `Workflow ${workflowName} pane was closed.\n\n${summary}`
-        : `Workflow ${workflowName} pane was closed.`,
-      type: "warning",
-    };
-  }
-
-  return {
-    text: summary
-      ? `Workflow ${workflowName} failed.\n\n${summary}`
-      : `Workflow ${workflowName} failed.`,
-    type: "error",
-  };
-}
 
 type WorkflowProgressTracker = {
   previousDetails?: WorkflowDetails;
@@ -1195,54 +1032,6 @@ export default function registerExtension(pi: ExtensionAPI) {
 
       const { workflowName, task } = resolved;
       const instruction = buildConductorInstruction(workflowName, task);
-
-      if (isInsideZellij()) {
-        const launched = await launchWorkflowInZellijPane(
-          pi,
-          ctx,
-          workflowName,
-          task,
-        );
-        if (launched.launched && launched.statusFile) {
-          const unblockInput = blockMainSessionInput(ctx);
-          const workflowConfig = discoverWorkflows(ctx.cwd).workflows.find(
-            (workflow) => workflow.name === workflowName,
-          );
-          if (workflowConfig) {
-            const initialDetails = createInitialWorkflowDetails(
-              workflowConfig,
-              task,
-              randomUUID(),
-            );
-            setWorkflowCardsWidget(
-              ctx,
-              buildWorkflowCardPayload(
-                initialDetails,
-                true,
-                getCurrentModelLabel(ctx),
-              ),
-            );
-          }
-          ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
-          try {
-            const status = await waitForWorkflowStatusFile(
-              launched.statusFile,
-              launched.progressFile,
-              (payload) => setWorkflowCardsWidget(ctx, payload),
-            );
-            const summary = buildMainSessionSummary(workflowName, status);
-            ctx.ui.notify(summary.text, summary.type);
-          } finally {
-            ctx.ui.setStatus("workflow", undefined);
-            unblockInput();
-          }
-          return;
-        }
-        ctx.ui.notify(
-          "Could not open a Zellij pane. Running the workflow in the current Pi session instead.",
-          "warning",
-        );
-      }
 
       await ctx.waitForIdle();
       ctx.ui.setToolsExpanded(true);

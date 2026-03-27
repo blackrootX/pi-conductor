@@ -117,17 +117,8 @@ Free-form explanation outside the marker block is allowed. If parsing fails, the
 
 ## UI Behavior
 
-Outside Zellij:
-
 - the workflow runs in the current Pi session
 - UI shows workflow state, step objectives, and per-step progress
-
-Inside Zellij:
-
-- `/workflow` opens a right-side pane automatically
-- the left Pi session stays blocked until the workflow finishes
-- the right pane shows one unified live workflow view for the workflow run
-- when the workflow finishes, the right pane asks whether to close or stay open
 
 Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 
@@ -143,6 +134,7 @@ Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 - auto-reorder
 - dynamic step insertion
 - teams or team-workflow
+- Zellij pane mirroring
 - public config loading
 - user-editable hooks
 - user-editable skill/include loading
