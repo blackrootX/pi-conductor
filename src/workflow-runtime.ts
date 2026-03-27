@@ -105,6 +105,9 @@ type WorkflowPersistence = {
   stepsDir: string;
 };
 
+const TOOL_POLICY_ENV = "PI_CONDUCTOR_ENFORCE_TOOLS";
+const ALLOWED_TOOLS_ENV = "PI_CONDUCTOR_ALLOWED_TOOLS";
+
 function writePromptToTempFile(
   agentName: string,
   prompt: string,
@@ -277,6 +280,7 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
   if (resolvedModel) args.push("--model", resolvedModel);
 
   const tools = toolsOverride ?? agent.tools;
+  const hasExplicitToolPolicy = toolsOverride !== undefined || agent.tools !== undefined;
   if (tools && tools.length > 0) {
     args.push("--tools", tools.join(","));
   }
@@ -322,6 +326,13 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
     const exitCode = await new Promise<number>((resolve) => {
       const proc = spawn("pi", args, {
         cwd: defaultCwd,
+        env: hasExplicitToolPolicy
+          ? {
+              ...process.env,
+              [TOOL_POLICY_ENV]: "1",
+              [ALLOWED_TOOLS_ENV]: tools?.join(",") ?? "",
+            }
+          : process.env,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });

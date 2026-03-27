@@ -37,6 +37,8 @@ import type { SharedState } from "./workflow-types.js";
 const COLLAPSED_ITEM_COUNT = 10;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ZELLIJ_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "workflow-pane.mjs");
+const TOOL_POLICY_ENV = "PI_CONDUCTOR_ENFORCE_TOOLS";
+const ALLOWED_TOOLS_ENV = "PI_CONDUCTOR_ALLOWED_TOOLS";
 
 const ConductorParams = Type.Object({
   workflow: Type.String({
@@ -763,7 +765,38 @@ function buildAvailableWorkflowText(workflows: WorkflowConfig[]): string {
     .join(", ");
 }
 
+function getWorkflowAllowedToolsFromEnv(): string[] | null {
+  if (process.env[TOOL_POLICY_ENV] !== "1") return null;
+  const raw = process.env[ALLOWED_TOOLS_ENV] ?? "";
+  if (!raw.trim()) return [];
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export default function registerExtension(pi: ExtensionAPI) {
+  const workflowAllowedTools = getWorkflowAllowedToolsFromEnv();
+  if (workflowAllowedTools) {
+    const allowedToolSet = new Set(workflowAllowedTools);
+
+    pi.on("before_agent_start", async () => {
+      pi.setActiveTools(workflowAllowedTools);
+      return undefined;
+    });
+
+    pi.on("tool_call", async (event) => {
+      if (allowedToolSet.has(event.toolName)) return undefined;
+      const allowedList = workflowAllowedTools.length > 0
+        ? workflowAllowedTools.join(", ")
+        : "(no tools allowed)";
+      return {
+        block: true,
+        reason: `Tool "${event.toolName}" is not allowed for this workflow step. Allowed tools: ${allowedList}.`,
+      };
+    });
+  }
+
   pi.registerTool({
     name: "conductor",
     label: "Conductor",

@@ -69,6 +69,14 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
     lines.push("");
   }
 
+  if (workOrder.constraints.length > 0) {
+    lines.push("STEP CONSTRAINTS");
+    for (const constraint of workOrder.constraints) {
+      lines.push(`- ${constraint}`);
+    }
+    lines.push("");
+  }
+
   lines.push("CURRENT CONTEXT");
 
   if (workOrder.context.summary?.trim()) {

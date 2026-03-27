@@ -69,6 +69,40 @@ function deriveCurrentFocus(state: WorkflowState): string | undefined {
   return undefined;
 }
 
+function buildPlanningObjective(
+  step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+  state: WorkflowState,
+  index: number,
+  total: number,
+): string {
+  const stepLabel = `step ${index + 1} of ${total}`;
+  const agentHint = agent?.description?.trim()
+    ? `Use the agent specialty as a hint, not as a rigid role: ${agent.description.trim()}.`
+    : undefined;
+  const currentFocus = deriveCurrentFocus(state);
+  const openWorkItems = getOpenWorkItems(state.shared.workItems);
+  const topOpenWorkTitles = openWorkItems
+    .slice(0, MAX_OBJECTIVE_OPEN_ITEMS)
+    .map((item) => item.title);
+
+  return [
+    `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
+    agentHint,
+    "This is a planning step: inspect the repository and workflow state, but do not implement the task in this step.",
+    topOpenWorkTitles.length > 0
+      ? `Prioritize clarifying, refining, or reordering the currently open work items instead of executing them yourself: ${topOpenWorkTitles.join("; ")}.`
+      : "Break the user's task into actionable `newWorkItems` for a later implementation step. If the task is already complete, verify that through inspection only.",
+    currentFocus
+      ? `Keep the current focus in mind: ${currentFocus}.`
+      : "Identify the best next focus that will help the next step execute efficiently.",
+    "Do not modify files, create files, or claim implementation work you did not perform in this step.",
+    "Use the structured result to record decisions, blockers, verification, and a short focusSummary for the next step.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 function buildGenericObjective(
   step: WorkflowStepConfig,
   agent: AgentConfig | undefined,
@@ -76,6 +110,10 @@ function buildGenericObjective(
   index: number,
   total: number,
 ): string {
+  if (step.agent === "plan") {
+    return buildPlanningObjective(step, agent, state, index, total);
+  }
+
   const stepLabel = `step ${index + 1} of ${total}`;
   const agentHint = agent?.description?.trim()
     ? `Use the agent specialty as a hint, not as a rigid role: ${agent.description.trim()}.`
@@ -171,6 +209,18 @@ export function buildWorkOrder(
   ).map((item) => ({ ...item }));
   const currentFocus = deriveCurrentFocus(state);
 
+  const constraints = [
+    "You are reporting to the workflow orchestrator, not speaking directly to the next agent.",
+    "Return the required structured result block exactly once.",
+    "Do not rely on free-form prose alone for critical workflow state.",
+  ];
+  if (step.agent === "plan") {
+    constraints.push(
+      "This is a planning step. Do not modify files, create files, or otherwise change repository state.",
+      "Do not use write, edit, or implementation commands to complete the task yourself. Hand execution to a later step via newWorkItems or verified context.",
+    );
+  }
+
   return {
     stepId: step.id,
     agent: step.agent,
@@ -188,11 +238,7 @@ export function buildWorkOrder(
       recentResolvedWorkItems,
       currentFocus,
     },
-    constraints: [
-      "You are reporting to the workflow orchestrator, not speaking directly to the next agent.",
-      "Return the required structured result block exactly once.",
-      "Do not rely on free-form prose alone for critical workflow state.",
-    ],
+    constraints,
     expectedOutput: [
       "summary",
       "decisions",
