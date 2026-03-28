@@ -718,6 +718,11 @@ function renderWorkflowResult(
     container.addChild(
       new Text(theme.fg("dim", `Run artifacts: ${details.runDir}`), 0, 0),
     );
+    if (details.state.status === "blocked") {
+      container.addChild(
+        new Text(theme.fg("warning", "Reply with clarification to continue."), 0, 0),
+      );
+    }
 
     for (let index = 0; index < details.results.length; index++) {
       const step = details.results[index];
@@ -861,6 +866,9 @@ function renderWorkflowResult(
   }
   text += `\n${theme.fg("dim", buildWorkflowVerificationSummary(details))}`;
   text += `\n${theme.fg("dim", `Run artifacts: ${details.runDir}`)}`;
+  if (details.state.status === "blocked") {
+    text += `\n${theme.fg("warning", "Reply with clarification to continue.")}`;
+  }
 
 	  for (let index = 0; index < details.results.length; index++) {
     const step = details.results[index];
@@ -1203,35 +1211,6 @@ export default function registerExtension(pi: ExtensionAPI) {
       ctx.ui.setToolsExpanded(true);
       pi.sendUserMessage(instruction);
       await ctx.waitForIdle();
-    },
-  });
-
-  pi.registerCommand("workflow-resume", {
-    description:
-      "Resume the latest blocked workflow in this session with your clarification text.",
-    handler: async (args, ctx) => {
-      updateCommandCompletionCwd(ctx.cwd);
-      const snapshot = getLatestWorkflowSnapshot(ctx.sessionManager);
-      if (!snapshot || snapshot.status !== "blocked") {
-        if (ctx.hasUI) {
-          ctx.ui.notify("No blocked workflow is waiting for clarification.", "warning");
-        }
-        return;
-      }
-
-      const replyText = args.trim();
-      if (!replyText) {
-        if (ctx.hasUI) {
-          ctx.ui.notify("Usage: /workflow-resume <your clarification>", "warning");
-        }
-        return;
-      }
-
-      await ctx.waitForIdle();
-      if (ctx.hasUI) {
-        ctx.ui.setToolsExpanded(true);
-      }
-      await resumeBlockedWorkflowInSession(pi, ctx, snapshot, replyText);
     },
   });
 }

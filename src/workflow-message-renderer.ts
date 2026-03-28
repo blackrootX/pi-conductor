@@ -101,6 +101,9 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
           ),
         );
         if (progress) lines.push(theme.fg("toolOutput", progress));
+        if (snapshot.status === "blocked") {
+          lines.push(theme.fg("warning", "Reply with clarification to continue."));
+        }
         if (snapshot.presentation.diagnostics.length > 0) {
           lines.push(theme.fg("error", snapshot.presentation.diagnostics[0]));
         }
@@ -140,6 +143,13 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
       if (progress) {
         container.addChild(new Spacer(1));
         container.addChild(new Markdown(progress, 0, 0, getMarkdownTheme()));
+      }
+
+      if (snapshot.status === "blocked") {
+        container.addChild(new Spacer(1));
+        container.addChild(
+          new Text(theme.fg("warning", "Reply with clarification to continue."), 0, 0),
+        );
       }
 
       const lists = [
