@@ -618,6 +618,87 @@ export function mergeAgentResultIntoState(
   step.finishedAt = finishedAt;
 }
 
+export function mergeBlockedAgentResultIntoState(
+  state: WorkflowState,
+  stepIndex: number,
+  result: AgentResult,
+  rawFinalText: string,
+  repairedFinalText?: string,
+  parseError?: string,
+): void {
+  const step = state.steps[stepIndex];
+  if (!step) return;
+  const finishedAt = nowIso();
+
+  const summary = result.summary.trim();
+  if (summary) state.shared.summary = summary;
+  if (result.focusSummary?.trim()) {
+    state.shared.focus = result.focusSummary.trim();
+  }
+
+  const normalizedDecisions = normalizeDecisions(result.decisions);
+  const normalizedArtifacts = normalizeArtifacts(result.artifacts);
+  const normalizedLearnings = normalizeLearnings(result.learnings);
+  const normalizedBlockers = normalizeBlockers(result.blockers);
+  const normalizedVerification = normalizeVerification(result.verification);
+  const normalizedEvidenceHints = normalizeEvidenceHints(result.evidenceHints);
+
+  if (normalizedDecisions?.length) {
+    state.shared.decisions = uniqueBy(
+      [...state.shared.decisions, ...normalizedDecisions],
+      (item: DecisionItem) => `${item.topic}\u0000${item.decision}`,
+    );
+  }
+
+  if (normalizedArtifacts?.length) {
+    state.shared.artifacts = uniqueBy(
+      [...state.shared.artifacts, ...normalizedArtifacts],
+      (item: ArtifactItem) => `${item.kind}\u0000${item.path ?? ""}\u0000${item.text ?? ""}`,
+    );
+  }
+
+  if (normalizedLearnings?.length) {
+    state.shared.learnings = uniqueBy(
+      [...state.shared.learnings, ...normalizedLearnings],
+      (item) => item,
+    );
+  }
+
+  if (normalizedBlockers?.length) {
+    state.shared.blockers = [...state.shared.blockers, ...normalizedBlockers];
+  }
+
+  if (normalizedVerification?.length) {
+    state.shared.verification = [
+      ...state.shared.verification,
+      ...normalizedVerification,
+    ];
+  }
+
+  step.result = {
+    ...result,
+    decisions: normalizedDecisions,
+    artifacts: normalizedArtifacts,
+    learnings: normalizedLearnings,
+    blockers: normalizedBlockers,
+    verification: normalizedVerification,
+    evidenceHints: normalizedEvidenceHints,
+  };
+  step.provisionalResult = step.provisionalResult ?? step.result;
+  step.evidenceHints = normalizedEvidenceHints;
+  step.rawFinalText = rawFinalText;
+  step.repairedFinalText = repairedFinalText;
+  step.parseError = parseError;
+  step.blockedWorkSummary = getProjectedWorkItems(state).blockedWorkSummary.map((item) => ({
+    ...item,
+    blockedByTitles: item.blockedByTitles ? [...item.blockedByTitles] : undefined,
+  }));
+  step.status = "blocked";
+  step.finishedAt = finishedAt;
+  state.status = "blocked";
+  state.finishedAt = finishedAt;
+}
+
 export function deriveProvisionalResult(result: AgentResult): AgentResult {
   return {
     ...result,

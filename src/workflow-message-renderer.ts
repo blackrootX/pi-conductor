@@ -15,9 +15,9 @@ function statusColor(
   switch (status) {
     case "done":
       return "success";
-    case "blocked":
     case "failed":
       return "error";
+    case "blocked":
     case "running":
       return "warning";
     default:
@@ -30,6 +30,7 @@ function statusIcon(status: WorkflowMessageDetails["snapshot"]["status"]): strin
     case "done":
       return "✓";
     case "blocked":
+      return "!";
     case "failed":
       return "✗";
     case "running":

@@ -36,6 +36,7 @@ import {
   markStepFailure,
   markStepRunning,
   mergeAgentResultIntoState,
+  mergeBlockedAgentResultIntoState,
   recordVerificationOutcome,
   setProvisionalStepResult,
 } from "./workflow-state.js";
@@ -159,8 +160,7 @@ export function isErrorResult(result: SingleResult): boolean {
     result.exitCode !== 0 ||
     result.stopReason === "error" ||
     result.stopReason === "aborted" ||
-    result.structuredStatus === "failed" ||
-    result.structuredStatus === "blocked"
+    result.structuredStatus === "failed"
   );
 }
 
@@ -839,19 +839,7 @@ function normalizeStructuredStatusForV7(result: AgentResult): {
   normalizedResult: AgentResult;
   diagnostics?: string[];
 } {
-  if (result.status !== "blocked") {
-    return { normalizedResult: result };
-  }
-
-  return {
-    normalizedResult: {
-      ...result,
-      status: "failed",
-    },
-    diagnostics: [
-      'Structured result used deprecated `status: "blocked"`; runtime normalized it to `failed`.',
-    ],
-  };
+  return { normalizedResult: result };
 }
 
 function createSyntheticFailureResult(options: {
@@ -1449,6 +1437,42 @@ export async function runWorkflowByName(
       normalizedStatus.diagnostics,
     );
 
+    if (provisionalResult.status === "blocked") {
+      finalResultRecord.structuredStatus = "blocked";
+      finalResultRecord.lastWork = provisionalResult.summary;
+      recordVerificationOutcome(
+        state,
+        index,
+        "skipped",
+        provisionalResult.verification,
+        "Step reported blocked and is waiting for clarification or another unblock action.",
+        0,
+      );
+      mergeBlockedAgentResultIntoState(
+        state,
+        index,
+        provisionalResult,
+        rawFinalText,
+        repairedFinalText,
+        parseError,
+      );
+      results.push(finalResultRecord);
+      persistStepResult(persistence, index, step.agent, state, finalResultRecord);
+      persistRunArtifacts(persistence, workflow, state);
+      emitDetails();
+      return {
+        workflowName: workflow.name,
+        steps: workflow.steps,
+        workflowSource: workflow.source,
+        workflowFilePath: workflow.filePath ?? null,
+        runDir: persistence.runDir,
+        results,
+        state,
+        finalText: buildFinalTextFromState(state),
+        isError: false,
+      };
+    }
+
     const workItemMutation = applyWorkItemBatch({
       currentWorkItems: state.shared.workItems,
       newWorkItems: provisionalResult.newWorkItems,
@@ -1647,8 +1671,7 @@ export async function runWorkflowByName(
         results,
         state,
         finalText: buildFinalTextFromState(state),
-        isError: true,
-        errorMessage: `Workflow blocked after step ${index + 1} (${step.agent}): no ready work items remain.`,
+        isError: false,
       };
     }
 

@@ -21,6 +21,7 @@ The public authoring model stays intentionally simple:
 - if a step fails to produce structured output, the runtime does one repair retry
 - built-in prompt includes and internal hooks stay private to the runtime
 - the current runtime supports dependency-aware work items through `blockedByTitles`
+- workflow steps may intentionally return `status: "blocked"` when they need user clarification or another unblock action
 - ready work, blocked work, and current focus are projected by the runtime, not authored directly
 - execution posture is runtime-resolved from stable step metadata without changing public workflow syntax
 
@@ -115,7 +116,7 @@ In the current runtime:
 - the runtime derives `readyWorkItems`, `blockedWorkSummary`, and `currentFocus`
 - invalid work-item authoring or dependency state becomes diagnostics and fails the step
 - workflow `blocked` is a runtime-owned outcome used only when unresolved canonical work exists but no ready work remains
-- authored step results should use `success` or `failed`; deprecated authored `blocked` is normalized to `failed`
+- authored step results may also use `blocked` to pause the workflow and surface clarification needs without marking the run as failed
 
 The structured contract is enforced by the runtime. Agents are asked to return a JSON block between:
 

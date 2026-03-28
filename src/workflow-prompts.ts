@@ -152,6 +152,7 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
     ...renderRequiredSection("CONSTRAINTS", [
       ...workOrder.constraints,
       ...(workOrder.profileGuidance ?? []),
+      "If you need clarification from the user, return `status: \"blocked\"` with concrete `blockers` instead of inventing dependency titles or pretending the task failed.",
       ...(isPlanningStep
         ? [
             "For planning steps, describe implementation as future work unless inspection confirmed it already exists.",
@@ -236,6 +237,7 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "You are repairing a workflow step response into the required structured result format.",
     "Do not invent new repository changes. Extract only what is justified by the original response.",
     "If information is unknown, leave optional arrays empty and omit optional strings.",
+    'If the original response is asking the user for clarification, preserve that as `status: "blocked"` with `blockers` instead of converting it to a failure.',
     "",
     "PARSE ERROR",
     parseError,
@@ -246,7 +248,7 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "RESPONSE CONTRACT",
     `Return exactly one JSON object between ${WORKFLOW_RESULT_BEGIN} and ${WORKFLOW_RESULT_END}.`,
     "Required fields:",
-    '- `status`: one of "success" or "failed"',
+    '- `status`: one of "success", "blocked", or "failed"',
     '- `summary`: concise string',
     "Optional fields:",
     "- `decisions`",

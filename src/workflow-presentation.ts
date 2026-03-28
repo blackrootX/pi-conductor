@@ -11,6 +11,7 @@ export type WorkflowPresentationStepStatus =
   | "pending"
   | "running"
   | "done"
+  | "blocked"
   | "error";
 
 export interface WorkflowPresentationStep {
@@ -166,8 +167,10 @@ export function buildWorkflowPresentation(
     const stateStep = details.state.steps[index];
     const stepStatus = stateStep?.status ?? "pending";
     const status: WorkflowPresentationStepStatus =
-      stepStatus === "failed" || stepStatus === "blocked"
+      stepStatus === "failed"
         ? "error"
+        : stepStatus === "blocked"
+          ? "blocked"
         : stepStatus === "running"
           ? "running"
           : stepStatus === "done"

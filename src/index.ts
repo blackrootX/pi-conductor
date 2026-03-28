@@ -536,6 +536,8 @@ function renderWorkflowResult(
   const icon =
     details.state.status === "done" && successCount === details.results.length
       ? theme.fg("success", "✓")
+      : details.state.status === "blocked"
+        ? theme.fg("warning", "!")
       : theme.fg("error", "✗");
 
   if (expanded) {
@@ -587,8 +589,10 @@ function renderWorkflowResult(
     for (let index = 0; index < details.results.length; index++) {
       const step = details.results[index];
       const stateStep = details.state.steps[index];
-      const stepIcon = isErrorResult(step) || stateStep?.status === "blocked" || stateStep?.status === "failed"
-        ? theme.fg("error", "✗")
+      const stepIcon = stateStep?.status === "blocked"
+        ? theme.fg("warning", "!")
+        : isErrorResult(step) || stateStep?.status === "failed"
+          ? theme.fg("error", "✗")
         : theme.fg("success", "✓");
       const displayItems = getDisplayItems(step.messages);
       const finalOutput =
@@ -727,8 +731,10 @@ function renderWorkflowResult(
 	  for (let index = 0; index < details.results.length; index++) {
     const step = details.results[index];
     const stateStep = details.state.steps[index];
-    const stepIcon = isErrorResult(step) || stateStep?.status === "blocked" || stateStep?.status === "failed"
-      ? theme.fg("error", "✗")
+    const stepIcon = stateStep?.status === "blocked"
+      ? theme.fg("warning", "!")
+      : isErrorResult(step) || stateStep?.status === "failed"
+        ? theme.fg("error", "✗")
       : theme.fg("success", "✓");
     const displayItems = getDisplayItems(step.messages);
     const finalOutput =
