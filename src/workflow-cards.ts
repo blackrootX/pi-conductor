@@ -355,7 +355,7 @@ function renderCard(
     : "";
   const top = cardBorder(`╭${"─".repeat(innerWidth)}╮`);
   const bottom = cardBorder(`╰${"─".repeat(innerWidth)}╯`);
-  const lines = [
+  return [
     top,
     styleJustifiedLine(
       ` STEP ${String(state.stepNumber).padStart(2, "0")}`,
@@ -371,30 +371,23 @@ function renderCard(
       innerWidth,
       cardBorder,
     ),
-  ];
-
-  if (metaLine) {
-    lines.push(
-      stylePaddedLine(` ${styler.muted(metaLine)}`, innerWidth, cardBorder),
-    );
-  }
-
-  lines.push(
+    stylePaddedLine(
+      ` ${metaLine ? styler.muted(metaLine) : ""}`,
+      innerWidth,
+      cardBorder,
+    ),
     stylePaddedLine(
       ` ${primaryDetail === "—" ? styler.dim(primaryDetail) : styler.muted(primaryDetail)}`,
       innerWidth,
       cardBorder,
     ),
-  );
-
-  if (contextLine) {
-    lines.push(
-      stylePaddedLine(` ${styler.dim(contextLine)}`, innerWidth, cardBorder),
-    );
-  }
-
-  lines.push(bottom);
-  return lines;
+    stylePaddedLine(
+      ` ${contextLine ? styler.dim(contextLine) : ""}`,
+      innerWidth,
+      cardBorder,
+    ),
+    bottom,
+  ];
 }
 
 function renderConnector(
@@ -439,16 +432,17 @@ function renderRows(
       Math.floor((Math.max(width, minCardWidth) - totalArrowWidth) / chunk.length),
     );
     const cards = chunk.map((step) => renderCard(step, cardWidth, styler, animationTick));
-    const connectorRow = Math.floor(cards[0].length / 2);
+    const maxLines = Math.max(...cards.map((card) => card.length));
+    const connectorRow = Math.floor(maxLines / 2);
 
-    for (let line = 0; line < cards[0].length; line++) {
-      let row = cards[0][line];
+    for (let line = 0; line < maxLines; line++) {
+      let row = cards[0][line] ?? " ".repeat(stripAnsi(cards[0][0] ?? "").length);
       for (let cardIndex = 1; cardIndex < cards.length; cardIndex++) {
         row +=
           line === connectorRow
             ? renderConnector(chunk[cardIndex], animationTick, styler)
             : " ".repeat(arrowWidth);
-        row += cards[cardIndex][line];
+        row += cards[cardIndex][line] ?? " ".repeat(stripAnsi(cards[cardIndex][0] ?? "").length);
       }
       output.push(row);
     }
