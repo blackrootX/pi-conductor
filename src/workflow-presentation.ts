@@ -139,7 +139,7 @@ function extractStructuredSummary(text: string): string | undefined {
   }
 }
 
-function formatProgressText(text: string | undefined): string {
+export function formatProgressText(text: string | undefined): string {
   const trimmed = text?.trim() ?? "";
   if (!trimmed) return "";
 

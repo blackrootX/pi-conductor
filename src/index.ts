@@ -34,6 +34,7 @@ import {
   renderWorkflowCardLines,
 } from "./workflow-cards.js";
 import { registerWorkflowMessageRenderer } from "./workflow-message-renderer.js";
+import { formatProgressText } from "./workflow-presentation.js";
 import {
   getDoneWorkItems,
   projectWorkItems,
@@ -727,12 +728,13 @@ function renderWorkflowResult(
           ? theme.fg("error", "✗")
         : theme.fg("success", "✓");
       const displayItems = getDisplayItems(step.messages);
-      const finalOutput =
+      const finalOutput = formatProgressText(
         step.lastWork ||
-        stateStep?.result?.summary ||
-        step.repairedFinalText ||
-        step.rawFinalText ||
-        getFinalOutput(step.messages);
+          stateStep?.result?.summary ||
+          step.repairedFinalText ||
+          step.rawFinalText ||
+          getFinalOutput(step.messages),
+      );
 
       container.addChild(new Spacer(1));
       container.addChild(
@@ -869,12 +871,13 @@ function renderWorkflowResult(
         ? theme.fg("error", "✗")
       : theme.fg("success", "✓");
     const displayItems = getDisplayItems(step.messages);
-    const finalOutput =
+    const finalOutput = formatProgressText(
       step.lastWork ||
-      stateStep?.result?.summary ||
-      step.repairedFinalText ||
-      step.rawFinalText ||
-      getFinalOutput(step.messages);
+        stateStep?.result?.summary ||
+        step.repairedFinalText ||
+        step.rawFinalText ||
+        getFinalOutput(step.messages),
+    );
 	    text += `\n\n${theme.fg("muted", `─── Step ${step.step}: `)}${theme.fg("accent", step.agent)}${theme.fg("muted", ` (${step.agentSource}) `)}${stepIcon}`;
 	    text += `\n${theme.fg("muted", "Objective: ")}${theme.fg("dim", step.objective || stateStep?.objective || step.task)}`;
 	    if (stateStep?.profile) {
