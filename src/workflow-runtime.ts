@@ -379,6 +379,7 @@ function createVerifyChecks(
   result: AgentResult,
   policy: VerifyPolicy,
   runtimeTouchedFiles: string[],
+  allowFallbackWorkerSelectedFileTargets = false,
 ): PlannedVerifyCheck[] {
   const { hintedFileTargets, symbolTargets, claimedChecks } = collectWorkerEvidence(result);
   const planned: PlannedVerifyCheck[] = [];
@@ -389,26 +390,49 @@ function createVerifyChecks(
     }))
     .filter((item) => item.resolvedPath && fs.existsSync(item.resolvedPath))
     .map((item) => item.fileTarget);
-  const candidateFileTargets = policy.allowWorkerSelectedFileTargets
-    ? uniqueStrings([...trustedRuntimeTargets, ...hintedFileTargets])
-    : trustedRuntimeTargets;
+  const candidateFileTargets: Array<{
+    fileTarget: string;
+    source: NonNullable<VerificationItem["source"]>;
+  }> = trustedRuntimeTargets.map((fileTarget) => ({
+    fileTarget,
+    source: "runtime",
+  }));
+  const seenFileTargets = new Set(trustedRuntimeTargets);
+  const hintedFileTargetSource =
+    policy.allowWorkerSelectedFileTargets
+      ? "runtime"
+      : allowFallbackWorkerSelectedFileTargets
+        ? "worker"
+        : null;
+  if (hintedFileTargetSource) {
+    for (const fileTarget of hintedFileTargets) {
+      if (!fileTarget || seenFileTargets.has(fileTarget)) continue;
+      seenFileTargets.add(fileTarget);
+      candidateFileTargets.push({
+        fileTarget,
+        source: hintedFileTargetSource,
+      });
+    }
+  }
 
   if (policy.allowFileExistsChecks) {
-    for (const fileTarget of candidateFileTargets.slice(0, 8)) {
+    for (const candidate of candidateFileTargets.slice(0, 8)) {
+      const { fileTarget, source } = candidate;
       const resolvedPath = resolveVerifyPath(cwd, fileTarget);
       if (!resolvedPath) continue;
       planned.push({
         check: `Path exists: ${fileTarget}`,
         kind: "file_exists",
         path: resolvedPath,
-        source: "runtime",
+        source,
       });
     }
   }
 
   if (policy.allowGrepChecks && symbolTargets.length > 0 && candidateFileTargets.length > 0) {
     let grepCount = 0;
-    for (const fileTarget of candidateFileTargets.slice(0, 4)) {
+    for (const candidate of candidateFileTargets.slice(0, 4)) {
+      const { fileTarget, source } = candidate;
       const resolvedPath = resolveVerifyPath(cwd, fileTarget);
       if (!resolvedPath) continue;
       for (const symbolTarget of symbolTargets.slice(0, 4)) {
@@ -417,7 +441,7 @@ function createVerifyChecks(
           kind: "grep_assertion",
           path: resolvedPath,
           pattern: symbolTarget,
-          source: "runtime",
+          source,
         });
         grepCount += 1;
         if (grepCount >= 8) break;
@@ -535,7 +559,13 @@ function verifyStep(
   const runtimeTouchedFiles = policy.allowWorkerSelectedFileTargets
     ? []
     : collectRuntimeTouchedFiles(cwd, repositorySnapshotBeforeStep);
-  const plannedChecks = createVerifyChecks(cwd, result, policy, runtimeTouchedFiles);
+  const plannedChecks = createVerifyChecks(
+    cwd,
+    result,
+    policy,
+    runtimeTouchedFiles,
+    !policy.allowWorkerSelectedFileTargets && !repositorySnapshotBeforeStep,
+  );
   const checks = plannedChecks.map(executeVerifyCheck);
   const anyFail = checks.some((item) => item.status === "fail");
   const anyPass = checks.some((item) => item.status === "pass");

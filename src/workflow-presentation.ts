@@ -1,6 +1,7 @@
 import {
   getDoneWorkItems,
   projectWorkItems,
+  type WorkItemProjection,
 } from "./workflow-work-items.js";
 import { WORKFLOW_RESULT_BEGIN } from "./workflow-prompts.js";
 import { extractStructuredBlock } from "./workflow-result.js";
@@ -65,25 +66,31 @@ export interface WorkflowPresentationPayload {
   decisions: string[];
   learnings: string[];
   verification: string[];
+  diagnostics: string[];
   readyWorkItems: string[];
   doneWorkItems: string[];
   blockedWorkSummary: string[];
   steps: WorkflowPresentationStep[];
 }
 
-function getProjection(details: WorkflowDetails) {
+type WorkflowPresentationProjection = WorkItemProjection & {
+  diagnostics: string[];
+};
+
+function getProjection(details: WorkflowDetails): WorkflowPresentationProjection {
   const projection = projectWorkItems(details.state.shared.workItems);
-  if (projection.ok) return projection.projection;
+  if (projection.ok) {
+    return {
+      ...projection.projection,
+      diagnostics: [],
+    };
+  }
   return {
     readyWorkItems: [],
-    blockedWorkSummary: projection.diagnostics.map((item) => ({
-      title: item,
-      reason: "explicit_blocked" as const,
-      details: undefined,
-      blockedByTitles: undefined,
-    })),
+    blockedWorkSummary: [],
     unresolvedWorkItems: [],
     currentFocus: undefined,
+    diagnostics: [...projection.diagnostics],
   };
 }
 
@@ -222,6 +229,7 @@ export function buildWorkflowPresentation(
     currentStepLastWork ||
     (currentStateStep?.status === "running" ? "" : latestResultLastWork) ||
     details.state.shared.summary ||
+    projection.diagnostics[0] ||
     "";
 
   return {
@@ -263,6 +271,7 @@ export function buildWorkflowPresentation(
         ? `${item.check}: ${item.status} (${item.notes})`
         : `${item.check}: ${item.status}`,
     ),
+    diagnostics: [...projection.diagnostics],
     readyWorkItems: projection.readyWorkItems.map(formatWorkItemLine),
     doneWorkItems: getDoneWorkItems(details.state.shared.workItems).map(
       formatWorkItemLine,

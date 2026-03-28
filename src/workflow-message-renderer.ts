@@ -100,6 +100,9 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
           ),
         );
         if (progress) lines.push(theme.fg("toolOutput", progress));
+        if (snapshot.presentation.diagnostics.length > 0) {
+          lines.push(theme.fg("error", snapshot.presentation.diagnostics[0]));
+        }
         return new Text(lines.join("\n"), 0, 0);
       }
 
@@ -139,6 +142,7 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
       }
 
       const lists = [
+        renderList("Diagnostics", snapshot.presentation.diagnostics, theme),
         renderList("Blockers", snapshot.presentation.blockers, theme),
         renderList("Decisions", snapshot.presentation.decisions, theme),
         renderList("Verification", snapshot.presentation.verification, theme),

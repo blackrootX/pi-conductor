@@ -145,6 +145,24 @@ function normalizeResolvedWorkItem(value: unknown): ResolvedWorkItemInput | unde
   };
 }
 
+function validateResolvedWorkItemArray(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    return "`resolvedWorkItems` must be an array when provided.";
+  }
+
+  for (const [index, item] of value.entries()) {
+    if (!isObject(item)) {
+      return `resolvedWorkItems[${index}] must be an object.`;
+    }
+    if (!normalizeText(item.title)) {
+      return `resolvedWorkItems[${index}].title must be a non-empty string.`;
+    }
+  }
+
+  return undefined;
+}
+
 function normalizeStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const items = value
@@ -225,6 +243,16 @@ export function validateAgentResultShape(
     return {
       ok: false,
       error: newWorkItemsError,
+    };
+  }
+
+  const resolvedWorkItemsError = validateResolvedWorkItemArray(
+    value.resolvedWorkItems,
+  );
+  if (resolvedWorkItemsError) {
+    return {
+      ok: false,
+      error: resolvedWorkItemsError,
     };
   }
 

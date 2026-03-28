@@ -370,12 +370,7 @@ export function applyWorkItemBatch(options: {
       candidate.title = newWorkItem.title;
       candidate.details = newWorkItem.details ?? candidate.details;
       candidate.priority = mergePriority(candidate.priority, newWorkItem.priority);
-      candidate.status =
-        candidate.status === "in_progress"
-          ? "in_progress"
-          : candidate.status === "blocked"
-            ? "blocked"
-            : "open";
+      candidate.status = candidate.status === "in_progress" ? "in_progress" : "open";
       candidate.updatedAt = options.updatedAt;
     } else {
       candidate = {

@@ -17,9 +17,12 @@ The public authoring model stays intentionally simple:
 - agents stay as normal Pi markdown agents
 - the plugin injects a structured workflow contract at runtime
 - step-to-step handoff goes through orchestrator state, not raw previous-step text
-- shared state can carry optional work items and a current focus across steps
+- shared state can carry runtime-owned work items and focus across steps
 - if a step fails to produce structured output, the runtime does one repair retry
-- `v4` adds internal runtime hooks plus built-in-only prompt includes without changing user-facing workflow or agent authoring
+- built-in prompt includes and internal hooks stay private to the runtime
+- the current runtime supports dependency-aware work items through `blockedByTitles`
+- ready work, blocked work, and current focus are projected by the runtime, not authored directly
+- execution posture is runtime-resolved from stable step metadata without changing public workflow syntax
 
 ## Usage
 
@@ -81,7 +84,7 @@ Agents are loaded from:
 Built-in agents can be overridden by project or global agents with the same name.
 User-defined agents do not need extra workflow-specific frontmatter.
 `v3` still does not require new frontmatter for work-item support.
-`v4` also does not add user-editable `includes`; internal prompt fragments are reserved for built-in agents only.
+The current runtime also does not add user-editable `includes`; internal prompt fragments are reserved for built-in agents only.
 
 ## Execution Model
 
@@ -105,6 +108,15 @@ In `v3`, that shared state can also carry:
 
 These work-item fields are a soft contract. Agents may return them when useful, but older agents that only return the original `v2` fields still continue to work.
 
+In the current runtime:
+
+- `newWorkItems` may optionally declare `blockedByTitles`
+- canonical work items store dependency edges as internal ids
+- the runtime derives `readyWorkItems`, `blockedWorkSummary`, and `currentFocus`
+- invalid work-item authoring or dependency state becomes diagnostics and fails the step
+- workflow `blocked` is a runtime-owned outcome used only when unresolved canonical work exists but no ready work remains
+- authored step results should use `success` or `failed`; deprecated authored `blocked` is normalized to `failed`
+
 The structured contract is enforced by the runtime. Agents are asked to return a JSON block between:
 
 ```text
@@ -124,12 +136,19 @@ Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 
 ## Current Scope
 
-`v4` is still sequential only. It adds internal hooks and built-in prompt reuse, but it does not add:
+The current runtime is still sequential only. It includes:
+
+- dependency-aware work items
+- runtime-owned ready / blocked / focus projection
+- internal base-profile vs resolved-profile policy
+- internal hooks and built-in prompt reuse without changing public workflow authoring
+
+It still does not add:
 
 - parallel steps
 - DAG workflows
 - resume
-- automatic agent selection
+- automatic user-visible agent selection
 - auto-skip
 - auto-reorder
 - dynamic step insertion
@@ -189,3 +208,8 @@ pi remove https://github.com/blackrootX/pi-conductor
 - [v3 tasks](./docs/taskv3.md)
 - [v4 plan](./docs/planv4.md)
 - [v4 tasks](./docs/taskv4.md)
+- [v5 tasks](./docs/taskv5.md)
+- [v6 plan](./docs/planv6.md)
+- [v6 tasks](./docs/taskv6.md)
+- [v7 plan](./docs/planv7.md)
+- [v7 tasks](./docs/taskv7.md)
