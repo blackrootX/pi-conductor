@@ -320,37 +320,42 @@ function renderCard(
   const innerWidth = Math.max(18, columnWidth - 2);
   const cardBorder = getBorderStyle(state.status, styler);
   const title = truncateText(buildTitle(state.agent, state.model), innerWidth);
-  const objective = state.objective.trim()
-    ? truncateText(`goal: ${state.objective.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
-    : "goal: —";
-  const profile = state.profile ? `profile: ${state.profile}` : "profile: —";
   const statusLabel = formatStatusLabel(state, animationTick);
-  const verifyLabel = truncateText(
-    `verify: ${state.verificationPhase} · ${formatVerifyStatus(state)}`,
-    innerWidth - 1,
-  );
-  const verifySummary = state.verifySummary?.trim()
-    ? truncateText(
-        `verify summary: ${state.verifySummary.trim().replace(/\s+/g, " ")}`,
-        innerWidth - 1,
-      )
-    : "verify summary: —";
-  const pending = state.topReadyWorkItem?.trim()
-    ? truncateText(`ready: ${state.topReadyWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
-    : "ready: —";
-  const focus = state.currentFocus?.trim()
-    ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
-    : "focus: —";
-  const lastWork = state.lastWork.trim()
+  const metaItems: string[] = [];
+  if (state.profile) metaItems.push(state.profile);
+  if (state.verifyStatus === "passed") {
+    metaItems.push("verified");
+  } else if (state.verifyStatus && state.verifyStatus !== "pending") {
+    metaItems.push(`verify ${formatVerifyStatus(state)}`);
+  }
+  if (state.repairAttempted) metaItems.push("repair");
+  if (state.newItemCount > 0) metaItems.push(`+${state.newItemCount} updates`);
+
+  const metaLine = metaItems.length > 0 ? truncateText(metaItems.join(" · "), innerWidth - 1) : "";
+  const primaryDetail = state.lastWork.trim()
     ? truncateText(state.lastWork.trim().replace(/\s+/g, " "), innerWidth - 1)
-    : "—";
-  const updateLabel = state.newItemCount > 0 ? `+${state.newItemCount} updates` : "";
-  const repairLabel = state.repairAttempted ? "repair" : "";
-  const rightMeta = repairLabel || updateLabel;
+    : state.objective.trim()
+      ? truncateText(state.objective.trim().replace(/\s+/g, " "), innerWidth - 1)
+      : "—";
+  const contextSource =
+    (state.rawStatus === "blocked" || state.rawStatus === "failed") &&
+    state.currentFocus?.trim()
+      ? `focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`
+      : (state.rawStatus === "blocked" || state.rawStatus === "failed") &&
+          state.topReadyWorkItem?.trim()
+        ? `next: ${state.topReadyWorkItem.trim().replace(/\s+/g, " ")}`
+        : state.verifyStatus &&
+            state.verifyStatus !== "passed" &&
+            state.verifyStatus !== "pending" &&
+            state.verifySummary?.trim()
+          ? state.verifySummary.trim().replace(/\s+/g, " ")
+          : "";
+  const contextLine = contextSource
+    ? truncateText(contextSource, innerWidth - 1)
+    : "";
   const top = cardBorder(`╭${"─".repeat(innerWidth)}╮`);
   const bottom = cardBorder(`╰${"─".repeat(innerWidth)}╯`);
-
-  return [
+  const lines = [
     top,
     styleJustifiedLine(
       ` STEP ${String(state.stepNumber).padStart(2, "0")}`,
@@ -366,31 +371,30 @@ function renderCard(
       innerWidth,
       cardBorder,
     ),
-    stylePaddedLine(` ${styler.muted(objective)}`, innerWidth, cardBorder),
-    styleJustifiedLine(
-      ` ${truncateText(profile, innerWidth - 2)}`,
-      rightMeta,
-      innerWidth,
-      cardBorder,
-      (text) => styler.muted(text),
-      (text) => (repairLabel ? styler.highlight(text) : styler.accent(text)),
-    ),
-    stylePaddedLine(` ${styler.muted(verifyLabel)}`, innerWidth, cardBorder),
-    stylePaddedLine(
-      ` ${verifySummary === "verify summary: —" ? styler.dim(verifySummary) : styler.muted(verifySummary)}`,
-      innerWidth,
-      cardBorder,
-    ),
-    stylePaddedLine(` ${state.currentFocus ? styler.muted(focus) : styler.dim(focus)}`, innerWidth, cardBorder),
-    stylePaddedLine(` ${state.topReadyWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, cardBorder),
-    stylePaddedLine(` ${styler.accent("latest")}`, innerWidth, cardBorder),
-    stylePaddedLine(
-      ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,
-      innerWidth,
-      cardBorder,
-    ),
-    bottom,
   ];
+
+  if (metaLine) {
+    lines.push(
+      stylePaddedLine(` ${styler.muted(metaLine)}`, innerWidth, cardBorder),
+    );
+  }
+
+  lines.push(
+    stylePaddedLine(
+      ` ${primaryDetail === "—" ? styler.dim(primaryDetail) : styler.muted(primaryDetail)}`,
+      innerWidth,
+      cardBorder,
+    ),
+  );
+
+  if (contextLine) {
+    lines.push(
+      stylePaddedLine(` ${styler.dim(contextLine)}`, innerWidth, cardBorder),
+    );
+  }
+
+  lines.push(bottom);
+  return lines;
 }
 
 function renderConnector(
