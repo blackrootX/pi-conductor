@@ -61,6 +61,7 @@ export interface WorkItem {
   details?: string;
   status: "open" | "in_progress" | "done" | "blocked";
   priority?: "low" | "medium" | "high";
+  blockedBy?: string[];
   sourceStepId: string;
   sourceAgent: string;
   updatedAt: string;
@@ -70,6 +71,7 @@ export interface NewWorkItemInput {
   title: string;
   details?: string;
   priority?: "low" | "medium" | "high";
+  blockedByTitles?: string[];
 }
 
 export interface ResolvedWorkItemInput {
@@ -111,12 +113,24 @@ export interface SharedState {
   workItems: WorkItem[];
 }
 
+export type BlockedWorkSummaryReason =
+  | "explicit_blocked"
+  | "unresolved_dependency";
+
+export interface BlockedWorkSummaryItem {
+  title: string;
+  reason: BlockedWorkSummaryReason;
+  details?: string;
+  blockedByTitles?: string[];
+}
+
 export interface StepRunState {
   stepId: string;
   agent: string;
   profile?: ExecutionProfile;
   objective: string;
   status: "pending" | "running" | "done" | "blocked" | "failed";
+  blockedWorkSummary?: BlockedWorkSummaryItem[];
   verifyStatus?: VerifyStatus;
   verifySummary?: string;
   verifyChecks?: VerificationItem[];
@@ -150,6 +164,7 @@ export interface WorkflowCanonicalStepSnapshot {
   profile?: ExecutionProfile;
   objective: string;
   status: StepRunState["status"];
+  blockedWorkSummary?: BlockedWorkSummaryItem[];
   verifyStatus?: VerifyStatus;
   verifySummary?: string;
   startedAt?: string;
@@ -185,7 +200,8 @@ export interface WorkOrder {
     learnings?: string[];
     blockers?: BlockerItem[];
     verification?: VerificationItem[];
-    openWorkItems?: WorkItem[];
+    readyWorkItems?: WorkItem[];
+    blockedWorkSummary?: BlockedWorkSummaryItem[];
     recentResolvedWorkItems?: WorkItem[];
     currentFocus?: string;
   };

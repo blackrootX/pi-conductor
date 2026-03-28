@@ -1,8 +1,6 @@
 import {
-  getBlockedWorkItems,
   getDoneWorkItems,
-  getOpenWorkItems,
-  getUnresolvedWorkItems,
+  projectWorkItems,
 } from "./workflow-work-items.js";
 import { WORKFLOW_RESULT_BEGIN } from "./workflow-prompts.js";
 import { extractStructuredBlock } from "./workflow-result.js";
@@ -33,7 +31,7 @@ export interface WorkflowPresentationStep {
   lastWork: string;
   repairAttempted?: boolean;
   currentFocus?: string;
-  topPendingWorkItem?: string;
+  topReadyWorkItem?: string;
   parseError?: string;
   newItemCount: number;
 }
@@ -52,10 +50,10 @@ export interface WorkflowPresentationPayload {
   currentStepAgent?: string;
   currentStepObjective?: string;
   currentFocus?: string;
-  topPendingWorkItem?: string;
+  topReadyWorkItem?: string;
   lastProgress: string;
   summary: {
-    openWorkItems: number;
+    readyWorkItems: number;
     doneWorkItems: number;
     blockedWorkItems: number;
     blockers: number;
@@ -67,20 +65,30 @@ export interface WorkflowPresentationPayload {
   decisions: string[];
   learnings: string[];
   verification: string[];
-  openWorkItems: string[];
+  readyWorkItems: string[];
   doneWorkItems: string[];
-  blockedWorkItems: string[];
+  blockedWorkSummary: string[];
   steps: WorkflowPresentationStep[];
 }
 
-function deriveCurrentFocus(details: WorkflowDetails): string | undefined {
-  const explicitFocus = details.state.shared.focus?.trim();
-  if (explicitFocus) return explicitFocus;
-  return getUnresolvedWorkItems(details.state.shared.workItems)[0]?.title;
+function getProjection(details: WorkflowDetails) {
+  const projection = projectWorkItems(details.state.shared.workItems);
+  if (projection.ok) return projection.projection;
+  return {
+    readyWorkItems: [],
+    blockedWorkSummary: projection.diagnostics.map((item) => ({
+      title: item,
+      reason: "explicit_blocked" as const,
+      details: undefined,
+      blockedByTitles: undefined,
+    })),
+    unresolvedWorkItems: [],
+    currentFocus: undefined,
+  };
 }
 
-function formatTopPendingWorkItem(details: WorkflowDetails): string | undefined {
-  const item = getUnresolvedWorkItems(details.state.shared.workItems)[0];
+function formatTopReadyWorkItem(details: WorkflowDetails): string | undefined {
+  const item = getProjection(details).readyWorkItems[0];
   if (!item) return undefined;
   const parts = [item.title, item.status];
   if (item.priority) parts.push(item.priority);
@@ -93,6 +101,19 @@ function formatWorkItemLine(
   const parts = [item.title, item.status];
   if (item.priority) parts.push(item.priority);
   if (item.details?.trim()) parts.push(item.details.trim());
+  return parts.join(" | ");
+}
+
+function formatBlockedSummaryLine(
+  item: ReturnType<typeof getProjection>["blockedWorkSummary"][number],
+): string {
+  const parts = [item.title, item.reason];
+  if (item.blockedByTitles?.length) {
+    parts.push(`waiting on: ${item.blockedByTitles.join(", ")}`);
+  }
+  if (item.details?.trim()) {
+    parts.push(item.details.trim());
+  }
   return parts.join(" | ");
 }
 
@@ -126,8 +147,9 @@ export function buildWorkflowPresentation(
   details: WorkflowDetails,
   defaultModel?: string,
 ): WorkflowPresentationPayload {
-  const currentFocus = deriveCurrentFocus(details);
-  const topPendingWorkItem = formatTopPendingWorkItem(details);
+  const projection = getProjection(details);
+  const currentFocus = projection.currentFocus;
+  const topReadyWorkItem = formatTopReadyWorkItem(details);
   const currentStateStep = details.state.steps[details.state.currentStepIndex];
 
   const steps = details.steps.map((step, index) => {
@@ -174,13 +196,21 @@ export function buildWorkflowPresentation(
       ),
       repairAttempted: result?.repairAttempted,
       currentFocus,
-      topPendingWorkItem,
+      topReadyWorkItem,
       parseError: result?.parseError ?? stateStep?.parseError,
       newItemCount:
-        (stateStep?.result?.decisions?.length ?? stateStep?.provisionalResult?.decisions?.length ?? 0) +
-        (stateStep?.result?.learnings?.length ?? stateStep?.provisionalResult?.learnings?.length ?? 0) +
-        (stateStep?.result?.blockers?.length ?? stateStep?.provisionalResult?.blockers?.length ?? 0) +
-        (stateStep?.result?.verification?.length ?? stateStep?.provisionalResult?.verification?.length ?? 0),
+        (stateStep?.result?.decisions?.length ??
+          stateStep?.provisionalResult?.decisions?.length ??
+          0) +
+        (stateStep?.result?.learnings?.length ??
+          stateStep?.provisionalResult?.learnings?.length ??
+          0) +
+        (stateStep?.result?.blockers?.length ??
+          stateStep?.provisionalResult?.blockers?.length ??
+          0) +
+        (stateStep?.result?.verification?.length ??
+          stateStep?.provisionalResult?.verification?.length ??
+          0),
     };
   });
 
@@ -208,12 +238,12 @@ export function buildWorkflowPresentation(
     currentStepAgent: currentStateStep?.agent,
     currentStepObjective: currentStateStep?.objective,
     currentFocus,
-    topPendingWorkItem,
+    topReadyWorkItem,
     lastProgress,
     summary: {
-      openWorkItems: getOpenWorkItems(details.state.shared.workItems).length,
+      readyWorkItems: projection.readyWorkItems.length,
       doneWorkItems: getDoneWorkItems(details.state.shared.workItems).length,
-      blockedWorkItems: getBlockedWorkItems(details.state.shared.workItems).length,
+      blockedWorkItems: projection.blockedWorkSummary.length,
       blockers: details.state.shared.blockers.length,
       decisions: details.state.shared.decisions.length,
       learnings: details.state.shared.learnings.length,
@@ -233,15 +263,11 @@ export function buildWorkflowPresentation(
         ? `${item.check}: ${item.status} (${item.notes})`
         : `${item.check}: ${item.status}`,
     ),
-    openWorkItems: getOpenWorkItems(details.state.shared.workItems).map(
-      formatWorkItemLine,
-    ),
+    readyWorkItems: projection.readyWorkItems.map(formatWorkItemLine),
     doneWorkItems: getDoneWorkItems(details.state.shared.workItems).map(
       formatWorkItemLine,
     ),
-    blockedWorkItems: getBlockedWorkItems(details.state.shared.workItems).map(
-      formatWorkItemLine,
-    ),
+    blockedWorkSummary: projection.blockedWorkSummary.map(formatBlockedSummaryLine),
     steps,
   };
 }

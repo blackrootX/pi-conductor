@@ -41,12 +41,17 @@ import {
 } from "./workflow-state.js";
 import type {
   AgentResult,
+  BlockedWorkSummaryItem,
   ExecutionProfile,
   VerificationItem,
   VerifyStatus,
   WorkflowConfig,
   WorkflowState,
 } from "./workflow-types.js";
+import {
+  applyWorkItemBatch,
+  projectWorkItems,
+} from "./workflow-work-items.js";
 import { discoverWorkflows } from "./workflows.js";
 
 const REPAIR_SYSTEM_PROMPT = [
@@ -562,21 +567,33 @@ function renderBucketSection(title: string, items: string[]): string {
 
 function renderSummaryBucket(state: WorkflowState): string {
   const summary = state.shared.summary?.trim() || "(no summary yet)";
-  const openItems = state.shared.workItems
-    .filter((item) => item.status === "open" || item.status === "in_progress")
-    .map((item) => `- ${item.title} [${item.status}]${item.details ? ` (${item.details})` : ""}`);
-  const blockedItems = state.shared.workItems
-    .filter((item) => item.status === "blocked")
-    .map((item) => `- ${item.title}${item.details ? ` (${item.details})` : ""}`);
+  const projection = projectWorkItems(state.shared.workItems);
+  const readyItems = projection.ok
+    ? projection.projection.readyWorkItems.map(
+        (item) =>
+          `- ${item.title} [${item.status}]${item.details ? ` (${item.details})` : ""}`,
+      )
+    : ["- Invalid work-item state"];
+  const blockedItems = projection.ok
+    ? projection.projection.blockedWorkSummary.map((item) => {
+        const blockedBy =
+          item.blockedByTitles?.length
+            ? ` (waiting on: ${item.blockedByTitles.join(", ")})`
+            : "";
+        return `- ${item.title} [${item.reason}]${blockedBy}${item.details ? ` (${item.details})` : ""}`;
+      })
+    : projection.diagnostics.map((item) => `- ${item}`);
   return [
     "# Summary",
     "",
     summary,
     "",
     renderBucketSection("## Current Focus", [
-      state.shared.focus?.trim() || "(no explicit focus)",
+      projection.ok
+        ? projection.projection.currentFocus ?? "(no actionable focus)"
+        : "(invalid work-item state)",
     ]),
-    renderBucketSection("## Open Work Items", openItems),
+    renderBucketSection("## Ready Work Items", readyItems),
     renderBucketSection("## Blocked Work Items", blockedItems),
   ]
     .join("\n")
@@ -697,6 +714,7 @@ function persistStepResult(
     verifyStatus: stepState?.verifyStatus,
     verifySummary: stepState?.verifySummary,
     verifyChecks: stepState?.verifyChecks ?? null,
+    blockedWorkSummary: cloneBlockedWorkSummary(stepState?.blockedWorkSummary) ?? null,
     parseError: result.parseError,
     repairAttempted: result.repairAttempted,
     rawFinalText: result.rawFinalText,
@@ -776,6 +794,34 @@ function mergeDiagnostics(
     if (trimmed) merged.add(trimmed);
   }
   return Array.from(merged.values());
+}
+
+function cloneBlockedWorkSummary(
+  items: BlockedWorkSummaryItem[] | undefined,
+): BlockedWorkSummaryItem[] | undefined {
+  return items?.map((item) => ({
+    ...item,
+    blockedByTitles: item.blockedByTitles ? [...item.blockedByTitles] : undefined,
+  }));
+}
+
+function normalizeStructuredStatusForV7(result: AgentResult): {
+  normalizedResult: AgentResult;
+  diagnostics?: string[];
+} {
+  if (result.status !== "blocked") {
+    return { normalizedResult: result };
+  }
+
+  return {
+    normalizedResult: {
+      ...result,
+      status: "failed",
+    },
+    diagnostics: [
+      'Structured result used deprecated `status: "blocked"`; runtime normalized it to `failed`.',
+    ],
+  };
 }
 
 function createSyntheticFailureResult(options: {
@@ -1088,11 +1134,23 @@ export async function runWorkflowByName(
   for (let index = 0; index < workflow.steps.length; index++) {
     const step = workflow.steps[index];
     const agent = agents.find((item) => item.name === step.agent);
-    const profile = resolveExecutionProfile(step, agent);
+    const profileResolution = resolveExecutionProfile(step, agent);
+    const profile = profileResolution.resolvedProfile;
     const verifyPolicy = resolveVerifyPolicy(profile);
     const systemPromptOverride = agent
       ? resolveAgentSystemPrompt(agent, profile)
       : undefined;
+    const currentProjection = projectWorkItems(state.shared.workItems);
+    if (!currentProjection.ok) {
+      return await failStep({
+        index,
+        step,
+        agent,
+        stage: "beforeStep",
+        error: currentProjection.diagnostics.join(" "),
+        messagePrefix: `Workflow stopped before step ${index + 1} (${step.agent}) due to invalid work-item state`,
+      });
+    }
     let workOrder = buildWorkOrder(state, step, agent, index, profile);
     state.steps[index].profile = profile;
     state.steps[index].objective = workOrder.objective;
@@ -1332,6 +1390,9 @@ export async function runWorkflowByName(
       });
     }
 
+    const normalizedStatus = normalizeStructuredStatusForV7(structuredResult);
+    structuredResult = normalizedStatus.normalizedResult;
+
     const provisionalResult = deriveProvisionalResult(structuredResult);
     setProvisionalStepResult(
       state,
@@ -1349,8 +1410,59 @@ export async function runWorkflowByName(
     finalResultRecord.parseError = parseError;
     finalResultRecord.repairAttempted = Boolean(parseError);
     finalResultRecord.lastWork = provisionalResult.summary;
+    state.steps[index].diagnostics = mergeDiagnostics(
+      state.steps[index].diagnostics,
+      normalizedStatus.diagnostics,
+    );
+    finalResultRecord.diagnostics = mergeDiagnostics(
+      finalResultRecord.diagnostics,
+      normalizedStatus.diagnostics,
+    );
 
-    if (provisionalResult.status === "blocked" || provisionalResult.status === "failed") {
+    const workItemMutation = applyWorkItemBatch({
+      currentWorkItems: state.shared.workItems,
+      newWorkItems: provisionalResult.newWorkItems,
+      resolvedWorkItems: provisionalResult.resolvedWorkItems,
+      stepId: step.id,
+      agentName: step.agent,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (!workItemMutation.ok) {
+      const validationDiagnostics = workItemMutation.diagnostics;
+      finalResultRecord.structuredStatus = "failed";
+      state.steps[index].diagnostics = mergeDiagnostics(
+        state.steps[index].diagnostics,
+        validationDiagnostics,
+      );
+      finalResultRecord.diagnostics = mergeDiagnostics(
+        finalResultRecord.diagnostics,
+        validationDiagnostics,
+      );
+      recordVerificationOutcome(
+        state,
+        index,
+        "failed",
+        undefined,
+        "Promotion denied because the combined work-item batch failed validation.",
+        0,
+      );
+      return await failStep({
+        index,
+        step,
+        agent,
+        workOrder,
+        stage: "afterStep",
+        error: validationDiagnostics.join(" "),
+        resultRecord: finalResultRecord,
+        rawFinalText,
+        repairedFinalText,
+        parseError,
+        messagePrefix: `Workflow stopped at step ${index + 1} (${step.agent}) due to invalid work-item authoring`,
+      });
+    }
+
+    if (provisionalResult.status === "failed") {
       recordVerificationOutcome(
         state,
         index,
@@ -1441,6 +1553,7 @@ export async function runWorkflowByName(
       rawFinalText,
       repairedFinalText,
       parseError,
+      workItemMutation,
     );
 
     let afterPromotePatch: AfterPromotePatch | undefined;
@@ -1469,6 +1582,45 @@ export async function runWorkflowByName(
       afterPromotePatch?.diagnostics,
     );
     finalResultRecord.lastWork = promotedResult.summary;
+
+    if (
+      workItemMutation.projection.unresolvedWorkItems.length > 0 &&
+      workItemMutation.projection.readyWorkItems.length === 0
+    ) {
+      const blockedDiagnostics = [
+        "Workflow blocked because unresolved canonical work exists but no ready work items remain.",
+      ];
+      state.steps[index].diagnostics = mergeDiagnostics(
+        state.steps[index].diagnostics,
+        blockedDiagnostics,
+      );
+      state.steps[index].blockedWorkSummary = cloneBlockedWorkSummary(
+        workItemMutation.projection.blockedWorkSummary,
+      );
+      finalResultRecord.diagnostics = mergeDiagnostics(
+        finalResultRecord.diagnostics,
+        blockedDiagnostics,
+      );
+      finalResultRecord.lastWork =
+        "Workflow blocked because no ready work items remain.";
+      markStepFailure(state, index, "blocked");
+      results.push(finalResultRecord);
+      persistStepResult(persistence, index, step.agent, state, finalResultRecord);
+      persistRunArtifacts(persistence, workflow, state);
+      emitDetails();
+      return {
+        workflowName: workflow.name,
+        steps: workflow.steps,
+        workflowSource: workflow.source,
+        workflowFilePath: workflow.filePath ?? null,
+        runDir: persistence.runDir,
+        results,
+        state,
+        finalText: buildFinalTextFromState(state),
+        isError: true,
+        errorMessage: `Workflow blocked after step ${index + 1} (${step.agent}): no ready work items remain.`,
+      };
+    }
 
     results.push(finalResultRecord);
     persistStepResult(persistence, index, step.agent, state, finalResultRecord);

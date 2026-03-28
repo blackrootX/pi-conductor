@@ -1,5 +1,6 @@
 import type {
   ArtifactItem,
+  BlockedWorkSummaryItem,
   BlockerItem,
   DecisionItem,
   VerificationItem,
@@ -35,6 +36,16 @@ function formatWorkItem(item: WorkItem): string {
   const parts = [item.title];
   if (item.priority) parts.push(`priority: ${item.priority}`);
   parts.push(`status: ${item.status}`);
+  if (item.blockedBy?.length) parts.push(`blockedBy: ${item.blockedBy.length} item(s)`);
+  if (item.details) parts.push(item.details);
+  return `- ${parts.join(" | ")}`;
+}
+
+function formatBlockedWorkSummary(item: BlockedWorkSummaryItem): string {
+  const parts = [item.title, `reason: ${item.reason}`];
+  if (item.blockedByTitles?.length) {
+    parts.push(`waiting on: ${item.blockedByTitles.join(", ")}`);
+  }
   if (item.details) parts.push(item.details);
   return `- ${parts.join(" | ")}`;
 }
@@ -78,7 +89,13 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
   lines.push(
     ...renderListSection(
       "READY WORK ITEMS",
-      (workOrder.context.openWorkItems ?? []).map(formatWorkItem),
+      (workOrder.context.readyWorkItems ?? []).map(formatWorkItem),
+    ),
+  );
+  lines.push(
+    ...renderListSection(
+      "BLOCKED WORK SUMMARY",
+      (workOrder.context.blockedWorkSummary ?? []).map(formatBlockedWorkSummary),
     ),
   );
   lines.push(
@@ -171,7 +188,7 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
   lines.push(`Expected output channels: ${workOrder.expectedOutput.join(", ")}`);
   lines.push("Required fields: `status`, `summary`.");
   lines.push(
-    "Optional fields when materially relevant: `decisions`, `artifacts`, `learnings`, `blockers`, `verification`, `newWorkItems`, `resolvedWorkItems`, `focusSummary`, `nextStepHint`, `evidenceHints`.",
+    "Optional fields when materially relevant: `decisions`, `artifacts`, `learnings`, `blockers`, `verification`, `newWorkItems` (with optional `blockedByTitles`), `resolvedWorkItems`, `focusSummary`, `nextStepHint`, `evidenceHints`.",
   );
   lines.push("");
   lines.push("Marker block template:");
@@ -188,7 +205,8 @@ export function renderStructuredStepPrompt(workOrder: WorkOrder): string {
   lines.push("    {");
   lines.push('      "title": "Actionable follow-up task",');
   lines.push('      "details": "Optional detail",');
-  lines.push('      "priority": "medium"');
+  lines.push('      "priority": "medium",');
+  lines.push('      "blockedByTitles": ["Optional prerequisite title"]');
   lines.push("    }");
   lines.push("  ],");
   lines.push('  "resolvedWorkItems": [');
@@ -228,7 +246,7 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "RESPONSE CONTRACT",
     `Return exactly one JSON object between ${WORKFLOW_RESULT_BEGIN} and ${WORKFLOW_RESULT_END}.`,
     "Required fields:",
-    '- `status`: one of "success", "blocked", or "failed"',
+    '- `status`: one of "success" or "failed"',
     '- `summary`: concise string',
     "Optional fields:",
     "- `decisions`",
@@ -236,7 +254,7 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "- `learnings`",
     "- `blockers`",
     "- `verification`",
-    "- `newWorkItems`",
+    "- `newWorkItems` with optional `blockedByTitles`",
     "- `resolvedWorkItems`",
     "- `focusSummary`",
     "- `nextStepHint`",
@@ -246,7 +264,7 @@ export function renderRepairPrompt(rawText: string, parseError: string): string 
     "{",
     '  "status": "success",',
     '  "summary": "...",',
-    '  "newWorkItems": [],',
+    '  "newWorkItems": [{"title": "...", "blockedByTitles": []}],',
     '  "resolvedWorkItems": [],',
     '  "evidenceHints": { "touchedFiles": [] }',
     "}",

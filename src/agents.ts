@@ -25,6 +25,16 @@ export interface AgentDiscoveryResult {
   globalAgentsDir: string;
 }
 
+export type RuntimeToolClass =
+  | "read-only"
+  | "write-capable"
+  | "unspecified";
+
+export interface ExecutionProfileResolution {
+  baseProfile: ExecutionProfile;
+  resolvedProfile: ExecutionProfile;
+}
+
 type BuiltInAgentDefinition = Omit<AgentConfig, "systemPrompt"> & {
   internalIncludes: string[];
   rolePrompt: string;
@@ -76,9 +86,9 @@ function getBuiltInAgents(): AgentConfig[] {
   }));
 }
 
-function getAgentToolClass(
+export function getAgentToolClass(
   agent: AgentConfig | undefined,
-): "read-only" | "write-capable" | "unspecified" {
+): RuntimeToolClass {
   const tools = agent?.tools ?? [];
   if (tools.length === 0) return "unspecified";
   return tools.some((tool) => tool === "write" || tool === "edit" || tool === "bash")
@@ -86,7 +96,7 @@ function getAgentToolClass(
     : "read-only";
 }
 
-export function resolveExecutionProfile(
+function inferBaseExecutionProfile(
   step: WorkflowStepConfig,
   agent: AgentConfig | undefined,
 ): ExecutionProfile {
@@ -102,6 +112,36 @@ export function resolveExecutionProfile(
   if (toolClass === "write-capable") return "implement";
 
   return agent?.source === "built-in" ? "implement" : "explore";
+}
+
+function resolveProfilePolicy(
+  baseProfile: ExecutionProfile,
+  step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+): ExecutionProfile {
+  const normalizedStepId = step.id.trim().toLowerCase();
+  const toolClass = getAgentToolClass(agent);
+
+  if (
+    baseProfile === "implement" &&
+    toolClass === "write-capable" &&
+    (normalizedStepId.includes("verify") ||
+      normalizedStepId.includes("evidence") ||
+      normalizedStepId.includes("context"))
+  ) {
+    return "verify-context";
+  }
+
+  return baseProfile;
+}
+
+export function resolveExecutionProfile(
+  step: WorkflowStepConfig,
+  agent: AgentConfig | undefined,
+): ExecutionProfileResolution {
+  const baseProfile = inferBaseExecutionProfile(step, agent);
+  const resolvedProfile = resolveProfilePolicy(baseProfile, step, agent);
+  return { baseProfile, resolvedProfile };
 }
 
 export function resolveAgentSystemPrompt(

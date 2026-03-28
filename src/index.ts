@@ -34,10 +34,8 @@ import {
 } from "./workflow-cards.js";
 import { registerWorkflowMessageRenderer } from "./workflow-message-renderer.js";
 import {
-  getBlockedWorkItems,
   getDoneWorkItems,
-  getOpenWorkItems,
-  getUnresolvedWorkItems,
+  projectWorkItems,
 } from "./workflow-work-items.js";
 import {
   WORKFLOW_MESSAGE_TYPE,
@@ -231,10 +229,13 @@ function aggregateUsage(results: SingleResult[]) {
 }
 
 function buildSharedSummaryLine(shared: SharedState): string {
+  const projection = projectWorkItems(shared.workItems);
+  const readyCount = projection.ok ? projection.projection.readyWorkItems.length : 0;
+  const blockedCount = projection.ok ? projection.projection.blockedWorkSummary.length : 0;
   return [
-    `open:${getOpenWorkItems(shared.workItems).length}`,
+    `ready:${readyCount}`,
     `done:${getDoneWorkItems(shared.workItems).length}`,
-    `blocked:${getBlockedWorkItems(shared.workItems).length}`,
+    `blocked:${blockedCount}`,
     `blockers:${shared.blockers.length}`,
     `decisions:${shared.decisions.length}`,
     `learnings:${shared.learnings.length}`,
@@ -243,13 +244,13 @@ function buildSharedSummaryLine(shared: SharedState): string {
 }
 
 function getCurrentFocus(shared: SharedState): string | undefined {
-  const explicitFocus = shared.focus?.trim();
-  if (explicitFocus) return explicitFocus;
-  return getUnresolvedWorkItems(shared.workItems)[0]?.title;
+  const projection = projectWorkItems(shared.workItems);
+  return projection.ok ? projection.projection.currentFocus : undefined;
 }
 
-function getTopPendingWorkItem(shared: SharedState): string | undefined {
-  const item = getUnresolvedWorkItems(shared.workItems)[0];
+function getTopReadyWorkItem(shared: SharedState): string | undefined {
+  const projection = projectWorkItems(shared.workItems);
+  const item = projection.ok ? projection.projection.readyWorkItems[0] : undefined;
   if (!item) return undefined;
   const parts = [item.title, item.status];
   if (item.priority) parts.push(item.priority);
@@ -533,7 +534,7 @@ function renderWorkflowResult(
   const successCount = details.results.filter((item) => !isErrorResult(item))
     .length;
   const icon =
-    successCount === details.results.length
+    details.state.status === "done" && successCount === details.results.length
       ? theme.fg("success", "✓")
       : theme.fg("error", "✗");
 
@@ -570,10 +571,10 @@ function renderWorkflowResult(
       );
     }
 
-    const topPendingWorkItem = getTopPendingWorkItem(shared);
-    if (topPendingWorkItem) {
+    const topReadyWorkItem = getTopReadyWorkItem(shared);
+    if (topReadyWorkItem) {
       container.addChild(
-        new Text(theme.fg("dim", `Top pending: ${topPendingWorkItem}`), 0, 0),
+        new Text(theme.fg("dim", `Top ready: ${topReadyWorkItem}`), 0, 0),
       );
     }
     container.addChild(
@@ -586,7 +587,7 @@ function renderWorkflowResult(
     for (let index = 0; index < details.results.length; index++) {
       const step = details.results[index];
       const stateStep = details.state.steps[index];
-      const stepIcon = isErrorResult(step)
+      const stepIcon = isErrorResult(step) || stateStep?.status === "blocked" || stateStep?.status === "failed"
         ? theme.fg("error", "✗")
         : theme.fg("success", "✓");
       const displayItems = getDisplayItems(step.messages);
@@ -716,17 +717,17 @@ function renderWorkflowResult(
     text += `\n${theme.fg("dim", `Focus: ${currentFocus}`)}`;
   }
 
-  const topPendingWorkItem = getTopPendingWorkItem(details.state.shared);
-	  if (topPendingWorkItem) {
-	    text += `\n${theme.fg("dim", `Top pending: ${topPendingWorkItem}`)}`;
-	  }
-	  text += `\n${theme.fg("dim", buildWorkflowVerificationSummary(details))}`;
-	  text += `\n${theme.fg("dim", `Run artifacts: ${details.runDir}`)}`;
+  const topReadyWorkItem = getTopReadyWorkItem(details.state.shared);
+  if (topReadyWorkItem) {
+    text += `\n${theme.fg("dim", `Top ready: ${topReadyWorkItem}`)}`;
+  }
+  text += `\n${theme.fg("dim", buildWorkflowVerificationSummary(details))}`;
+  text += `\n${theme.fg("dim", `Run artifacts: ${details.runDir}`)}`;
 
 	  for (let index = 0; index < details.results.length; index++) {
-	    const step = details.results[index];
-	    const stateStep = details.state.steps[index];
-    const stepIcon = isErrorResult(step)
+    const step = details.results[index];
+    const stateStep = details.state.steps[index];
+    const stepIcon = isErrorResult(step) || stateStep?.status === "blocked" || stateStep?.status === "failed"
       ? theme.fg("error", "✗")
       : theme.fg("success", "✓");
     const displayItems = getDisplayItems(step.messages);

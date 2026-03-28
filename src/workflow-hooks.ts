@@ -1,5 +1,4 @@
 import type { AgentConfig } from "./agents.js";
-import { normalizeWorkItemTitle } from "./workflow-work-items.js";
 import type {
   AgentResult,
   ArtifactItem,
@@ -36,18 +35,15 @@ export interface SharedStatePatch {
   learnings?: string[];
   blockers?: BlockerItem[];
   verification?: VerificationItem[];
-  workItems?: WorkItem[];
 }
 
 export interface WorkOrderContextPatch {
   summary?: string | null;
-  currentFocus?: string | null;
   decisions?: DecisionItem[];
   artifacts?: ArtifactItem[];
   learnings?: string[];
   blockers?: BlockerItem[];
   verification?: VerificationItem[];
-  openWorkItems?: WorkItem[];
   recentResolvedWorkItems?: WorkItem[];
 }
 
@@ -296,15 +292,13 @@ function verificationKey(item: VerificationItem): string {
 }
 
 function workItemKey(item: WorkItem): string {
-  return item.id || normalizeWorkItemTitle(item.title) || item.title.trim().toLowerCase();
+  return item.id || item.title.trim().toLowerCase();
 }
 
-function newWorkItemKey(item: NewWorkItemInput): string {
-  return normalizeWorkItemTitle(item.title) || item.title.trim().toLowerCase();
-}
-
-function resolvedWorkItemKey(item: ResolvedWorkItemInput): string {
-  return normalizeWorkItemTitle(item.title) || item.title.trim().toLowerCase();
+function appendItems<T>(current: T[] | undefined, patch: T[] | undefined): T[] | undefined {
+  if (!patch || patch.length === 0) return current;
+  if (!current || current.length === 0) return [...patch];
+  return [...current, ...patch];
 }
 
 function mergeSharedPatchIntoContext(
@@ -316,11 +310,6 @@ function mergeSharedPatchIntoContext(
   return {
     ...current,
     summary: applyStringPatch(current.summary, patch.summary, hasOwn(patch, "summary")),
-    currentFocus: applyStringPatch(
-      current.currentFocus,
-      patch.currentFocus,
-      hasOwn(patch, "currentFocus"),
-    ),
     decisions: mergeUniqueItems(current.decisions, patch.decisions, decisionKey),
     artifacts: mergeUniqueItems(current.artifacts, patch.artifacts, artifactKey),
     learnings: mergeOrderedStrings(current.learnings, patch.learnings),
@@ -329,11 +318,6 @@ function mergeSharedPatchIntoContext(
       current.verification,
       patch.verification,
       verificationKey,
-    ),
-    openWorkItems: mergeUniqueItems(
-      current.openWorkItems,
-      patch.openWorkItems,
-      workItemKey,
     ),
     recentResolvedWorkItems: mergeUniqueItems(
       current.recentResolvedWorkItems,
@@ -383,9 +367,6 @@ export function mergeSharedStatePatch(
         patch.verification,
         verificationKey,
       ) ?? current.verification,
-    workItems:
-      mergeUniqueItems(current.workItems, patch.workItems, workItemKey) ??
-      current.workItems,
   };
 }
 
@@ -451,15 +432,10 @@ export function mergeAfterStepPatch(
       patch.verification,
       verificationKey,
     ),
-    newWorkItems: mergeUniqueItems(
-      current.newWorkItems,
-      patch.newWorkItems,
-      newWorkItemKey,
-    ),
-    resolvedWorkItems: mergeUniqueItems(
+    newWorkItems: appendItems(current.newWorkItems, patch.newWorkItems),
+    resolvedWorkItems: appendItems(
       current.resolvedWorkItems,
       patch.resolvedWorkItems,
-      resolvedWorkItemKey,
     ),
     focusSummary: applyStringPatch(
       current.focusSummary,

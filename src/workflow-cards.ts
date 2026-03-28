@@ -244,8 +244,8 @@ function buildOverviewSubline(payload: WorkflowCardPayload, width: number): stri
       : `${payload.steps.length} step${payload.steps.length === 1 ? "" : "s"} queued`;
   const focus = payload.currentFocus?.trim()
     ? truncateText(payload.currentFocus.trim().replace(/\s+/g, " "), 30)
-    : payload.topPendingWorkItem?.trim()
-      ? truncateText(payload.topPendingWorkItem.trim().replace(/\s+/g, " "), 30)
+    : payload.topReadyWorkItem?.trim()
+      ? truncateText(payload.topReadyWorkItem.trim().replace(/\s+/g, " "), 30)
       : "";
 
   const combined = focus ? `${stepSummary}  •  ${focus}` : stepSummary;
@@ -254,7 +254,7 @@ function buildOverviewSubline(payload: WorkflowCardPayload, width: number): stri
 
 function buildOverviewMetrics(payload: WorkflowCardPayload, width: number): string {
   return truncateText(
-    `open ${payload.summary.openWorkItems}  done ${payload.summary.doneWorkItems}  blocked ${payload.summary.blockedWorkItems}  blockers ${payload.summary.blockers}  verify ${payload.summary.verification}`,
+    `ready ${payload.summary.readyWorkItems}  done ${payload.summary.doneWorkItems}  blocked ${payload.summary.blockedWorkItems}  blockers ${payload.summary.blockers}  verify ${payload.summary.verification}`,
     width,
   );
 }
@@ -335,9 +335,9 @@ function renderCard(
         innerWidth - 1,
       )
     : "verify summary: —";
-  const pending = state.topPendingWorkItem?.trim()
-    ? truncateText(`pending: ${state.topPendingWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
-    : "pending: —";
+  const pending = state.topReadyWorkItem?.trim()
+    ? truncateText(`ready: ${state.topReadyWorkItem.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
+    : "ready: —";
   const focus = state.currentFocus?.trim()
     ? truncateText(`focus: ${state.currentFocus.trim().replace(/\s+/g, " ")}`, innerWidth - 1)
     : "focus: —";
@@ -382,7 +382,7 @@ function renderCard(
       cardBorder,
     ),
     stylePaddedLine(` ${state.currentFocus ? styler.muted(focus) : styler.dim(focus)}`, innerWidth, cardBorder),
-    stylePaddedLine(` ${state.topPendingWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, cardBorder),
+    stylePaddedLine(` ${state.topReadyWorkItem ? styler.muted(pending) : styler.dim(pending)}`, innerWidth, cardBorder),
     stylePaddedLine(` ${styler.accent("latest")}`, innerWidth, cardBorder),
     stylePaddedLine(
       ` ${lastWork === "—" ? styler.dim(lastWork) : styler.muted(lastWork)}`,

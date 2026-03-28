@@ -96,7 +96,7 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
         lines.push(
           theme.fg(
             "muted",
-            `open:${snapshot.presentation.summary.openWorkItems} done:${snapshot.presentation.summary.doneWorkItems} blocked:${snapshot.presentation.summary.blockedWorkItems} blockers:${snapshot.presentation.summary.blockers} verification:${snapshot.presentation.summary.verification}`,
+            `ready:${snapshot.presentation.summary.readyWorkItems} done:${snapshot.presentation.summary.doneWorkItems} blocked:${snapshot.presentation.summary.blockedWorkItems} blockers:${snapshot.presentation.summary.blockers} verification:${snapshot.presentation.summary.verification}`,
           ),
         );
         if (progress) lines.push(theme.fg("toolOutput", progress));
@@ -120,12 +120,12 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
         );
       }
 
-      if (snapshot.presentation.topPendingWorkItem) {
+      if (snapshot.presentation.topReadyWorkItem) {
         container.addChild(
           new Text(
             theme.fg(
               "dim",
-              `Top pending: ${snapshot.presentation.topPendingWorkItem}`,
+              `Top ready: ${snapshot.presentation.topReadyWorkItem}`,
             ),
             0,
             0,
@@ -142,8 +142,8 @@ export function registerWorkflowMessageRenderer(pi: ExtensionAPI): void {
         renderList("Blockers", snapshot.presentation.blockers, theme),
         renderList("Decisions", snapshot.presentation.decisions, theme),
         renderList("Verification", snapshot.presentation.verification, theme),
-        renderList("Open Work", snapshot.presentation.openWorkItems, theme),
-        renderList("Blocked Work", snapshot.presentation.blockedWorkItems, theme),
+        renderList("Ready Work", snapshot.presentation.readyWorkItems, theme),
+        renderList("Blocked Work", snapshot.presentation.blockedWorkSummary, theme),
       ].filter((item): item is Text => Boolean(item));
 
       if (lists.length > 0) {

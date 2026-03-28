@@ -2,6 +2,7 @@ import type { AgentConfig } from "./agents.js";
 import type {
   AgentResult,
   ArtifactItem,
+  BlockedWorkSummaryItem,
   DecisionItem,
   EvidenceHints,
   ExecutionProfile,
@@ -17,18 +18,14 @@ import type {
   WorkOrder,
 } from "./workflow-types.js";
 import {
-  createWorkItemId,
-  findWorkItemByTitle,
-  findWorkItemForBlocker,
-  getBlockedWorkItems,
   getDoneWorkItems,
-  getOpenWorkItems,
   getRecentResolvedWorkItems,
-  getUnresolvedWorkItems,
+  projectWorkItems,
+  type WorkItemProjection,
 } from "./workflow-work-items.js";
 
 const MAX_OBJECTIVE_OPEN_ITEMS = 3;
-const MAX_PROJECTED_OPEN_ITEMS = 6;
+const MAX_PROJECTED_READY_ITEMS = 6;
 const MAX_PROJECTED_RESOLVED_ITEMS = 4;
 
 function nowIso(): string {
@@ -52,31 +49,24 @@ function normalizeText(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function mergePriority(
-  current: WorkItem["priority"],
-  incoming: WorkItem["priority"],
-): WorkItem["priority"] {
-  if (!current) return incoming;
-  if (!incoming) return current;
-
-  const rank = { high: 3, medium: 2, low: 1 } as const;
-  return rank[incoming] > rank[current] ? incoming : current;
+function getProjectedWorkItems(state: WorkflowState): WorkItemProjection {
+  const projection = projectWorkItems(state.shared.workItems);
+  if (projection.ok) return projection.projection;
+  return {
+    readyWorkItems: [],
+    blockedWorkSummary: [],
+    unresolvedWorkItems: state.shared.workItems
+      .filter((item) => item.status !== "done")
+      .map((item) => ({
+        ...item,
+        blockedBy: item.blockedBy ? [...item.blockedBy] : undefined,
+      })),
+    currentFocus: undefined,
+  };
 }
 
 function deriveCurrentFocus(state: WorkflowState): string | undefined {
-  const explicitFocus = state.shared.focus?.trim();
-  if (explicitFocus) return explicitFocus;
-
-  const topOpenWorkItem = getOpenWorkItems(state.shared.workItems)[0];
-  if (topOpenWorkItem) return topOpenWorkItem.title;
-
-  const topBlockedWorkItem = getBlockedWorkItems(state.shared.workItems)[0];
-  if (topBlockedWorkItem) return `Unblock: ${topBlockedWorkItem.title}`;
-
-  const latestBlocker = state.shared.blockers.at(-1);
-  if (latestBlocker?.issue.trim()) return latestBlocker.issue.trim();
-
-  return undefined;
+  return getProjectedWorkItems(state).currentFocus;
 }
 
 export function normalizeDecisions(
@@ -175,9 +165,8 @@ function buildPlanningObjective(
   const agentHint = agent?.description?.trim()
     ? `Use the agent specialty as a hint, not as a rigid role: ${agent.description.trim()}.`
     : undefined;
-  const currentFocus = deriveCurrentFocus(state);
-  const openWorkItems = getOpenWorkItems(state.shared.workItems);
-  const topOpenWorkTitles = openWorkItems
+  const projection = getProjectedWorkItems(state);
+  const topReadyWorkTitles = projection.readyWorkItems
     .slice(0, MAX_OBJECTIVE_OPEN_ITEMS)
     .map((item) => item.title);
 
@@ -185,12 +174,14 @@ function buildPlanningObjective(
     `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
     agentHint,
     "This is a planning step: inspect the repository and workflow state, but do not implement the task in this step.",
-    topOpenWorkTitles.length > 0
-      ? `Prioritize clarifying, refining, or reordering the currently open work items instead of executing them yourself: ${topOpenWorkTitles.join("; ")}.`
+    topReadyWorkTitles.length > 0
+      ? `Prioritize clarifying, refining, or reordering the currently ready work items instead of executing them yourself: ${topReadyWorkTitles.join("; ")}.`
       : "Break the user's task into actionable `newWorkItems` for a later implementation step. If the task is already complete, verify that through inspection only.",
-    currentFocus
-      ? `Keep the current focus in mind: ${currentFocus}.`
-      : "Identify the best next focus that will help the next step execute efficiently.",
+    projection.currentFocus
+      ? `Keep the current ready-work focus in mind: ${projection.currentFocus}.`
+      : projection.unresolvedWorkItems.length > 0
+        ? "No ready work is available yet. Refine the plan without fabricating a blocked item into the next actionable focus."
+        : "Identify the best next focus that will help the next step execute efficiently.",
     "Do not modify files, create files, or claim implementation work you did not perform in this step.",
     "Use the structured result to record decisions, blockers, verification, and a short focusSummary for the next step.",
   ]
@@ -235,20 +226,20 @@ function buildGenericObjective(
   const agentHint = agent?.description?.trim()
     ? `Use the agent specialty as a hint, not as a rigid role: ${agent.description.trim()}.`
     : undefined;
-  const currentFocus = deriveCurrentFocus(state);
-  const openWorkItems = getOpenWorkItems(state.shared.workItems);
+  const projection = getProjectedWorkItems(state);
+  const readyWorkItems = projection.readyWorkItems;
   const recentResolvedWorkItems = getRecentResolvedWorkItems(state.shared.workItems, 2);
   const hasCompletedSteps = state.steps.slice(0, index).some((item) => item.status === "done");
 
-  if (!hasCompletedSteps && openWorkItems.length === 0) {
+  if (!hasCompletedSteps && projection.unresolvedWorkItems.length === 0) {
     return [
       `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
       agentHint,
       profile === "explore"
         ? "Start by understanding the user's task and inspecting the repository or shared state that matters for this read-only step."
         : "Start by understanding the user's task and inspecting the repository or shared state that matters for this step.",
-      currentFocus
-        ? `Keep the current focus in mind: ${currentFocus}.`
+      projection.currentFocus
+        ? `Keep the current focus in mind: ${projection.currentFocus}.`
         : "Identify the most important focus that will move the workflow forward.",
       profile === "explore"
         ? "Gather concrete findings, evidence targets, and next-step guidance without modifying repository state."
@@ -258,7 +249,28 @@ function buildGenericObjective(
       .join(" ");
   }
 
-  const topOpenWorkTitles = openWorkItems
+  if (readyWorkItems.length === 0 && projection.unresolvedWorkItems.length > 0) {
+    const blockedTitles = projection.blockedWorkSummary
+      .slice(0, MAX_OBJECTIVE_OPEN_ITEMS)
+      .map((item) =>
+        item.blockedByTitles?.length
+          ? `${item.title} (waiting on: ${item.blockedByTitles.join(", ")})`
+          : item.title,
+      );
+    return [
+      `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
+      agentHint,
+      "No ready work items are currently available. Do not invent a new actionable focus from blocked work.",
+      blockedTitles.length > 0
+        ? `Current blocked work: ${blockedTitles.join("; ")}.`
+        : undefined,
+      "Inspect the existing blocked state and return only concrete diagnostics or unblock guidance.",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  const topReadyWorkTitles = readyWorkItems
     .slice(0, MAX_OBJECTIVE_OPEN_ITEMS)
     .map((item) => item.title);
   const resolvedHint = recentResolvedWorkItems.length > 0
@@ -268,10 +280,10 @@ function buildGenericObjective(
   return [
     `Advance ${stepLabel} for the "${state.workflowName}" workflow using agent "${step.agent}".`,
     agentHint,
-    topOpenWorkTitles.length > 0
-      ? `Prioritize the currently open work items before starting unrelated work: ${topOpenWorkTitles.join("; ")}.`
-      : "If no open work items exist yet, identify and complete the next most actionable piece of work.",
-    currentFocus ? `Current focus: ${currentFocus}.` : undefined,
+    topReadyWorkTitles.length > 0
+      ? `Prioritize the currently ready work items before starting unrelated work: ${topReadyWorkTitles.join("; ")}.`
+      : "If no ready work items exist yet, identify and complete the next most actionable piece of work.",
+    projection.currentFocus ? `Current focus: ${projection.currentFocus}.` : undefined,
     resolvedHint,
     profile === "explore"
       ? "Record findings, blockers, and evidence hints in the structured result so a later step can act on verified context."
@@ -409,14 +421,16 @@ export function buildWorkOrder(
     state.steps.length,
     profile,
   );
-  const openWorkItems = getUnresolvedWorkItems(state.shared.workItems)
-    .slice(0, MAX_PROJECTED_OPEN_ITEMS)
+  const projection = getProjectedWorkItems(state);
+  const readyWorkItems = projection.readyWorkItems
+    .slice(0, MAX_PROJECTED_READY_ITEMS)
     .map((item) => ({ ...item }));
+  const blockedWorkSummary = projection.blockedWorkSummary.map((item) => ({ ...item }));
   const recentResolvedWorkItems = getRecentResolvedWorkItems(
     state.shared.workItems,
     MAX_PROJECTED_RESOLVED_ITEMS,
   ).map((item) => ({ ...item }));
-  const currentFocus = deriveCurrentFocus(state);
+  const currentFocus = projection.currentFocus;
   const allowedTools =
     agent?.tools && agent.tools.length > 0 ? [...agent.tools] : undefined;
   const profileGuidance = buildProfileGuidance(profile);
@@ -455,7 +469,8 @@ export function buildWorkOrder(
       learnings: state.shared.learnings,
       blockers: state.shared.blockers,
       verification: state.shared.verification,
-      openWorkItems,
+      readyWorkItems,
+      blockedWorkSummary,
       recentResolvedWorkItems,
       currentFocus,
     },
@@ -481,6 +496,7 @@ export function markStepRunning(state: WorkflowState, stepIndex: number): void {
   const step = state.steps[stepIndex];
   if (!step) return;
   step.status = "running";
+  step.blockedWorkSummary = undefined;
   step.startedAt = step.startedAt ?? nowIso();
   step.verifyStatus = "pending";
   step.verifySummary = undefined;
@@ -516,16 +532,17 @@ export function mergeAgentResultIntoState(
   rawFinalText: string,
   repairedFinalText?: string,
   parseError?: string,
+  workItemUpdate?: {
+    workItems: WorkItem[];
+    projection: WorkItemProjection;
+  },
 ): void {
   const step = state.steps[stepIndex];
   if (!step) return;
   const finishedAt = nowIso();
-  const stepId = step.stepId;
-  const agentName = step.agent;
   const touchedWorkProgression =
     Boolean(result.newWorkItems?.length) ||
-    Boolean(result.resolvedWorkItems?.length) ||
-    Boolean(result.blockers?.length);
+    Boolean(result.resolvedWorkItems?.length);
 
   const summary = result.summary.trim();
   if (summary) state.shared.summary = summary;
@@ -573,67 +590,11 @@ export function mergeAgentResultIntoState(
       ...normalizedVerification,
     ];
   }
-
-  if (result.newWorkItems?.length) {
-    for (const newWorkItem of result.newWorkItems) {
-      const existing = findWorkItemByTitle(state.shared.workItems, newWorkItem.title);
-      if (existing) {
-        existing.title = newWorkItem.title;
-        existing.details = newWorkItem.details ?? existing.details;
-        existing.priority = mergePriority(existing.priority, newWorkItem.priority);
-        existing.status =
-          existing.status === "done"
-            ? "open"
-            : existing.status === "in_progress"
-              ? "in_progress"
-              : existing.status === "blocked"
-                ? "blocked"
-                : "open";
-        existing.updatedAt = finishedAt;
-        continue;
-      }
-
-      state.shared.workItems.push({
-        id: createWorkItemId(newWorkItem.title),
-        title: newWorkItem.title,
-        details: newWorkItem.details,
-        status: "open",
-        priority: newWorkItem.priority,
-        sourceStepId: stepId,
-        sourceAgent: agentName,
-        updatedAt: finishedAt,
-      });
-    }
-  }
-
-  if (result.resolvedWorkItems?.length) {
-    for (const resolvedWorkItem of result.resolvedWorkItems) {
-      const existing = findWorkItemByTitle(state.shared.workItems, resolvedWorkItem.title);
-      if (existing) {
-        existing.title = resolvedWorkItem.title;
-        existing.status = "done";
-        existing.updatedAt = finishedAt;
-        continue;
-      }
-
-      state.shared.workItems.push({
-        id: createWorkItemId(resolvedWorkItem.title),
-        title: resolvedWorkItem.title,
-        status: "done",
-        sourceStepId: stepId,
-        sourceAgent: agentName,
-        updatedAt: finishedAt,
-      });
-    }
-  }
-
-  if (normalizedBlockers?.length) {
-    for (const blocker of normalizedBlockers) {
-      const matchingWorkItem = findWorkItemForBlocker(state.shared.workItems, blocker.issue);
-      if (!matchingWorkItem || matchingWorkItem.status === "done") continue;
-      matchingWorkItem.status = "blocked";
-      matchingWorkItem.updatedAt = finishedAt;
-    }
+  if (workItemUpdate) {
+    state.shared.workItems = workItemUpdate.workItems.map((item) => ({
+      ...item,
+      blockedBy: item.blockedBy ? [...item.blockedBy] : undefined,
+    }));
   }
 
   step.result = {
@@ -650,18 +611,11 @@ export function mergeAgentResultIntoState(
   step.rawFinalText = rawFinalText;
   step.repairedFinalText = repairedFinalText;
   step.parseError = parseError;
-  step.status =
-    result.status === "blocked"
-      ? "blocked"
-      : result.status === "failed"
-        ? "failed"
-        : "done";
+  step.blockedWorkSummary =
+    workItemUpdate?.projection.blockedWorkSummary.map((item) => ({ ...item })) ??
+    undefined;
+  step.status = "done";
   step.finishedAt = finishedAt;
-
-  if (result.status === "blocked" || result.status === "failed") {
-    state.status = result.status;
-    state.finishedAt = finishedAt;
-  }
 }
 
 export function deriveProvisionalResult(result: AgentResult): AgentResult {
@@ -721,6 +675,7 @@ export function buildCanonicalStepSnapshot(
     profile: step.profile,
     objective: step.objective,
     status: step.status,
+    blockedWorkSummary: step.blockedWorkSummary,
     verifyStatus: step.verifyStatus,
     verifySummary: step.verifySummary,
     startedAt: step.startedAt,
@@ -760,24 +715,44 @@ function formatVerificationLine(item: VerificationItem): string {
   return `- ${item.check}: ${item.status}${item.notes ? ` (${item.notes})` : ""}`;
 }
 
+function formatBlockedSummaryLine(item: BlockedWorkSummaryItem): string {
+  const parts = [item.title, item.reason];
+  if (item.blockedByTitles?.length) {
+    parts.push(`waiting on: ${item.blockedByTitles.join(", ")}`);
+  }
+  if (item.details) {
+    parts.push(item.details);
+  }
+  return `- ${parts.join(" | ")}`;
+}
+
 export function buildFinalTextFromState(state: WorkflowState): string {
   const sections: string[] = [];
   const summary = state.shared.summary?.trim();
   if (summary) sections.push(summary);
 
-  const focus = deriveCurrentFocus(state);
+  const projection = getProjectedWorkItems(state);
+  const focus = projection.currentFocus;
   if (focus) {
     sections.push(`Current focus: ${focus}`);
   }
 
-  const unresolvedWorkItems = getUnresolvedWorkItems(state.shared.workItems);
-  if (unresolvedWorkItems.length > 0) {
+  if (projection.readyWorkItems.length > 0) {
     sections.push(
       [
-        "Unresolved work:",
-        ...unresolvedWorkItems.map((item) =>
+        "Ready work:",
+        ...projection.readyWorkItems.map((item) =>
           `- ${item.title} [${item.status}]${item.details ? ` (${item.details})` : ""}`,
         ),
+      ].join("\n"),
+    );
+  }
+
+  if (projection.blockedWorkSummary.length > 0) {
+    sections.push(
+      [
+        "Blocked work:",
+        ...projection.blockedWorkSummary.map(formatBlockedSummaryLine),
       ].join("\n"),
     );
   }
@@ -813,13 +788,14 @@ export function completeWorkflowState(state: WorkflowState): void {
 }
 
 export function getStateSummaryCounts(state: WorkflowState) {
+  const projection = getProjectedWorkItems(state);
   return {
     decisions: state.shared.decisions.length,
     learnings: state.shared.learnings.length,
     blockers: state.shared.blockers.length,
     verification: state.shared.verification.length,
-    openWorkItems: getOpenWorkItems(state.shared.workItems).length,
+    readyWorkItems: projection.readyWorkItems.length,
     doneWorkItems: getDoneWorkItems(state.shared.workItems).length,
-    blockedWorkItems: getBlockedWorkItems(state.shared.workItems).length,
+    blockedWorkItems: projection.blockedWorkSummary.length,
   };
 }

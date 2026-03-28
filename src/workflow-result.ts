@@ -92,6 +92,11 @@ function normalizeNewWorkItem(value: unknown): NewWorkItemInput | undefined {
   const title = normalizeText(value.title);
   if (!title) return undefined;
   const priority = normalizeText(value.priority);
+  const blockedByTitles = Array.isArray(value.blockedByTitles)
+    ? value.blockedByTitles
+        .map((item) => normalizeText(item))
+        .filter((item): item is string => Boolean(item))
+    : undefined;
   return {
     title,
     details: normalizeText(value.details),
@@ -99,7 +104,35 @@ function normalizeNewWorkItem(value: unknown): NewWorkItemInput | undefined {
       priority === "low" || priority === "medium" || priority === "high"
         ? priority
         : undefined,
+    ...(Array.isArray(value.blockedByTitles) ? { blockedByTitles } : {}),
   };
+}
+
+function validateNewWorkItemArray(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    return "`newWorkItems` must be an array when provided.";
+  }
+
+  for (const [index, item] of value.entries()) {
+    if (!isObject(item)) {
+      return `newWorkItems[${index}] must be an object.`;
+    }
+    if (!normalizeText(item.title)) {
+      return `newWorkItems[${index}].title must be a non-empty string.`;
+    }
+    if (!Object.prototype.hasOwnProperty.call(item, "blockedByTitles")) continue;
+    if (!Array.isArray(item.blockedByTitles)) {
+      return `newWorkItems[${index}].blockedByTitles must be an array of non-empty strings when provided.`;
+    }
+    for (const dependencyTitle of item.blockedByTitles) {
+      if (!normalizeText(dependencyTitle)) {
+        return `newWorkItems[${index}].blockedByTitles must contain only non-empty strings.`;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function normalizeResolvedWorkItem(value: unknown): ResolvedWorkItemInput | undefined {
@@ -184,6 +217,14 @@ export function validateAgentResultShape(
     return {
       ok: false,
       error: "Structured result requires a non-empty `summary` string.",
+    };
+  }
+
+  const newWorkItemsError = validateNewWorkItemArray(value.newWorkItems);
+  if (newWorkItemsError) {
+    return {
+      ok: false,
+      error: newWorkItemsError,
     };
   }
 
