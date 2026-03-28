@@ -46,6 +46,7 @@ import type {
   ExecutionProfile,
   VerificationItem,
   VerifyStatus,
+  WorkflowPersistedStateSnapshot,
   WorkflowConfig,
   WorkflowState,
 } from "./workflow-types.js";
@@ -737,9 +738,11 @@ function persistStepResult(
     stepId: result.stepId,
     agent: result.agent,
     agentSource: result.agentSource,
+    task: result.task,
     profile: result.profile ?? stepState?.profile,
     objective: result.objective,
     exitCode: result.exitCode,
+    elapsedMs: result.elapsedMs,
     structuredStatus: result.structuredStatus,
     verifyStatus: stepState?.verifyStatus,
     verifySummary: stepState?.verifySummary,
@@ -749,6 +752,7 @@ function persistStepResult(
     repairAttempted: result.repairAttempted,
     rawFinalText: result.rawFinalText,
     repairedFinalText: result.repairedFinalText,
+    messages: result.messages,
     provisionalResult: stepState?.provisionalResult ?? null,
     evidenceHints: stepState?.evidenceHints ?? null,
     diagnostics: stepState?.diagnostics ?? result.diagnostics ?? null,
@@ -784,6 +788,339 @@ function persistRunArtifacts(
 ): void {
   persistWorkflowState(persistence, workflow, state);
   persistWorkflowBuckets(persistence, state);
+}
+
+function cloneAgentResult(result: AgentResult | undefined): AgentResult | undefined {
+  if (!result) return undefined;
+  return {
+    ...result,
+    decisions: result.decisions?.map((item) => ({ ...item })),
+    artifacts: result.artifacts?.map((item) => ({ ...item })),
+    learnings: result.learnings ? [...result.learnings] : undefined,
+    blockers: result.blockers?.map((item) => ({ ...item })),
+    verification: result.verification?.map((item) => ({ ...item })),
+    newWorkItems: result.newWorkItems?.map((item) => ({
+      ...item,
+      blockedByTitles: item.blockedByTitles ? [...item.blockedByTitles] : undefined,
+    })),
+    resolvedWorkItems: result.resolvedWorkItems?.map((item) => ({ ...item })),
+    evidenceHints: result.evidenceHints
+      ? {
+          touchedFiles: result.evidenceHints.touchedFiles
+            ? [...result.evidenceHints.touchedFiles]
+            : undefined,
+          artifactPaths: result.evidenceHints.artifactPaths
+            ? [...result.evidenceHints.artifactPaths]
+            : undefined,
+          symbols: result.evidenceHints.symbols
+            ? [...result.evidenceHints.symbols]
+            : undefined,
+          commands: result.evidenceHints.commands
+            ? [...result.evidenceHints.commands]
+            : undefined,
+        }
+      : undefined,
+  };
+}
+
+function cloneWorkflowStateFromSnapshot(snapshot: WorkflowPersistedStateSnapshot): WorkflowState {
+  return {
+    runId: snapshot.runId,
+    workflowName: snapshot.workflowName,
+    userTask: snapshot.userTask,
+    status: snapshot.status,
+    currentStepIndex: snapshot.currentStepIndex,
+    startedAt: snapshot.startedAt,
+    finishedAt: snapshot.finishedAt,
+    shared: {
+      summary: snapshot.shared.summary,
+      focus: snapshot.shared.focus,
+      decisions: snapshot.shared.decisions.map((item) => ({ ...item })),
+      artifacts: snapshot.shared.artifacts.map((item) => ({ ...item })),
+      learnings: [...snapshot.shared.learnings],
+      blockers: snapshot.shared.blockers.map((item) => ({ ...item })),
+      verification: snapshot.shared.verification.map((item) => ({ ...item })),
+      workItems: snapshot.shared.workItems.map((item) => ({
+        ...item,
+        blockedBy: item.blockedBy ? [...item.blockedBy] : undefined,
+      })),
+    },
+    steps: snapshot.steps.map((step) => ({
+      stepId: step.stepId,
+      agent: step.agent,
+      profile: step.profile,
+      objective: step.objective,
+      status: step.status,
+      blockedWorkSummary: cloneBlockedWorkSummary(step.blockedWorkSummary),
+      verifyStatus: step.verifyStatus,
+      verifySummary: step.verifySummary,
+      startedAt: step.startedAt,
+      finishedAt: step.finishedAt,
+      result: step.summary
+        ? {
+            status:
+              step.status === "blocked"
+                ? "blocked"
+                : step.status === "failed"
+                  ? "failed"
+                  : "success",
+            summary: step.summary,
+          }
+        : undefined,
+    })),
+  };
+}
+
+function readWorkflowSnapshotFromDisk(
+  cwd: string,
+  runId: string,
+): WorkflowPersistedStateSnapshot {
+  const filePath = path.join(cwd, ".pi", "workflow-runs", runId, "state.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Could not read persisted workflow state for run ${runId}: ${describeUnknownError(error)}`,
+    );
+  }
+
+  const snapshot = parsed as WorkflowPersistedStateSnapshot;
+  if (!snapshot || typeof snapshot !== "object" || snapshot.runId !== runId) {
+    throw new Error(`Persisted workflow state for run ${runId} is invalid.`);
+  }
+  return snapshot;
+}
+
+function getPersistedStepResultPath(
+  persistence: WorkflowPersistence,
+  stepIndex: number,
+  stepAgent: string,
+): string {
+  return path.join(
+    persistence.stepsDir,
+    `${String(stepIndex + 1).padStart(2, "0")}-${sanitizeFileNamePart(stepAgent)}.result.json`,
+  );
+}
+
+function createReconstructedSingleResult(
+  step: WorkflowState["steps"][number],
+  stepIndex: number,
+  model?: string,
+): SingleResult {
+  return {
+    agent: step.agent,
+    agentSource: "unknown",
+    task: step.objective,
+    objective: step.objective,
+    profile: step.profile,
+    exitCode: step.status === "failed" ? 1 : 0,
+    elapsedMs: 0,
+    lastWork: step.result?.summary ?? step.provisionalResult?.summary ?? "",
+    messages: [],
+    stderr: "",
+    usage: makeEmptyUsage(),
+    model,
+    step: stepIndex + 1,
+    stepId: step.stepId,
+    rawFinalText: step.rawFinalText,
+    repairedFinalText: step.repairedFinalText,
+    parseError: step.parseError,
+    structuredStatus:
+      step.result?.status ??
+      (step.status === "blocked"
+        ? "blocked"
+        : step.status === "failed"
+          ? "failed"
+          : "success"),
+    diagnostics: step.diagnostics ? [...step.diagnostics] : undefined,
+  };
+}
+
+function loadPersistedWorkflowRun(
+  cwd: string,
+  runId: string,
+  workflow: WorkflowConfig,
+  model?: string,
+): {
+  persistence: WorkflowPersistence;
+  state: WorkflowState;
+  results: SingleResult[];
+} {
+  const snapshot = readWorkflowSnapshotFromDisk(cwd, runId);
+  if (snapshot.workflowName !== workflow.name) {
+    throw new Error(
+      `Persisted run ${runId} belongs to workflow "${snapshot.workflowName}", not "${workflow.name}".`,
+    );
+  }
+  if (snapshot.steps.length !== workflow.steps.length) {
+    throw new Error(
+      `Persisted run ${runId} no longer matches the current "${workflow.name}" workflow definition.`,
+    );
+  }
+  for (let index = 0; index < workflow.steps.length; index++) {
+    const persistedStep = snapshot.steps[index];
+    const workflowStep = workflow.steps[index];
+    if (
+      persistedStep?.stepId !== workflowStep.id ||
+      persistedStep?.agent !== workflowStep.agent
+    ) {
+      throw new Error(
+        `Persisted run ${runId} no longer matches the current "${workflow.name}" workflow step order.`,
+      );
+    }
+  }
+
+  const state = cloneWorkflowStateFromSnapshot(snapshot);
+  const persistence = createPersistence(cwd, runId);
+  const results: SingleResult[] = [];
+
+  for (let index = 0; index < workflow.steps.length; index++) {
+    const workflowStep = workflow.steps[index];
+    const stateStep = state.steps[index];
+    if (!stateStep) continue;
+
+    const persistedPath = getPersistedStepResultPath(
+      persistence,
+      index,
+      workflowStep.agent,
+    );
+    if (!fs.existsSync(persistedPath)) {
+      if (stateStep.status !== "pending" && stateStep.status !== "running") {
+        results[index] = createReconstructedSingleResult(stateStep, index, model);
+      }
+      continue;
+    }
+
+    const raw = JSON.parse(fs.readFileSync(persistedPath, "utf8")) as Partial<
+      SingleResult & {
+        verifyStatus: VerifyStatus;
+        verifySummary: string;
+        verifyChecks: VerificationItem[];
+        blockedWorkSummary: BlockedWorkSummaryItem[];
+        provisionalResult: AgentResult;
+        evidenceHints: NonNullable<WorkflowState["steps"][number]["evidenceHints"]>;
+        diagnostics: string[];
+      }
+    >;
+
+    const loadedResult: SingleResult = {
+      agent: raw.agent ?? workflowStep.agent,
+      agentSource: raw.agentSource ?? "unknown",
+      task: raw.task ?? stateStep.objective,
+      objective: raw.objective ?? stateStep.objective,
+      profile: raw.profile ?? stateStep.profile,
+      exitCode: raw.exitCode ?? (stateStep.status === "failed" ? 1 : 0),
+      elapsedMs: raw.elapsedMs ?? 0,
+      lastWork: raw.lastWork ?? stateStep.result?.summary ?? "",
+      messages: raw.messages ?? [],
+      stderr: raw.stderr ?? "",
+      usage: raw.usage ?? makeEmptyUsage(),
+      model: raw.model ?? model,
+      stopReason: raw.stopReason,
+      errorMessage: raw.errorMessage,
+      step: raw.step ?? index + 1,
+      stepId: raw.stepId ?? workflowStep.id,
+      rawFinalText: raw.rawFinalText,
+      repairedFinalText: raw.repairedFinalText,
+      parseError: raw.parseError,
+      repairAttempted: raw.repairAttempted,
+      structuredStatus: raw.structuredStatus,
+      diagnostics: raw.diagnostics,
+    };
+    results[index] = loadedResult;
+
+    stateStep.verifyStatus = raw.verifyStatus ?? stateStep.verifyStatus;
+    stateStep.verifySummary = raw.verifySummary ?? stateStep.verifySummary;
+    stateStep.verifyChecks = raw.verifyChecks
+      ? raw.verifyChecks.map((item) => ({ ...item }))
+      : stateStep.verifyChecks;
+    stateStep.blockedWorkSummary = raw.blockedWorkSummary
+      ? cloneBlockedWorkSummary(raw.blockedWorkSummary)
+      : stateStep.blockedWorkSummary;
+    stateStep.parseError = raw.parseError ?? stateStep.parseError;
+    stateStep.evidenceHints = raw.evidenceHints
+      ? {
+          touchedFiles: raw.evidenceHints.touchedFiles
+            ? [...raw.evidenceHints.touchedFiles]
+            : undefined,
+          artifactPaths: raw.evidenceHints.artifactPaths
+            ? [...raw.evidenceHints.artifactPaths]
+            : undefined,
+          symbols: raw.evidenceHints.symbols ? [...raw.evidenceHints.symbols] : undefined,
+          commands: raw.evidenceHints.commands ? [...raw.evidenceHints.commands] : undefined,
+        }
+      : stateStep.evidenceHints;
+    stateStep.rawFinalText = raw.rawFinalText ?? stateStep.rawFinalText;
+    stateStep.repairedFinalText = raw.repairedFinalText ?? stateStep.repairedFinalText;
+    stateStep.diagnostics = raw.diagnostics ? [...raw.diagnostics] : stateStep.diagnostics;
+    stateStep.provisionalResult = cloneAgentResult(raw.provisionalResult) ?? stateStep.provisionalResult;
+    if (stateStep.status === "done" || stateStep.status === "blocked") {
+      stateStep.result = cloneAgentResult(raw.provisionalResult) ?? stateStep.result;
+    }
+  }
+
+  return { persistence, state, results };
+}
+
+function applyResumeClarification(
+  state: WorkflowState,
+  stepIndex: number,
+  clarification: string,
+): void {
+  const step = state.steps[stepIndex];
+  if (!step) return;
+
+  const previousBlockers = step.result?.blockers ?? step.provisionalResult?.blockers;
+  if (previousBlockers?.length) {
+    const blockerKeys = new Set(
+      previousBlockers.map((item) => `${item.issue}\u0000${item.needs ?? ""}`),
+    );
+    state.shared.blockers = state.shared.blockers.filter(
+      (item) => !blockerKeys.has(`${item.issue}\u0000${item.needs ?? ""}`),
+    );
+  }
+
+  const trimmed = clarification.trim();
+  if (!trimmed) return;
+
+  const decisionKey = `User clarification\u0000${trimmed}`;
+  const existingDecisionKeys = new Set(
+    state.shared.decisions.map((item) => `${item.topic}\u0000${item.decision}`),
+  );
+  if (!existingDecisionKeys.has(decisionKey)) {
+    state.shared.decisions = [
+      ...state.shared.decisions,
+      {
+        topic: "User clarification",
+        decision: trimmed,
+        rationale: `Provided while resuming workflow run ${state.runId}.`,
+      },
+    ];
+  }
+
+  const learning = `User clarification: ${trimmed}`;
+  if (!state.shared.learnings.includes(learning)) {
+    state.shared.learnings = [...state.shared.learnings, learning];
+  }
+}
+
+function replaceStepResult(
+  results: SingleResult[],
+  stepIndex: number,
+  result: SingleResult,
+): void {
+  results[stepIndex] = result;
+}
+
+function withStepResult(
+  results: SingleResult[],
+  stepIndex: number,
+  result: SingleResult,
+): SingleResult[] {
+  const next = results.slice();
+  next[stepIndex] = result;
+  return next;
 }
 
 function buildStructuredStopMessage(
@@ -923,65 +1260,45 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
   });
 }
 
-export async function runWorkflowByName(
-  cwd: string,
-  workflowName: string,
-  task: string,
-  defaultModel?: string,
-  signal?: AbortSignal,
-  onUpdate?: WorkflowUpdateCallback,
-  runtimeHooks: WorkflowRuntimeHooks = {},
-  runId = randomUUID(),
-): Promise<WorkflowRunResult> {
-  const { agents } = discoverAgents(cwd);
-  const { workflows } = discoverWorkflows(cwd);
-  const workflow = workflows.find((item) => item.name === workflowName);
-
-  if (!workflow) {
-    return {
-      workflowName,
-      steps: [],
-      workflowSource: "built-in",
-      workflowFilePath: null,
-      runDir: "",
-      results: [],
-      state: createWorkflowState(
-        { name: workflowName, steps: [], source: "built-in" },
-        task,
-        runId,
-      ),
-      finalText: "",
-      isError: true,
-      errorMessage: `Unknown workflow: "${workflowName}"`,
-    };
-  }
-
-  const missingAgents = workflow.steps
-    .map((step) => step.agent)
-    .filter((agentName) => !agents.some((agent) => agent.name === agentName));
-  if (missingAgents.length > 0) {
-    return {
-      workflowName: workflow.name,
-      steps: workflow.steps,
-      workflowSource: workflow.source,
-      workflowFilePath: workflow.filePath ?? null,
-      runDir: "",
-      results: [],
-      state: createWorkflowState(workflow, task, runId),
-      finalText: "",
-      isError: true,
-      errorMessage: `Workflow "${workflow.name}" cannot start. Missing agents: ${missingAgents.join(", ")}.`,
-    };
-  }
-
-  const state = createWorkflowState(workflow, task, runId);
+async function runWorkflowWithPreparedState(options: {
+  cwd: string;
+  workflow: WorkflowConfig;
+  agents: AgentConfig[];
+  task: string;
+  state: WorkflowState;
+  initialResults?: SingleResult[];
+  startStepIndex?: number;
+  runBeforeWorkflowHook?: boolean;
+  emitInitialDetails?: boolean;
+  defaultModel?: string;
+  signal?: AbortSignal;
+  onUpdate?: WorkflowUpdateCallback;
+  runtimeHooks?: WorkflowRuntimeHooks;
+}): Promise<WorkflowRunResult> {
+  const {
+    cwd,
+    workflow,
+    agents,
+    task,
+    state,
+    initialResults = [],
+    startStepIndex = 0,
+    runBeforeWorkflowHook = true,
+    emitInitialDetails = false,
+    defaultModel,
+    signal,
+    onUpdate,
+    runtimeHooks = {},
+  } = options;
   const persistence = createPersistence(cwd, state.runId);
-  const results: SingleResult[] = [];
+  const results = initialResults.slice();
   const hooks = runtimeHooks;
 
   const emitDetails = (partialResults = results) => {
     onUpdate?.(makeWorkflowDetails(persistence, workflow, partialResults, state));
   };
+
+  if (emitInitialDetails) emitDetails();
 
   const runOnStepErrorHook = async (
     input: Parameters<NonNullable<WorkflowRuntimeHooks["onStepError"]>>[0],
@@ -1093,7 +1410,7 @@ export async function runWorkflowByName(
     }
 
     markStepFailure(state, index, "failed");
-    results.push(failureResult);
+    replaceStepResult(results, index, failureResult);
     persistStepResult(
       persistence,
       index,
@@ -1118,38 +1435,40 @@ export async function runWorkflowByName(
     };
   };
 
-  try {
-    const beforeWorkflowPatch = await hooks.beforeWorkflow?.({
-      cwd,
-      workflow: createImmutableHookSnapshot(workflow),
-      agents: createImmutableHookSnapshot(agents),
-      defaultModel,
-      state: createImmutableHookSnapshot(state),
-    });
-    if (beforeWorkflowPatch?.shared) {
-      state.shared = mergeSharedStatePatch(state.shared, beforeWorkflowPatch.shared);
+  if (runBeforeWorkflowHook) {
+    try {
+      const beforeWorkflowPatch = await hooks.beforeWorkflow?.({
+        cwd,
+        workflow: createImmutableHookSnapshot(workflow),
+        agents: createImmutableHookSnapshot(agents),
+        defaultModel,
+        state: createImmutableHookSnapshot(state),
+      });
+      if (beforeWorkflowPatch?.shared) {
+        state.shared = mergeSharedStatePatch(state.shared, beforeWorkflowPatch.shared);
+      }
+    } catch (error) {
+      markWorkflowFailed(state);
+      persistRunArtifacts(persistence, workflow, state);
+      emitDetails();
+      return {
+        workflowName: workflow.name,
+        steps: workflow.steps,
+        workflowSource: workflow.source,
+        workflowFilePath: workflow.filePath ?? null,
+        runDir: persistence.runDir,
+        results,
+        state,
+        finalText: "",
+        isError: true,
+        errorMessage: `Workflow "${workflow.name}" could not start: ${describeUnknownError(error)}`,
+      };
     }
-  } catch (error) {
-    markWorkflowFailed(state);
-    persistRunArtifacts(persistence, workflow, state);
-    emitDetails();
-    return {
-      workflowName: workflow.name,
-      steps: workflow.steps,
-      workflowSource: workflow.source,
-      workflowFilePath: workflow.filePath ?? null,
-      runDir: persistence.runDir,
-      results,
-      state,
-      finalText: "",
-      isError: true,
-      errorMessage: `Workflow "${workflow.name}" could not start: ${describeUnknownError(error)}`,
-    };
   }
 
   persistRunArtifacts(persistence, workflow, state);
 
-  for (let index = 0; index < workflow.steps.length; index++) {
+  for (let index = startStepIndex; index < workflow.steps.length; index++) {
     const step = workflow.steps[index];
     const agent = agents.find((item) => item.name === step.agent);
     const profileResolution = resolveExecutionProfile(step, agent);
@@ -1222,7 +1541,7 @@ export async function runWorkflowByName(
         onUpdate: onUpdate
           ? (partialResult) => {
               partialResult.profile = profile;
-              emitDetails([...results, partialResult]);
+              emitDetails(withStepResult(results, index, partialResult));
             }
           : undefined,
         systemPromptOverride,
@@ -1292,13 +1611,13 @@ export async function runWorkflowByName(
           signal,
           onUpdate: onUpdate
             ? (partialResult) => {
-              partialResult.parseError = parseError;
-              partialResult.repairAttempted = true;
-              partialResult.rawFinalText = rawFinalText;
-              partialResult.profile = profile;
-              emitDetails([...results, partialResult]);
-            }
-          : undefined,
+                partialResult.parseError = parseError;
+                partialResult.repairAttempted = true;
+                partialResult.rawFinalText = rawFinalText;
+                partialResult.profile = profile;
+                emitDetails(withStepResult(results, index, partialResult));
+              }
+            : undefined,
           systemPromptOverride: REPAIR_SYSTEM_PROMPT,
           toolsOverride: [],
         });
@@ -1456,7 +1775,7 @@ export async function runWorkflowByName(
         repairedFinalText,
         parseError,
       );
-      results.push(finalResultRecord);
+      replaceStepResult(results, index, finalResultRecord);
       persistStepResult(persistence, index, step.agent, state, finalResultRecord);
       persistRunArtifacts(persistence, workflow, state);
       emitDetails();
@@ -1578,7 +1897,7 @@ export async function runWorkflowByName(
         finalResultRecord.lastWork = verifyOutcome.summary;
       }
       markStepFailure(state, index, "failed");
-      results.push(finalResultRecord);
+      replaceStepResult(results, index, finalResultRecord);
       persistStepResult(persistence, index, step.agent, state, finalResultRecord);
       persistRunArtifacts(persistence, workflow, state);
       emitDetails();
@@ -1658,7 +1977,7 @@ export async function runWorkflowByName(
       finalResultRecord.lastWork =
         "Workflow blocked because no ready work items remain.";
       markStepFailure(state, index, "blocked");
-      results.push(finalResultRecord);
+      replaceStepResult(results, index, finalResultRecord);
       persistStepResult(persistence, index, step.agent, state, finalResultRecord);
       persistRunArtifacts(persistence, workflow, state);
       emitDetails();
@@ -1675,7 +1994,7 @@ export async function runWorkflowByName(
       };
     }
 
-    results.push(finalResultRecord);
+    replaceStepResult(results, index, finalResultRecord);
     persistStepResult(persistence, index, step.agent, state, finalResultRecord);
     persistRunArtifacts(persistence, workflow, state);
     emitDetails();
@@ -1695,4 +2014,192 @@ export async function runWorkflowByName(
     finalText: buildFinalTextFromState(state),
     isError: false,
   };
+}
+
+export async function runWorkflowByName(
+  cwd: string,
+  workflowName: string,
+  task: string,
+  defaultModel?: string,
+  signal?: AbortSignal,
+  onUpdate?: WorkflowUpdateCallback,
+  runtimeHooks: WorkflowRuntimeHooks = {},
+  runId = randomUUID(),
+): Promise<WorkflowRunResult> {
+  const { agents } = discoverAgents(cwd);
+  const { workflows } = discoverWorkflows(cwd);
+  const workflow = workflows.find((item) => item.name === workflowName);
+
+  if (!workflow) {
+    return {
+      workflowName,
+      steps: [],
+      workflowSource: "built-in",
+      workflowFilePath: null,
+      runDir: "",
+      results: [],
+      state: createWorkflowState(
+        { name: workflowName, steps: [], source: "built-in" },
+        task,
+        runId,
+      ),
+      finalText: "",
+      isError: true,
+      errorMessage: `Unknown workflow: "${workflowName}"`,
+    };
+  }
+
+  const missingAgents = workflow.steps
+    .map((step) => step.agent)
+    .filter((agentName) => !agents.some((agent) => agent.name === agentName));
+  if (missingAgents.length > 0) {
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      runDir: "",
+      results: [],
+      state: createWorkflowState(workflow, task, runId),
+      finalText: "",
+      isError: true,
+      errorMessage: `Workflow "${workflow.name}" cannot start. Missing agents: ${missingAgents.join(", ")}.`,
+    };
+  }
+
+  return runWorkflowWithPreparedState({
+    cwd,
+    workflow,
+    agents,
+    task,
+    state: createWorkflowState(workflow, task, runId),
+    defaultModel,
+    signal,
+    onUpdate,
+    runtimeHooks,
+  });
+}
+
+export async function resumeWorkflowRun(
+  cwd: string,
+  runId: string,
+  clarification: string,
+  defaultModel?: string,
+  signal?: AbortSignal,
+  onUpdate?: WorkflowUpdateCallback,
+  runtimeHooks: WorkflowRuntimeHooks = {},
+): Promise<WorkflowRunResult> {
+  const runDir = path.join(cwd, ".pi", "workflow-runs", runId);
+  let snapshot: WorkflowPersistedStateSnapshot;
+  try {
+    snapshot = readWorkflowSnapshotFromDisk(cwd, runId);
+  } catch (error) {
+    return {
+      workflowName: `resume:${runId}`,
+      steps: [],
+      workflowSource: "built-in",
+      workflowFilePath: null,
+      runDir,
+      results: [],
+      state: createWorkflowState(
+        { name: `resume:${runId}`, steps: [], source: "built-in" },
+        clarification,
+        runId,
+      ),
+      finalText: "",
+      isError: true,
+      errorMessage: describeUnknownError(error),
+    };
+  }
+
+  const { workflows } = discoverWorkflows(cwd);
+  const workflow = workflows.find((item) => item.name === snapshot.workflowName);
+  if (!workflow) {
+    const state = cloneWorkflowStateFromSnapshot(snapshot);
+    return {
+      workflowName: snapshot.workflowName,
+      steps: [],
+      workflowSource: snapshot.workflowSource,
+      workflowFilePath: snapshot.workflowFilePath ?? null,
+      runDir,
+      results: [],
+      state,
+      finalText: "",
+      isError: true,
+      errorMessage: `Persisted workflow "${snapshot.workflowName}" is no longer available for resume.`,
+    };
+  }
+
+  const { agents } = discoverAgents(cwd);
+  const missingAgents = workflow.steps
+    .map((step) => step.agent)
+    .filter((agentName) => !agents.some((agent) => agent.name === agentName));
+  if (missingAgents.length > 0) {
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      runDir,
+      results: [],
+      state: cloneWorkflowStateFromSnapshot(snapshot),
+      finalText: "",
+      isError: true,
+      errorMessage: `Workflow "${workflow.name}" cannot resume. Missing agents: ${missingAgents.join(", ")}.`,
+    };
+  }
+
+  let loaded;
+  try {
+    loaded = loadPersistedWorkflowRun(cwd, runId, workflow, defaultModel);
+  } catch (error) {
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      runDir,
+      results: [],
+      state: cloneWorkflowStateFromSnapshot(snapshot),
+      finalText: "",
+      isError: true,
+      errorMessage: describeUnknownError(error),
+    };
+  }
+
+  const state = loaded.state;
+  const blockedStepIndex = state.currentStepIndex;
+  const blockedStep = state.steps[blockedStepIndex];
+  if (state.status !== "blocked" || !blockedStep || blockedStep.status !== "blocked") {
+    return {
+      workflowName: workflow.name,
+      steps: workflow.steps,
+      workflowSource: workflow.source,
+      workflowFilePath: workflow.filePath ?? null,
+      runDir,
+      results: loaded.results,
+      state,
+      finalText: buildFinalTextFromState(state),
+      isError: true,
+      errorMessage: `Workflow run ${runId} is not paused on a blocked step and cannot be resumed.`,
+    };
+  }
+
+  applyResumeClarification(state, blockedStepIndex, clarification);
+
+  return runWorkflowWithPreparedState({
+    cwd,
+    workflow,
+    agents,
+    task: state.userTask,
+    state,
+    initialResults: loaded.results,
+    startStepIndex: blockedStepIndex,
+    runBeforeWorkflowHook: false,
+    emitInitialDetails: true,
+    defaultModel,
+    signal,
+    onUpdate,
+    runtimeHooks,
+  });
 }

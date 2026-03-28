@@ -492,11 +492,13 @@ export function buildWorkOrder(
 
 export function markStepRunning(state: WorkflowState, stepIndex: number): void {
   state.status = "running";
+  state.finishedAt = undefined;
   state.currentStepIndex = stepIndex;
   const step = state.steps[stepIndex];
   if (!step) return;
   step.status = "running";
   step.blockedWorkSummary = undefined;
+  step.finishedAt = undefined;
   step.startedAt = step.startedAt ?? nowIso();
   step.verifyStatus = "pending";
   step.verifySummary = undefined;

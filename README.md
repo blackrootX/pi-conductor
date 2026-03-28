@@ -45,6 +45,12 @@ Open the workflow picker:
 /workflow
 ```
 
+Resume the latest blocked workflow explicitly:
+
+```text
+/workflow-resume filename is docs/random.md and content should be plain markdown
+```
+
 ## Workflow Definitions
 
 Workflows are loaded from:
@@ -132,6 +138,10 @@ Free-form explanation outside the marker block is allowed. If parsing fails, the
 
 - the workflow runs in the current Pi session
 - UI shows workflow state, step objectives, and per-step progress
+- if a step returns `status: "blocked"`, the workflow pauses instead of failing
+- a short clarification reply is treated as resume input when it looks like an answer, while normal questions still go to the main Pi agent
+- `/workflow-resume <clarification>` always resumes the latest blocked workflow explicitly
+- resume restores the original workflow run directory instead of assuming the current session cwd
 
 Debug state is also persisted under `.pi/workflow-runs/<runId>/`.
 
@@ -148,7 +158,6 @@ It still does not add:
 
 - parallel steps
 - DAG workflows
-- resume
 - automatic user-visible agent selection
 - auto-skip
 - auto-reorder

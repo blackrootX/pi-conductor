@@ -17,6 +17,7 @@ import {
   type WorkflowDetails,
   getFinalOutput,
   isErrorResult,
+  resumeWorkflowRun,
   runWorkflowByName,
 } from "./workflow-runtime.js";
 import {
@@ -47,6 +48,7 @@ import {
   buildWorkflowMessageContent,
   createInitialWorkflowDetails,
   createWorkflowMessageDetails,
+  getLatestWorkflowSelection,
   getLatestWorkflowSnapshot,
 } from "./workflow-session-entries.js";
 import type { WorkflowRuntimeHooks } from "./workflow-hooks.js";
@@ -300,6 +302,68 @@ function buildConductorInstruction(workflowName: string, task: string): string {
   ].join("\n");
 }
 
+function shouldAutoResumeBlockedWorkflow(
+  text: string,
+  snapshot: ReturnType<typeof getLatestWorkflowSnapshot>,
+): boolean {
+  const trimmed = text.trim();
+  if (!snapshot || snapshot.status !== "blocked") return false;
+  if (!trimmed) return false;
+  if (trimmed.startsWith("/")) return false;
+  if (trimmed.startsWith("!")) return false;
+  if (/[?？]\s*$/.test(trimmed)) return false;
+
+  const lower = trimmed.toLowerCase();
+  const conversationalPrefixes = [
+    "why",
+    "what",
+    "how",
+    "show",
+    "explain",
+    "review",
+    "fix",
+    "debug",
+    "help",
+    "summarize",
+    "compare",
+    "list",
+    "tell me",
+    "can you",
+    "could you",
+    "would you",
+    "will you",
+    "please",
+    "wait",
+    "hold on",
+    "stop",
+    "cancel",
+    "ignore",
+    "never mind",
+  ];
+  if (conversationalPrefixes.some((prefix) => lower === prefix || lower.startsWith(`${prefix} `))) {
+    return false;
+  }
+
+  if (/[:=\n]/.test(trimmed)) return true;
+  if (trimmed.length > 280) return false;
+  return trimmed.split(/\s+/).length <= 40;
+}
+
+function getResumeWorkflowCwd(
+  ctx: ExtensionContext,
+  snapshot: NonNullable<ReturnType<typeof getLatestWorkflowSnapshot>>,
+): string {
+  const selection = getLatestWorkflowSelection(ctx.sessionManager);
+  if (
+    selection?.cwd &&
+    selection.workflowName === snapshot.workflowName &&
+    selection.task === snapshot.userTask
+  ) {
+    return selection.cwd;
+  }
+  return ctx.cwd;
+}
+
 function getCurrentModelLabel(ctx: ExtensionContext): string | undefined {
   return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
@@ -419,6 +483,74 @@ function syncWorkflowProgress(
   }
 
   tracker.previousDetails = details;
+}
+
+async function resumeBlockedWorkflowInSession(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  snapshot: NonNullable<ReturnType<typeof getLatestWorkflowSnapshot>>,
+  clarification: string,
+): Promise<void> {
+  const currentModel = getCurrentModelLabel(ctx);
+  const tracker: WorkflowProgressTracker = {};
+  const resumeCwd = getResumeWorkflowCwd(ctx, snapshot);
+  const runtimeHooks = await resolveWorkflowRuntimeHooks({
+    cwd: resumeCwd,
+    workflowName: snapshot.workflowName,
+    task: snapshot.userTask,
+    defaultModel: currentModel,
+  });
+  const handleWorkflowUpdate = (details: WorkflowDetails) => {
+    const payload = buildWorkflowCardPayload(details, true, currentModel);
+    setWorkflowCardsWidget(ctx, payload);
+    syncWorkflowProgress(pi, tracker, details, currentModel);
+  };
+
+  const result = await resumeWorkflowRun(
+    resumeCwd,
+    snapshot.runId,
+    clarification,
+    currentModel,
+    undefined,
+    handleWorkflowUpdate,
+    runtimeHooks,
+  );
+
+  const finalDetails = {
+    workflowName: result.workflowName,
+    steps: result.steps,
+    workflowSource: result.workflowSource,
+    workflowFilePath: result.workflowFilePath,
+    runDir: result.runDir,
+    results: result.results,
+    state: result.state,
+  };
+
+  if (result.steps.length > 0) {
+    setWorkflowCardsWidget(
+      ctx,
+      buildWorkflowCardPayload(finalDetails, false, currentModel),
+    );
+    const snapshotMessage = appendWorkflowRunFinished(
+      pi,
+      finalDetails,
+      {
+        finalText: result.finalText,
+        errorMessage: result.errorMessage,
+        isError: result.isError,
+      },
+      currentModel,
+    );
+    emitWorkflowMessage(pi, "run-finished", snapshotMessage);
+  }
+
+  if (ctx.hasUI) {
+    if (result.isError) {
+      ctx.ui.notify(result.errorMessage || "Workflow resume failed.", "error");
+    } else {
+      ctx.ui.notify(`Workflow "${result.workflowName}" resumed.`, "info");
+    }
+  }
 }
 
 function restoreWorkflowSummaryWidget(ctx: ExtensionContext): void {
@@ -840,6 +972,30 @@ export default function registerExtension(pi: ExtensionAPI) {
   pi.on("session_fork", restoreWorkflowUi);
   pi.on("session_tree", restoreWorkflowUi);
 
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") {
+      return { action: "continue" as const };
+    }
+
+    const snapshot = getLatestWorkflowSnapshot(ctx.sessionManager);
+    if (!snapshot || !shouldAutoResumeBlockedWorkflow(event.text, snapshot)) {
+      return { action: "continue" as const };
+    }
+
+    const replyText = event.text.trim();
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `Resuming blocked workflow "${snapshot.workflowName}" with your reply.`,
+        "info",
+      );
+      ctx.ui.setToolsExpanded(true);
+    }
+
+    await resumeBlockedWorkflowInSession(pi, ctx, snapshot, replyText);
+    return { action: "handled" as const };
+  });
+
   const workflowAllowedTools = getWorkflowAllowedToolsFromEnv();
   if (workflowAllowedTools) {
     const allowedToolSet = new Set(workflowAllowedTools);
@@ -1044,6 +1200,35 @@ export default function registerExtension(pi: ExtensionAPI) {
       ctx.ui.setToolsExpanded(true);
       pi.sendUserMessage(instruction);
       await ctx.waitForIdle();
+    },
+  });
+
+  pi.registerCommand("workflow-resume", {
+    description:
+      "Resume the latest blocked workflow in this session with your clarification text.",
+    handler: async (args, ctx) => {
+      updateCommandCompletionCwd(ctx.cwd);
+      const snapshot = getLatestWorkflowSnapshot(ctx.sessionManager);
+      if (!snapshot || snapshot.status !== "blocked") {
+        if (ctx.hasUI) {
+          ctx.ui.notify("No blocked workflow is waiting for clarification.", "warning");
+        }
+        return;
+      }
+
+      const replyText = args.trim();
+      if (!replyText) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Usage: /workflow-resume <your clarification>", "warning");
+        }
+        return;
+      }
+
+      await ctx.waitForIdle();
+      if (ctx.hasUI) {
+        ctx.ui.setToolsExpanded(true);
+      }
+      await resumeBlockedWorkflowInSession(pi, ctx, snapshot, replyText);
     },
   });
 }
