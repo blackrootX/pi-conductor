@@ -26,6 +26,22 @@ import {
 } from "./team-runtime.js";
 import type { TeamConfig } from "./teams.js";
 import { DEFAULT_TEAM_NAME, discoverTeams } from "./teams.js";
+import {
+  runMeetingByName,
+  type MeetingRunResult,
+  type MeetingProgressUpdate,
+} from "./meeting-runtime.js";
+import {
+  buildMeetingCardPayload,
+  renderMeetingCardLines,
+  renderMeetingResult,
+  type MeetingCardPayload,
+} from "./meeting-cards.js";
+import {
+  DEFAULT_MEETING_NAME,
+  discoverMeetings,
+  type MeetingConfig,
+} from "./meetings.js";
 import type { WorkflowConfig } from "./workflows.js";
 import { DEFAULT_WORKFLOW_NAME, discoverWorkflows } from "./workflows.js";
 import {
@@ -104,6 +120,25 @@ const TeamConductorParams = Type.Object({
   cwd: Type.Optional(
     Type.String({
       description: "Working directory for the team run",
+    }),
+  ),
+});
+
+const MeetingConductorParams = Type.Object({
+  meeting: Type.String({
+    description: "Name of the meeting to run",
+  }),
+  task: Type.String({
+    description: "Runtime task input or topic for the meeting",
+  }),
+  artifact: Type.Optional(
+    Type.String({
+      description: "Path to an artifact file for refine/debate meetings",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description: "Working directory for the meeting run",
     }),
   ),
 });
@@ -622,6 +657,34 @@ function setTeamCardsWidget(
         dispose() {
           if (interval) clearInterval(interval);
         },
+      };
+    },
+    { placement: "aboveEditor" },
+  );
+}
+
+function setMeetingCardsWidget(
+  ctx: ExtensionContext,
+  payload: MeetingCardPayload | undefined,
+) {
+  if (!payload || !ctx.hasUI) return;
+
+  ctx.ui.setWidget(
+    "meeting-cards",
+    (_tui, theme) => {
+      const text = new Text("", 0, 0);
+      const isAnimated = !payload.isFinished;
+      const interval = isAnimated
+        ? setInterval(() => { text.invalidate(); }, 250)
+        : undefined;
+
+      return {
+        render(width: number) {
+          text.setText(renderMeetingCardLines(payload, false, theme).join("\n"));
+          return text.render(width);
+        },
+        invalidate() { text.invalidate(); },
+        dispose() { if (interval) clearInterval(interval); },
       };
     },
     { placement: "aboveEditor" },
@@ -1774,6 +1837,78 @@ function buildTeamCallPreview(teamName: string, task: string, theme: any) {
   );
 }
 
+function buildMeetingCallPreview(meetingName: string, task: string, theme: any) {
+  const preview =
+    task.length > 60 ? `${task.slice(0, 60)}...` : task || "(no task)";
+  return new Text(
+    theme.fg("toolTitle", theme.bold("meeting-conductor ")) +
+      theme.fg("accent", meetingName) +
+      `\n  ${theme.fg("dim", preview)}`,
+    0,
+    0,
+  );
+}
+
+async function resolveMeetingCommandInput(
+  args: string,
+  ctx: ExtensionCommandContext,
+): Promise<{ meetingName: string; task: string; artifactPath?: string } | undefined> {
+  const rawArgs = args.trim();
+  const { meetings, warnings } = discoverMeetings(ctx.cwd);
+  notifyDiscoveryWarnings(ctx, warnings);
+  const meetingMap = new Map(meetings.map((m) => [m.name, m]));
+
+  const tokens = tokenizeCommandArgs(rawArgs);
+
+  if (tokens.length === 0) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Provide a meeting name and task when no interactive UI is available.", "error");
+      return undefined;
+    }
+    const options = meetings.map((m) => `${m.name} (${m.source})`);
+    const choice = await ctx.ui.select("Select meeting", options);
+    if (!choice) return undefined;
+    const index = options.indexOf(choice);
+    const selected = meetings[index];
+    const task = await ctx.ui.input(`Run meeting: ${selected.name}`, "implement auth");
+    if (!task?.trim()) return undefined;
+    return { meetingName: selected.name, task: task.trim() };
+  }
+
+  const maybeMeeting = meetingMap.get(tokens[0]);
+  if (maybeMeeting) {
+    const remaining = tokens.slice(1);
+    if (remaining.length === 0) {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Provide a task after the meeting name.", "error");
+        return undefined;
+      }
+      const task = await ctx.ui.input(`Run meeting: ${maybeMeeting.name}`, "implement auth");
+      if (!task?.trim()) return undefined;
+      return { meetingName: maybeMeeting.name, task: task.trim() };
+    }
+    if (remaining.length === 1) {
+      return { meetingName: maybeMeeting.name, task: remaining[0] };
+    }
+    if (remaining.length >= 2) {
+      const rawAfterName = rawArgs.slice(rawArgs.indexOf(tokens[0]) + tokens[0].length).trimStart();
+      const quoteChar = rawAfterName[0];
+      if (quoteChar !== '"' && quoteChar !== "'") {
+        ctx.ui.notify(
+          `Task must be quoted when a file path is provided. Example: /meeting ${maybeMeeting.name} "my topic" path/to/file.md`,
+          "error",
+        );
+        return undefined;
+      }
+      const task = remaining.slice(0, remaining.length - 1).join(" ");
+      const artifactPath = remaining[remaining.length - 1];
+      return { meetingName: maybeMeeting.name, task, artifactPath };
+    }
+  }
+
+  return { meetingName: DEFAULT_MEETING_NAME, task: tokens.join(" ").trim() };
+}
+
 function buildAvailableWorkflowText(workflows: WorkflowConfig[]): string {
   return workflows
     .map((workflow) => `${workflow.name} (${workflow.source})`)
@@ -2280,6 +2415,212 @@ export default function registerExtension(pi: ExtensionAPI) {
           "warning",
         );
       }
+
+      await ctx.waitForIdle();
+      ctx.ui.setToolsExpanded(true);
+      pi.sendUserMessage(instruction);
+      await ctx.waitForIdle();
+    },
+  });
+
+  pi.registerTool({
+    name: "meeting-conductor",
+    label: "Meeting Conductor",
+    description:
+      "Run a named meeting (execute, refine, or debate mode) using agents from .pi/meeting.yaml or built-in defaults.",
+    promptSnippet:
+      "meeting-conductor(meeting, task): run a named meeting from .pi/meeting.yaml",
+    promptGuidelines: [
+      "Use `meeting-conductor` when the user wants to run a meeting such as `plan-build-parallel`, `quick-critique`, or `proposal-review`.",
+      "For parallel execution use mode: execute meetings. For iterative review use mode: refine. For adversarial debate use mode: debate.",
+      "Prefer `meeting-conductor` over `team-conductor` for new meeting definitions.",
+    ],
+    parameters: MeetingConductorParams,
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runtimeCwd = params.cwd ?? ctx.cwd;
+      const { warnings } = discoverMeetings(runtimeCwd);
+      notifyDiscoveryWarnings(ctx, warnings);
+
+      const meetingUpdates: MeetingProgressUpdate[] = [];
+
+      const result = await runMeetingByName(
+        runtimeCwd,
+        params.meeting,
+        params.task,
+        params.artifact,
+        getCurrentModelLabel(ctx),
+        signal,
+        (update) => {
+          meetingUpdates.push(update);
+          const payload = buildMeetingCardPayload(params.meeting, update.mode, meetingUpdates);
+          setMeetingCardsWidget(ctx, payload);
+          if (onUpdate) {
+            onUpdate({
+              content: [{ type: "text", text: update.lastWork || "(running...)" }],
+              details: undefined as any,
+            });
+          }
+        },
+        (warning) => ctx.ui.notify(warning, "warning"),
+      );
+
+      const finalPayload = buildMeetingCardPayload(
+        params.meeting,
+        result.mode,
+        meetingUpdates,
+        result.executeResult,
+        result,
+      );
+      setMeetingCardsWidget(ctx, finalPayload);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.isError ? result.errorMessage || "(meeting failed)" : result.finalText,
+          },
+        ],
+        details: result,
+        isError: result.isError,
+      };
+    },
+
+    renderCall(args, theme) {
+      return buildMeetingCallPreview(args.meeting, args.task, theme);
+    },
+
+    renderResult(result, options, theme) {
+      const meetingResult = (result as AgentToolResult<MeetingRunResult>).details;
+      if (!meetingResult) return new Text("(no meeting result)", 0, 0);
+      return new Text(renderMeetingResult(meetingResult, options.expanded, theme), 0, 0);
+    },
+  });
+
+  pi.registerCommand("meeting", {
+    description:
+      'Run a meeting. Examples: `/meeting "implement auth"` or `/meeting quick-critique "review this"` or `/meeting proposal-review "topic" "path/to/file.md"`.',
+    handler: async (args, ctx) => {
+      const resolved = await resolveMeetingCommandInput(args, ctx);
+      if (!resolved) return;
+
+      const { meetingName, task, artifactPath } = resolved;
+
+      if (isInsideTmux()) {
+        const { meetings } = discoverMeetings(ctx.cwd);
+        const meetingConfig = meetings.find((m) => m.name === meetingName);
+
+        if (meetingConfig && meetingConfig.mode === "execute") {
+          const workerPaneTempDir = fs.mkdtempSync(
+            path.join(os.tmpdir(), "pi-conductor-team-workers-"),
+          );
+          const { teams } = discoverTeams(ctx.cwd);
+          const asTeamConfig = {
+            name: meetingConfig.name,
+            phases: meetingConfig.phases,
+            source: meetingConfig.source,
+            filePath: meetingConfig.filePath,
+          } as TeamConfig;
+          const workerCount = getMaxParallelMembers(asTeamConfig);
+          const workerStateFiles = Array.from(
+            { length: workerCount },
+            (_, index) => path.join(workerPaneTempDir, `worker-${index + 1}.json`),
+          );
+
+          const initialPayload = buildInitialTeamCardPayload(ctx.cwd, asTeamConfig, getCurrentModelLabel(ctx));
+          setTeamCardsWidget(ctx, initialPayload);
+          writeTeamWorkerPaneStates(workerStateFiles, {
+            teamName: meetingName,
+            teamSource: asTeamConfig.source,
+            teamFilePath: asTeamConfig.filePath ?? null,
+            runDir: "",
+            phases: initialPayload.phases,
+            results: [],
+          });
+
+          const launchedWorkerPanes = await launchTeamWorkerPanes(pi, ctx, meetingName, workerStateFiles);
+          if (!launchedWorkerPanes) {
+            ctx.ui.notify("Could not open worker tmux panes. Running in the current session instead.", "warning");
+          }
+
+          const abortController = new AbortController();
+          const unblockInput = blockTeamRunInput(ctx, () => abortController.abort());
+          ctx.ui.setStatus("meeting", `Running ${meetingName} in tmux...`);
+
+          try {
+            const result = await runMeetingByName(
+              ctx.cwd,
+              meetingName,
+              task,
+              artifactPath,
+              getCurrentModelLabel(ctx),
+              abortController.signal,
+              undefined,
+              (warning) => ctx.ui.notify(warning, "warning"),
+            );
+
+            if (result.executeResult) {
+              setTeamCardsWidget(ctx, buildTeamCardPayload(result.executeResult));
+              writeTeamWorkerPaneStates(workerStateFiles, result.executeResult, result.isError ? result.errorMessage : result.finalText, true);
+            }
+
+            const summary = buildMainSessionSummary("Meeting", meetingName, {
+              success: !result.isError,
+              message: result.isError ? result.errorMessage : result.finalText,
+              summary: result.isError ? result.errorMessage : result.finalText,
+            });
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("meeting", undefined);
+          }
+          return;
+        }
+
+        if (meetingConfig && (meetingConfig.mode === "refine" || meetingConfig.mode === "debate")) {
+          const abortController = new AbortController();
+          const unblockInput = blockTeamRunInput(ctx, () => abortController.abort());
+          ctx.ui.setStatus("meeting", `Running ${meetingName}...`);
+
+          try {
+            const result = await runMeetingByName(
+              ctx.cwd,
+              meetingName,
+              task,
+              artifactPath,
+              getCurrentModelLabel(ctx),
+              abortController.signal,
+              undefined,
+              (warning) => ctx.ui.notify(warning, "warning"),
+            );
+            const summary = buildMainSessionSummary("Meeting", meetingName, {
+              success: !result.isError,
+              message: result.isError ? result.errorMessage : result.finalText,
+              summary: result.isError ? result.errorMessage : result.finalText,
+            });
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("meeting", undefined);
+            unblockInput();
+          }
+          return;
+        }
+      }
+
+      ctx.ui.notify(
+        meetingName
+          ? "Running meeting in the current session."
+          : "tmux not detected. Running meeting in the current session.",
+        "warning",
+      );
+
+      const instruction = [
+        "Use the `meeting-conductor` tool immediately.",
+        `Run the meeting named "${meetingName}".`,
+        "Pass the following task exactly as the tool's `task` argument.",
+        artifactPath ? `Pass "${artifactPath}" as the tool's \`artifact\` argument.` : "",
+        "",
+        task,
+      ].filter(Boolean).join("\n");
 
       await ctx.waitForIdle();
       ctx.ui.setToolsExpanded(true);

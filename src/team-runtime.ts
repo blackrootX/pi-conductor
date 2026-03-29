@@ -26,7 +26,7 @@ import {
   type TeamRunLock,
   type TeamRunStatus,
 } from "./team-state.js";
-import type { TeamPhaseConfig, TeamSource } from "./teams.js";
+import type { TeamPhaseConfig, TeamConfig, TeamSource } from "./teams.js";
 import { discoverTeams } from "./teams.js";
 import { getFinalOutput, type UsageStats } from "./workflow-runtime.js";
 
@@ -92,6 +92,215 @@ interface RpcWorkerHandle {
   result: TeamMemberResult;
   waitPromise: Promise<TeamMemberResult>;
   abort: (reason: string) => void;
+}
+
+export interface RpcProcessResult {
+  messages: Message[];
+  exitCode: number;
+  stderr: string;
+  usage: UsageStats;
+  model?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  elapsedMs: number;
+  lastWork: string;
+}
+
+export interface RpcProcess {
+  run(task: string, signal?: AbortSignal): Promise<RpcProcessResult>;
+  abort(reason: string): void;
+}
+
+export function spawnRpcProcess(
+  cwd: string,
+  agent: AgentConfig,
+  defaultModel: string | undefined,
+): RpcProcess {
+  const args: string[] = ["--mode", "rpc", "--no-session"];
+  const effectiveModel = getEffectiveModel(agent, defaultModel);
+  if (effectiveModel) args.push("--model", effectiveModel);
+  if (agent.tools && agent.tools.length > 0) {
+    args.push("--tools", agent.tools.join(","));
+  }
+
+  let tempPromptDir: string | null = null;
+  let tempPromptPath: string | null = null;
+  if (agent.systemPrompt.trim()) {
+    const tempPrompt = writePromptToTempFile(agent.name, agent.systemPrompt);
+    tempPromptDir = tempPrompt.dir;
+    tempPromptPath = tempPrompt.filePath;
+    args.push("--append-system-prompt", tempPromptPath);
+  }
+
+  const proc = spawn("pi", args, {
+    cwd,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let abortReason: string | undefined;
+  let killTimer: NodeJS.Timeout | undefined;
+  let forceKillTimer: NodeJS.Timeout | undefined;
+
+  const cleanupTempFiles = () => {
+    if (tempPromptPath) {
+      try { fs.unlinkSync(tempPromptPath); } catch { /* ignore */ }
+    }
+    if (tempPromptDir) {
+      try { fs.rmdirSync(tempPromptDir); } catch { /* ignore */ }
+    }
+  };
+
+  const clearKillTimers = () => {
+    if (killTimer) clearTimeout(killTimer);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+  };
+
+  const doAbort = (reason: string) => {
+    if (proc.exitCode !== null) return;
+    abortReason = reason;
+    try {
+      proc.stdin.write(JSON.stringify({ type: "abort" }) + "\n");
+    } catch { /* ignore */ }
+    killTimer = setTimeout(() => {
+      if (proc.exitCode === null) proc.kill("SIGTERM");
+    }, 3000);
+    forceKillTimer = setTimeout(() => {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+    }, 4000);
+  };
+
+  return {
+    run(task: string, signal?: AbortSignal): Promise<RpcProcessResult> {
+      const usage: UsageStats = createEmptyUsage();
+      const messages: Message[] = [];
+      let stderr = "";
+      let model: string | undefined = effectiveModel;
+      let stopReason: string | undefined;
+      let errorMessage: string | undefined;
+      let commandFailed = false;
+      let promptResponded = false;
+      let agentEnded = false;
+      let buffer = "";
+      const startTime = Date.now();
+      const promptId = `prompt-${randomUUID()}`;
+
+      const onSignalAbort = () => doAbort("Meeting run was aborted.");
+      if (signal) {
+        if (signal.aborted) {
+          onSignalAbort();
+        } else {
+          signal.addEventListener("abort", onSignalAbort, { once: true });
+        }
+      }
+
+      const updateUsage = (message: Message) => {
+        if (message.role !== "assistant") return;
+        usage.turns++;
+        const u = message.usage;
+        if (!u) return;
+        usage.input += u.input || 0;
+        usage.output += u.output || 0;
+        usage.cacheRead += u.cacheRead || 0;
+        usage.cacheWrite += u.cacheWrite || 0;
+        usage.cost += u.cost?.total || 0;
+        usage.contextTokens = u.totalTokens || 0;
+      };
+
+      const handleLine = (line: string) => {
+        const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
+        if (!normalized.trim()) return;
+        let parsed: unknown;
+        try { parsed = JSON.parse(normalized); } catch { return; }
+
+        if (isRpcResponseRecord(parsed)) {
+          if (parsed.id !== promptId || parsed.command !== "prompt") return;
+          promptResponded = true;
+          if (parsed.success === false) {
+            commandFailed = true;
+            errorMessage = parsed.error || "RPC prompt command failed.";
+            stopReason = "error";
+            try { proc.stdin.end(); } catch { /* ignore */ }
+            proc.kill("SIGTERM");
+          }
+          return;
+        }
+        if (isRpcMessageEndRecord(parsed) && parsed.message) {
+          messages.push(parsed.message);
+          if (parsed.message.role === "assistant") {
+            updateUsage(parsed.message);
+            if (!model && parsed.message.model) model = parsed.message.model;
+            if (parsed.message.stopReason) stopReason = parsed.message.stopReason;
+            if (parsed.message.errorMessage) errorMessage = parsed.message.errorMessage;
+          }
+          return;
+        }
+        if (isRpcAgentEndRecord(parsed)) {
+          agentEnded = true;
+          if (messages.length === 0 && Array.isArray(parsed.messages)) {
+            for (const m of parsed.messages) {
+              messages.push(m);
+              updateUsage(m);
+            }
+          }
+          try { proc.stdin.end(); } catch { /* ignore */ }
+        }
+      };
+
+      return new Promise<RpcProcessResult>((resolve) => {
+        proc.stdout.on("data", (data: Buffer) => {
+          buffer += data.toString();
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) handleLine(line);
+        });
+        proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+        proc.on("close", (code) => {
+          if (signal) signal.removeEventListener("abort", onSignalAbort);
+          clearKillTimers();
+          if (buffer.trim()) handleLine(buffer);
+          const exitCode = code ?? 0;
+          if (!errorMessage && abortReason) { errorMessage = abortReason; stopReason = "aborted"; }
+          if (!promptResponded && !errorMessage) { errorMessage = "RPC worker exited before prompt response."; stopReason = "error"; }
+          if (!agentEnded && (commandFailed || exitCode !== 0) && !errorMessage) {
+            errorMessage = stderr.trim() || `RPC worker exited with code ${exitCode}.`;
+            stopReason = "error";
+          }
+          const lastWork = getFinalOutput(messages);
+          if (!lastWork.trim() && !errorMessage) { errorMessage = "Agent produced no text output."; stopReason = "error"; }
+          if (!stopReason && errorMessage) stopReason = "error";
+          cleanupTempFiles();
+          resolve({
+            messages,
+            exitCode: commandFailed && exitCode === 0 ? 1 : exitCode,
+            stderr,
+            usage,
+            model,
+            stopReason,
+            errorMessage,
+            elapsedMs: Date.now() - startTime,
+            lastWork,
+          });
+        });
+        proc.on("error", (error: Error) => {
+          errorMessage = error.message;
+          stopReason = "error";
+        });
+
+        try {
+          proc.stdin.write(JSON.stringify({ id: promptId, type: "prompt", message: task }) + "\n");
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+          stopReason = "error";
+          commandFailed = true;
+        }
+      });
+    },
+
+    abort(reason: string) {
+      doAbort(reason);
+    },
+  };
 }
 
 type TeamPhaseRunResult =
@@ -258,22 +467,7 @@ function createWorker(
   defaultModel: string | undefined,
   onUpdate: ((result: TeamMemberResult) => void) | undefined,
 ): RpcWorkerHandle {
-  const args: string[] = ["--mode", "rpc", "--no-session"];
   const effectiveModel = getEffectiveModel(agent, defaultModel);
-  if (effectiveModel) args.push("--model", effectiveModel);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  }
-
-  let tempPromptDir: string | null = null;
-  let tempPromptPath: string | null = null;
-  if (agent.systemPrompt.trim()) {
-    const tempPrompt = writePromptToTempFile(agent.name, agent.systemPrompt);
-    tempPromptDir = tempPrompt.dir;
-    tempPromptPath = tempPrompt.filePath;
-    args.push("--append-system-prompt", tempPromptPath);
-  }
-
   const result: TeamMemberResult = {
     agent: agent.name,
     agentSource: agent.source,
@@ -289,187 +483,27 @@ function createWorker(
     model: effectiveModel,
   };
 
-  const startTime = Date.now();
-  const promptId = `prompt-${phaseIndex}-${memberIndex}`;
-  const proc = spawn("pi", args, {
-    cwd,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"],
+  const rpc = spawnRpcProcess(cwd, agent, defaultModel);
+
+  const waitPromise = rpc.run(task).then((proc) => {
+    result.messages = proc.messages;
+    result.exitCode = proc.exitCode;
+    result.stderr = proc.stderr;
+    result.usage = proc.usage;
+    result.model = proc.model;
+    result.stopReason = proc.stopReason;
+    result.errorMessage = proc.errorMessage;
+    result.elapsedMs = proc.elapsedMs;
+    result.lastWork = proc.lastWork;
+    onUpdate?.({ ...result, usage: { ...result.usage }, messages: result.messages.map(cloneMessage) });
+    return result;
   });
-  let buffer = "";
-  let commandFailed = false;
-  let promptResponded = false;
-  let agentEnded = false;
-  let abortReason: string | undefined;
-  let killTimer: NodeJS.Timeout | undefined;
-  let forceKillTimer: NodeJS.Timeout | undefined;
-
-  const emitUpdate = () => {
-    result.elapsedMs = Date.now() - startTime;
-    result.lastWork = getFinalOutput(result.messages);
-    onUpdate?.({
-      ...result,
-      usage: { ...result.usage },
-      messages: result.messages.map(cloneMessage),
-    });
-  };
-
-  const clearKillTimers = () => {
-    if (killTimer) clearTimeout(killTimer);
-    if (forceKillTimer) clearTimeout(forceKillTimer);
-  };
-
-  const finalize = () => {
-    clearKillTimers();
-    if (!result.errorMessage && abortReason) {
-      result.errorMessage = abortReason;
-      result.stopReason = "aborted";
-    }
-    if (!promptResponded && !result.errorMessage) {
-      result.errorMessage = "RPC worker exited before prompt response.";
-      result.stopReason = "error";
-    }
-    if (!agentEnded && result.exitCode !== 0 && !result.errorMessage) {
-      result.errorMessage = result.stderr.trim() || `RPC worker exited with code ${result.exitCode}.`;
-      result.stopReason = "error";
-    }
-    if (!getFinalOutput(result.messages).trim() && !result.errorMessage) {
-      result.errorMessage = "Agent produced no text output.";
-      result.stopReason = "error";
-    }
-    result.elapsedMs = Date.now() - startTime;
-    result.lastWork = getFinalOutput(result.messages);
-    if (!result.stopReason && result.errorMessage) result.stopReason = "error";
-    emitUpdate();
-    if (tempPromptPath) {
-      try {
-        fs.unlinkSync(tempPromptPath);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (tempPromptDir) {
-      try {
-        fs.rmdirSync(tempPromptDir);
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-
-  const handleLine = (line: string) => {
-    const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
-    if (!normalized.trim()) return;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(normalized);
-    } catch {
-      return;
-    }
-
-    if (isRpcResponseRecord(parsed)) {
-      if (parsed.id !== promptId || parsed.command !== "prompt") return;
-      promptResponded = true;
-      if (parsed.success === false) {
-        commandFailed = true;
-        result.errorMessage = parsed.error || "RPC prompt command failed.";
-        result.stopReason = "error";
-        try {
-          proc.stdin.end();
-        } catch {
-          /* ignore */
-        }
-        proc.kill("SIGTERM");
-      }
-      return;
-    }
-
-    if (isRpcMessageEndRecord(parsed) && parsed.message) {
-      result.messages.push(parsed.message);
-      if (parsed.message.role === "assistant") {
-        updateUsageFromMessage(result, parsed.message);
-        if (!result.model && parsed.message.model) {
-          result.model = parsed.message.model;
-        }
-        if (parsed.message.stopReason) result.stopReason = parsed.message.stopReason;
-        if (parsed.message.errorMessage) result.errorMessage = parsed.message.errorMessage;
-      }
-      emitUpdate();
-      return;
-    }
-
-    if (isRpcAgentEndRecord(parsed)) {
-      agentEnded = true;
-      if (result.messages.length === 0 && Array.isArray(parsed.messages)) {
-        result.messages = parsed.messages;
-        rebuildUsage(result);
-      }
-      emitUpdate();
-      try {
-        proc.stdin.end();
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-
-  const waitPromise = new Promise<TeamMemberResult>((resolve) => {
-    proc.stdout.on("data", (data) => {
-      buffer += data.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) handleLine(line);
-    });
-
-    proc.stderr.on("data", (data) => {
-      result.stderr += data.toString();
-    });
-
-    proc.on("close", (code) => {
-      if (buffer.trim()) handleLine(buffer);
-      result.exitCode = code ?? 0;
-      if (commandFailed && result.exitCode === 0) result.exitCode = 1;
-      finalize();
-      resolve(result);
-    });
-
-    proc.on("error", (error) => {
-      result.errorMessage = error.message;
-      result.stopReason = "error";
-    });
-  });
-
-  try {
-    proc.stdin.write(
-      JSON.stringify({ id: promptId, type: "prompt", message: task }) + "\n",
-    );
-  } catch (error) {
-    result.errorMessage = error instanceof Error ? error.message : String(error);
-    result.stopReason = "error";
-    commandFailed = true;
-  }
-
-  emitUpdate();
 
   return {
     result,
     waitPromise,
     abort(reason: string) {
-      if (proc.exitCode !== null) return;
-      abortReason = reason;
-      result.stopReason = "aborted";
-      try {
-        proc.stdin.write(JSON.stringify({ type: "abort" }) + "\n");
-      } catch {
-        /* ignore */
-      }
-      killTimer = setTimeout(() => {
-        if (proc.exitCode === null) proc.kill("SIGTERM");
-      }, 3000);
-      forceKillTimer = setTimeout(() => {
-        if (proc.exitCode === null) proc.kill("SIGKILL");
-      }, 4000);
+      rpc.abort(reason);
     },
   };
 }
@@ -669,32 +703,16 @@ async function runParallelPhase(
   return { ok: true, phaseResults };
 }
 
-export async function runTeamByName(
+export async function runTeamPhases(
   cwd: string,
-  teamName: string,
+  team: TeamConfig,
+  agents: AgentConfig[],
   task: string,
   defaultModel?: string,
   signal?: AbortSignal,
   onUpdate?: TeamUpdateCallback,
   options?: TeamRuntimeOptions,
 ): Promise<TeamRunResult> {
-  const { agents } = discoverAgents(cwd);
-  const { teams } = discoverTeams(cwd);
-  const team = teams.find((item) => item.name === teamName);
-  if (!team) {
-    return {
-      teamName,
-      teamSource: "built-in",
-      teamFilePath: null,
-      runDir: "",
-      phases: [],
-      results: [],
-      finalText: "",
-      isError: true,
-      errorMessage: `Unknown team: "${teamName}"`,
-    };
-  }
-
   const missingAgents = Array.from(
     new Set(
       team.phases.flatMap((phase) =>
@@ -943,4 +961,32 @@ export async function runTeamByName(
       if (lock) releaseTeamLock(lock);
     }
   }
+}
+
+export async function runTeamByName(
+  cwd: string,
+  teamName: string,
+  task: string,
+  defaultModel?: string,
+  signal?: AbortSignal,
+  onUpdate?: TeamUpdateCallback,
+  options?: TeamRuntimeOptions,
+): Promise<TeamRunResult> {
+  const { agents } = discoverAgents(cwd);
+  const { teams } = discoverTeams(cwd);
+  const team = teams.find((item) => item.name === teamName);
+  if (!team) {
+    return {
+      teamName,
+      teamSource: "built-in",
+      teamFilePath: null,
+      runDir: "",
+      phases: [],
+      results: [],
+      finalText: "",
+      isError: true,
+      errorMessage: `Unknown team: "${teamName}"`,
+    };
+  }
+  return runTeamPhases(cwd, team, agents, task, defaultModel, signal, onUpdate, options);
 }
