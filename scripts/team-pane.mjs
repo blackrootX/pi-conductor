@@ -44,11 +44,13 @@ function renderTeam(details, finalMessage, isRunning = false, animationTick = Da
   const lines = [];
   lines.push(`team: ${details.teamName} (${details.teamSource})`);
   if (details.teamFilePath) lines.push(`source: ${details.teamFilePath}`);
+  if (details.runDir) lines.push(`run dir: ${details.runDir}`);
   lines.push("");
 
   for (let phaseIndex = 0; phaseIndex < details.phases.length; phaseIndex++) {
     const phase = details.phases[phaseIndex];
     lines.push(`phase ${phaseIndex + 1}: ${phase.kind}`);
+    if (phase.warningMessage) lines.push(`  warning: ${phase.warningMessage}`);
 
     for (let memberIndex = 0; memberIndex < phase.members.length; memberIndex++) {
       const memberState = phase.members[memberIndex];
@@ -165,6 +167,7 @@ function writeCurrentStatus(overrides = {}) {
       latestRenderState.isRunning,
     ),
     closedByUser: true,
+    runDir: latestRenderState.details.runDir,
     ...overrides,
   });
 }
@@ -301,6 +304,7 @@ async function main() {
       false,
     ),
     closedByUser: abortRequested,
+    runDir: result.runDir,
   });
 
   if (stdin.isTTY && stdout.isTTY && !abortRequested) {
@@ -318,6 +322,7 @@ main().catch((error) => {
     message: error instanceof Error ? error.message : String(error),
     summary: truncateSummary(error instanceof Error ? error.message : String(error)),
     closedByUser: abortRequested,
+    runDir: latestRenderState?.details?.runDir,
   });
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
