@@ -2572,8 +2572,8 @@ export default function registerExtension(pi: ExtensionAPI) {
             ctx.ui.notify(summary.text, summary.type);
           } finally {
             ctx.ui.setStatus("meeting", undefined);
+            unblockInput();
           }
-          return;
         }
 
         if (meetingConfig && (meetingConfig.mode === "refine" || meetingConfig.mode === "debate")) {

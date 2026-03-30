@@ -23,6 +23,27 @@ import {
 import type { TeamConfig } from "./teams.js";
 import { getFinalOutput } from "./workflow-runtime.js";
 
+const DEFAULT_PARTICIPANT_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function withParticipantTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Participant "${label}" timed out after ${Math.round(timeoutMs / 1000)}s.`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface MeetingRunResult {
   meetingName: string;
   meetingSource: MeetingSource;
@@ -351,7 +372,11 @@ async function runRefineMeeting(
 
     onUpdate?.({ meetingName: config.name, mode: "refine", phase: "review", round, totalRounds: maxRounds, status: "running", lastWork: `Round ${round}: reviewing...` });
 
-    const reviewResult = await runParticipant(reviewer, reviewerPrompt, cwd, agents, defaultModel, signal);
+    const reviewResult = await withParticipantTimeout(
+      runParticipant(reviewer, reviewerPrompt, cwd, agents, defaultModel, signal),
+      DEFAULT_PARTICIPANT_TIMEOUT_MS,
+      typeof reviewer === "string" ? reviewer : reviewer.cli,
+    );
     const reviewOutput = reviewResult.lastWork || getFinalOutput(reviewResult.messages);
 
     if (isRpcFailed(reviewResult) && !reviewOutput) {
@@ -395,7 +420,11 @@ async function runRefineMeeting(
 
     onUpdate?.({ meetingName: config.name, mode: "refine", phase: "fix", round, totalRounds: maxRounds, status: "running", lastWork: `Round ${round}: fixing...` });
 
-    const fixResult = await runParticipant(fixer, fixerPrompt, cwd, agents, defaultModel, signal);
+    const fixResult = await withParticipantTimeout(
+      runParticipant(fixer, fixerPrompt, cwd, agents, defaultModel, signal),
+      DEFAULT_PARTICIPANT_TIMEOUT_MS,
+      typeof fixer === "string" ? fixer : fixer.cli,
+    );
 
     if (isRpcFailed(fixResult)) {
       return { meetingName: config.name, meetingSource: config.source, meetingFilePath: config.filePath ?? null, mode: "refine", isError: true, errorMessage: `Fixer failed in round ${round}: ${fixResult.errorMessage ?? "(error)"}`, finalText };
@@ -488,8 +517,11 @@ async function runDebateMeeting(
 
   const phase1Results = await Promise.all(
     resolvedParticipants.map((p) =>
-      runParticipant(p.spec, phase1Prompt, cwd, agents, defaultModel, signal)
-        .then((result) => ({ role: p.role, spec: p.spec, result })),
+      withParticipantTimeout(
+        runParticipant(p.spec, phase1Prompt, cwd, agents, defaultModel, signal),
+        DEFAULT_PARTICIPANT_TIMEOUT_MS,
+        p.role,
+      ).then((result) => ({ role: p.role, spec: p.spec, result })),
     ),
   );
 
@@ -509,23 +541,29 @@ async function runDebateMeeting(
 
     onUpdate?.({ meetingName: config.name, mode: "debate", phase: "critique", round, totalRounds: config.rounds, status: "running", lastWork: `Round ${round}: cross-critique...` });
 
-    const critiqueResults: Array<{ role: string; output: string }> = [];
-    for (const p of resolvedParticipants) {
-      const othersOutput = latestPositions
-        .filter((pos) => pos.role !== p.role)
-        .map((pos) => `### A colleague's position\n${pos.output}`)
-        .join("\n\n");
+    const capturedPositions = [...latestPositions];
+    const critiqueResults = await Promise.all(
+      resolvedParticipants.map(async (p) => {
+        const othersOutput = capturedPositions
+          .filter((pos) => pos.role !== p.role)
+          .map((pos) => `### A colleague's position\n${pos.output}`)
+          .join("\n\n");
 
-      const critiquePrompt = [
-        `## Topic\n${task}`,
-        `## Your Previous Position\n${latestPositions.find((pos) => pos.role === p.role)?.output ?? ""}`,
-        `## Colleague Positions (for cross-critique)\n${othersOutput}`,
-        `First write a steelman of the strongest colleague position (5-8 sentences). Then provide your critique and updated position. Maintain your original position unless you find a specific factual error.`,
-      ].join("\n\n");
+        const critiquePrompt = [
+          `## Topic\n${task}`,
+          `## Your Previous Position\n${capturedPositions.find((pos) => pos.role === p.role)?.output ?? ""}`,
+          `## Colleague Positions (for cross-critique)\n${othersOutput}`,
+          `First write a steelman of the strongest colleague position (5-8 sentences). Then provide your critique and updated position. Maintain your original position unless you find a specific factual error.`,
+        ].join("\n\n");
 
-      const critiqueResult = await runParticipant(p.spec, critiquePrompt, cwd, agents, defaultModel, signal);
-      critiqueResults.push({ role: p.role, output: critiqueResult.lastWork || getFinalOutput(critiqueResult.messages) });
-    }
+        const critiqueResult = await withParticipantTimeout(
+          runParticipant(p.spec, critiquePrompt, cwd, agents, defaultModel, signal),
+          DEFAULT_PARTICIPANT_TIMEOUT_MS,
+          p.role,
+        );
+        return { role: p.role, output: critiqueResult.lastWork || getFinalOutput(critiqueResult.messages) };
+      }),
+    );
     latestPositions = critiqueResults;
 
     onUpdate?.({ meetingName: config.name, mode: "debate", phase: "critique", round, totalRounds: config.rounds, status: "done", lastWork: `Round ${round} complete.` });
@@ -534,13 +572,40 @@ async function runDebateMeeting(
   onUpdate?.({ meetingName: config.name, mode: "debate", phase: "synthesis", status: "running", lastWork: "Synthesizing..." });
 
   const allPositions = latestPositions.map((p) => `### ${p.role}\n${p.output}`).join("\n\n");
+
+  const synthesisPrompt = [
+    `## Topic\n${task}`,
+    `## Final Positions\n${allPositions}`,
+    [
+      `You are synthesizing a multi-agent debate. Produce a structured synthesis with these sections:`,
+      `1. **Convergent Points** — where all participants agreed`,
+      `2. **Divergent Points** — key disagreements; classify each as factual (D-F), predictive (D-P), value-based (D-V), or unknown (D-U)`,
+      `3. **Unique Insights** — perspectives raised by only one participant`,
+      `4. **Recommendation** — the most defensible position given the evidence, or state explicitly if no clear winner`,
+      `5. **Confidence** — HIGH / MEDIUM / LOW based on convergence level`,
+      `Be specific and cite participant roles when referencing positions.`,
+    ].join("\n"),
+  ].join("\n\n");
+
+  const synthesizerSpec = resolvedParticipants[0]?.spec ?? "plan";
+  let synthesisText: string;
+  try {
+    const synthesisResult = await withParticipantTimeout(
+      runParticipant(synthesizerSpec, synthesisPrompt, cwd, agents, defaultModel, signal),
+      DEFAULT_PARTICIPANT_TIMEOUT_MS,
+      "synthesizer",
+    );
+    synthesisText = synthesisResult.lastWork || getFinalOutput(synthesisResult.messages);
+    if (!synthesisText.trim()) synthesisText = allPositions;
+  } catch {
+    synthesisText = allPositions;
+  }
+
   const synthesisContent = [
     `# Meeting Synthesis: ${config.name}`,
     `## Topic\n${task}`,
-    `## Final Positions\n${allPositions}`,
-    `## Synthesis`,
-    `The following synthesis applies reconciliation rules (convergent points, divergent points, unique insights, confidence level):`,
-    latestPositions.length >= 2 ? buildSimpleSynthesis(task, latestPositions) : latestPositions[0]?.output ?? "",
+    `## Synthesis\n${synthesisText}`,
+    `## Full Positions\n${allPositions}`,
   ].join("\n\n");
 
   let outputPath: string | undefined;
@@ -570,21 +635,6 @@ async function runDebateMeeting(
     isError: false,
     finalText: config.output === "file" && outputPath ? `Synthesis written to: ${outputPath}\n\n${synthesisContent}` : synthesisContent,
   };
-}
-
-function buildSimpleSynthesis(
-  task: string,
-  positions: Array<{ role: string; output: string }>,
-): string {
-  return [
-    `**Topic**: ${task}`,
-    `**Participants**: ${positions.map((p) => p.role).join(", ")}`,
-    `**Convergent Points**: Identify where participants agreed.`,
-    `**Divergent Points**: Identify key disagreements and classify as factual (D-F), predictive (D-P), value-based (D-V), or unknown (D-U).`,
-    `**Unique Insights**: Note perspectives raised by only one participant.`,
-    `**Confidence**: Based on the above, assess overall confidence in a recommendation.`,
-    `\n*Full positions above provide the raw material for human synthesis.*`,
-  ].join("\n");
 }
 
 export async function runMeetingByName(
