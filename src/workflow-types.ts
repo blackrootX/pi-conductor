@@ -167,9 +167,16 @@ export interface WorkflowCanonicalStepSnapshot {
   blockedWorkSummary?: BlockedWorkSummaryItem[];
   verifyStatus?: VerifyStatus;
   verifySummary?: string;
+  verifyChecks?: VerificationItem[];
+  verifyAttemptCount?: number;
   startedAt?: string;
   finishedAt?: string;
   summary?: string;
+  rawFinalText?: string;
+  repairedFinalText?: string;
+  parseError?: string;
+  diagnostics?: string[];
+  evidenceHints?: EvidenceHints;
 }
 
 export interface WorkflowPersistedStateSnapshot {

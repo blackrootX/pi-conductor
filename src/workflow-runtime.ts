@@ -9,7 +9,7 @@ import {
   resolveAgentSystemPrompt,
   resolveExecutionProfile,
 } from "./agents.js";
-import { runWorkflowAgentSession } from "./workflow-agent-session.js";
+import { runWorkflowAgentSession, createSharedSessionResources, type SharedSessionResources } from "./workflow-agent-session.js";
 import {
   applyOnStepErrorPatch,
   type AfterPromotePatch,
@@ -62,6 +62,18 @@ const REPAIR_SYSTEM_PROMPT = [
   "Preserve the most faithful interpretation of the original step output.",
   "Return the required structured result block exactly once.",
 ].join("\n");
+
+const STEP_TIMEOUT_ENV = "PI_CONDUCTOR_STEP_TIMEOUT_MS";
+
+function resolveStepTimeoutMs(): number | undefined {
+  const envValue = process.env[STEP_TIMEOUT_ENV];
+  if (envValue === "0" || envValue === "none" || envValue === "false") return undefined;
+  if (envValue) {
+    const parsed = Number.parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
 
 export interface UsageStats {
   input: number;
@@ -135,6 +147,8 @@ type RunSingleAgentOptions = {
   stepId: string;
   objective: string;
   signal: AbortSignal | undefined;
+  stepTimeoutMs: number | undefined;
+  sharedResources: SharedSessionResources | undefined;
   onUpdate: ((result: SingleResult) => void) | undefined;
   systemPromptOverride?: string;
   toolsOverride?: string[];
@@ -717,10 +731,14 @@ function persistWorkflowState(
   workflow: WorkflowConfig,
   state: WorkflowState,
 ): void {
-  writeJsonFile(
-    path.join(persistence.runDir, "state.json"),
-    buildPersistedWorkflowStateSnapshot(state, workflow.source, workflow.filePath ?? null),
-  );
+  try {
+    writeJsonFile(
+      path.join(persistence.runDir, "state.json"),
+      buildPersistedWorkflowStateSnapshot(state, workflow.source, workflow.filePath ?? null),
+    );
+  } catch {
+    // State persistence is best-effort; the workflow should not crash on disk errors.
+  }
 }
 
 function persistStepResult(
@@ -730,6 +748,7 @@ function persistStepResult(
   state: WorkflowState,
   result: SingleResult,
 ): void {
+  try {
   const fileName = `${String(stepIndex + 1).padStart(2, "0")}-${sanitizeFileNamePart(stepAgent)}.result.json`;
   const stepState = state.steps[stepIndex];
   writeJsonFile(path.join(persistence.stepsDir, fileName), {
@@ -762,6 +781,9 @@ function persistStepResult(
     errorMessage: result.errorMessage,
     lastWork: result.lastWork,
   });
+  } catch {
+    // Step result persistence is best-effort; the workflow should not crash on disk errors.
+  }
 }
 
 function makeWorkflowDetails(
@@ -854,8 +876,30 @@ function cloneWorkflowStateFromSnapshot(snapshot: WorkflowPersistedStateSnapshot
       blockedWorkSummary: cloneBlockedWorkSummary(step.blockedWorkSummary),
       verifyStatus: step.verifyStatus,
       verifySummary: step.verifySummary,
+      verifyAttemptCount: (step as any).verifyAttemptCount,
+      verifyChecks: (step as any).verifyChecks?.map((item: any) => ({ ...item })),
       startedAt: step.startedAt,
       finishedAt: step.finishedAt,
+      rawFinalText: (step as any).rawFinalText,
+      repairedFinalText: (step as any).repairedFinalText,
+      parseError: (step as any).parseError,
+      diagnostics: (step as any).diagnostics ? [...(step as any).diagnostics] : undefined,
+      evidenceHints: (step as any).evidenceHints
+        ? {
+            touchedFiles: (step as any).evidenceHints.touchedFiles
+              ? [...(step as any).evidenceHints.touchedFiles]
+              : undefined,
+            artifactPaths: (step as any).evidenceHints.artifactPaths
+              ? [...(step as any).evidenceHints.artifactPaths]
+              : undefined,
+            symbols: (step as any).evidenceHints.symbols
+              ? [...(step as any).evidenceHints.symbols]
+              : undefined,
+            commands: (step as any).evidenceHints.commands
+              ? [...(step as any).evidenceHints.commands]
+              : undefined,
+          }
+        : undefined,
       result: step.summary
         ? {
             status:
@@ -1222,6 +1266,8 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
     stepId,
     objective,
     signal,
+    stepTimeoutMs,
+    sharedResources,
     onUpdate,
     systemPromptOverride,
     toolsOverride,
@@ -1245,19 +1291,177 @@ async function runSingleAgent(options: RunSingleAgentOptions): Promise<SingleRes
     };
   }
 
-  return runWorkflowAgentSession({
-    cwd: defaultCwd,
-    agent,
-    task,
-    defaultModel,
+  let stepSignal = signal;
+  let stepTimeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  if (stepTimeoutMs !== undefined && stepTimeoutMs > 0) {
+    const controller = new AbortController();
+    stepTimeoutId = setTimeout(() => controller.abort(), stepTimeoutMs);
+    if (signal) {
+      signal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+    stepSignal = controller.signal;
+  }
+
+  try {
+    const result = await runWorkflowAgentSession({
+      cwd: defaultCwd,
+      agent,
+      task,
+      defaultModel,
+      step,
+      stepId,
+      objective,
+      signal: stepSignal,
+      onUpdate,
+      systemPromptOverride,
+      toolsOverride,
+      sharedResources,
+    });
+
+    if (stepTimeoutId !== undefined && stepSignal?.aborted && !signal?.aborted) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = `Step timed out after ${Math.round(stepTimeoutMs! / 1000)}s`;
+    }
+
+    return result;
+  } finally {
+    if (stepTimeoutId !== undefined) clearTimeout(stepTimeoutId);
+  }
+}
+
+type FailStepContext = {
+  cwd: string;
+  workflow: WorkflowConfig;
+  persistence: WorkflowPersistence;
+  state: WorkflowState;
+  results: SingleResult[];
+  defaultModel: string | undefined;
+  task: string;
+  hooks: WorkflowRuntimeHooks;
+  emitDetails: (partialResults?: SingleResult[]) => void;
+};
+
+type FailStepOptions = {
+  index: number;
+  step: WorkflowConfig["steps"][number];
+  agent: AgentConfig | undefined;
+  workOrder?: ReturnType<typeof buildWorkOrder>;
+  stage: WorkflowRuntimeErrorStage;
+  error: unknown;
+  resultRecord?: SingleResult;
+  rawFinalText?: string;
+  repairedFinalText?: string;
+  parseError?: string;
+  messagePrefix: string;
+};
+
+async function failStepAndReturn(
+  ctx: FailStepContext,
+  options: FailStepOptions,
+): Promise<WorkflowRunResult> {
+  const {
+    index,
     step,
-    stepId,
-    objective,
-    signal,
-    onUpdate,
-    systemPromptOverride,
-    toolsOverride,
-  });
+    agent,
+    workOrder,
+    stage,
+    error,
+    rawFinalText,
+    repairedFinalText,
+    parseError,
+    messagePrefix,
+  } = options;
+
+  const workflowError: WorkflowRuntimeError = {
+    stage,
+    workflowName: ctx.workflow.name,
+    stepIndex: index,
+    stepId: step.id,
+    agent: step.agent,
+    message: describeUnknownError(error),
+    stderr: options.resultRecord?.stderr,
+    rawFinalText,
+    repairedFinalText,
+    parseError,
+  };
+
+  let errorPatch: OnStepErrorPatch | undefined;
+  if (ctx.hooks.onStepError) {
+    try {
+      const patch = await ctx.hooks.onStepError({
+        cwd: ctx.cwd,
+        workflow: createImmutableHookSnapshot(ctx.workflow),
+        agent: agent ? createImmutableHookSnapshot(agent) : undefined,
+        state: createImmutableHookSnapshot(ctx.state),
+        stepIndex: index,
+        workOrder: workOrder
+          ? createImmutableHookSnapshot(workOrder)
+          : undefined,
+        error: createImmutableHookSnapshot(workflowError),
+      });
+      errorPatch = patch ?? undefined;
+    } catch (hookError) {
+      errorPatch = mergeOnStepErrorPatch(undefined, {
+        diagnostics: [`onStepError hook failed: ${describeUnknownError(hookError)}`],
+      });
+    }
+  }
+
+  applyOnStepErrorPatch(ctx.state, index, errorPatch);
+
+  const failureResult =
+    options.resultRecord ??
+    createSyntheticFailureResult({
+      agentName: step.agent,
+      agentSource: agent?.source ?? "unknown",
+      task: workOrder ? renderStructuredStepPrompt(workOrder) : ctx.task,
+      objective: workOrder?.objective ?? ctx.state.steps[index]?.objective ?? "",
+      step: index + 1,
+      stepId: step.id,
+      stderr: workflowError.message,
+      model: agent?.model ?? ctx.defaultModel,
+    });
+
+  failureResult.objective = workOrder?.objective ?? failureResult.objective;
+  failureResult.profile = workOrder?.profile ?? failureResult.profile;
+  failureResult.rawFinalText = rawFinalText ?? failureResult.rawFinalText;
+  failureResult.repairedFinalText =
+    repairedFinalText ?? failureResult.repairedFinalText;
+  failureResult.parseError = parseError ?? failureResult.parseError;
+  failureResult.diagnostics = mergeDiagnostics(
+    failureResult.diagnostics,
+    errorPatch?.diagnostics,
+  );
+  if (errorPatch?.summary?.trim()) {
+    failureResult.lastWork = errorPatch.summary.trim();
+  }
+
+  markStepFailure(ctx.state, index, "failed");
+  replaceStepResult(ctx.results, index, failureResult);
+  persistStepResult(
+    ctx.persistence,
+    index,
+    step.agent,
+    ctx.state,
+    failureResult,
+  );
+  persistRunArtifacts(ctx.persistence, ctx.workflow, ctx.state);
+  ctx.emitDetails();
+
+  return {
+    workflowName: ctx.workflow.name,
+    steps: ctx.workflow.steps,
+    workflowSource: ctx.workflow.source,
+    workflowFilePath: ctx.workflow.filePath ?? null,
+    runDir: ctx.persistence.runDir,
+    results: ctx.results,
+    state: ctx.state,
+    finalText: "",
+    isError: true,
+    errorMessage: `${messagePrefix}: ${workflowError.message}`,
+  };
 }
 
 async function runWorkflowWithPreparedState(options: {
@@ -1271,6 +1475,7 @@ async function runWorkflowWithPreparedState(options: {
   runBeforeWorkflowHook?: boolean;
   emitInitialDetails?: boolean;
   defaultModel?: string;
+  stepTimeoutMs?: number;
   signal?: AbortSignal;
   onUpdate?: WorkflowUpdateCallback;
   runtimeHooks?: WorkflowRuntimeHooks;
@@ -1286,6 +1491,7 @@ async function runWorkflowWithPreparedState(options: {
     runBeforeWorkflowHook = true,
     emitInitialDetails = false,
     defaultModel,
+    stepTimeoutMs,
     signal,
     onUpdate,
     runtimeHooks = {},
@@ -1293,27 +1499,13 @@ async function runWorkflowWithPreparedState(options: {
   const persistence = createPersistence(cwd, state.runId);
   const results = initialResults.slice();
   const hooks = runtimeHooks;
+  const sharedResources = createSharedSessionResources(cwd);
 
   const emitDetails = (partialResults = results) => {
     onUpdate?.(makeWorkflowDetails(persistence, workflow, partialResults, state));
   };
 
   if (emitInitialDetails) emitDetails();
-
-  const runOnStepErrorHook = async (
-    input: Parameters<NonNullable<WorkflowRuntimeHooks["onStepError"]>>[0],
-  ): Promise<OnStepErrorPatch | undefined> => {
-    if (!hooks.onStepError) return undefined;
-
-    try {
-      const patch = await hooks.onStepError(input);
-      return patch ?? undefined;
-    } catch (hookError) {
-      return mergeOnStepErrorPatch(undefined, {
-        diagnostics: [`onStepError hook failed: ${describeUnknownError(hookError)}`],
-      });
-    }
-  };
 
   const runOnVerifyFailureHook = async (
     input: Parameters<NonNullable<WorkflowRuntimeHooks["onVerifyFailure"]>>[0],
@@ -1329,110 +1521,16 @@ async function runWorkflowWithPreparedState(options: {
     }
   };
 
-  const failStep = async (options: {
-    index: number;
-    step: WorkflowConfig["steps"][number];
-    agent: AgentConfig | undefined;
-    workOrder?: ReturnType<typeof buildWorkOrder>;
-    stage: WorkflowRuntimeErrorStage;
-    error: unknown;
-    resultRecord?: SingleResult;
-    rawFinalText?: string;
-    repairedFinalText?: string;
-    parseError?: string;
-    messagePrefix: string;
-  }): Promise<WorkflowRunResult> => {
-    const {
-      index,
-      step,
-      agent,
-      workOrder,
-      stage,
-      error,
-      rawFinalText,
-      repairedFinalText,
-      parseError,
-      messagePrefix,
-    } = options;
-
-    const workflowError: WorkflowRuntimeError = {
-      stage,
-      workflowName: workflow.name,
-      stepIndex: index,
-      stepId: step.id,
-      agent: step.agent,
-      message: describeUnknownError(error),
-      stderr: options.resultRecord?.stderr,
-      rawFinalText,
-      repairedFinalText,
-      parseError,
-    };
-
-    let errorPatch = await runOnStepErrorHook({
-      cwd,
-      workflow: createImmutableHookSnapshot(workflow),
-      agent: agent ? createImmutableHookSnapshot(agent) : undefined,
-      state: createImmutableHookSnapshot(state),
-      stepIndex: index,
-      workOrder: workOrder
-        ? createImmutableHookSnapshot(workOrder)
-        : undefined,
-      error: createImmutableHookSnapshot(workflowError),
-    });
-
-    applyOnStepErrorPatch(state, index, errorPatch);
-
-    const failureResult =
-      options.resultRecord ??
-      createSyntheticFailureResult({
-        agentName: step.agent,
-        agentSource: agent?.source ?? "unknown",
-        task: workOrder ? renderStructuredStepPrompt(workOrder) : task,
-        objective: workOrder?.objective ?? state.steps[index]?.objective ?? "",
-        step: index + 1,
-        stepId: step.id,
-        stderr: workflowError.message,
-        model: agent?.model ?? defaultModel,
-      });
-
-    failureResult.objective = workOrder?.objective ?? failureResult.objective;
-    failureResult.profile = workOrder?.profile ?? failureResult.profile;
-    failureResult.rawFinalText = rawFinalText ?? failureResult.rawFinalText;
-    failureResult.repairedFinalText =
-      repairedFinalText ?? failureResult.repairedFinalText;
-    failureResult.parseError = parseError ?? failureResult.parseError;
-    failureResult.diagnostics = mergeDiagnostics(
-      failureResult.diagnostics,
-      errorPatch?.diagnostics,
-    );
-    if (errorPatch?.summary?.trim()) {
-      failureResult.lastWork = errorPatch.summary.trim();
-    }
-
-    markStepFailure(state, index, "failed");
-    replaceStepResult(results, index, failureResult);
-    persistStepResult(
-      persistence,
-      index,
-      step.agent,
-      state,
-      failureResult,
-    );
-    persistRunArtifacts(persistence, workflow, state);
-    emitDetails();
-
-    return {
-      workflowName: workflow.name,
-      steps: workflow.steps,
-      workflowSource: workflow.source,
-      workflowFilePath: workflow.filePath ?? null,
-      runDir: persistence.runDir,
-      results,
-      state,
-      finalText: "",
-      isError: true,
-      errorMessage: `${messagePrefix}: ${workflowError.message}`,
-    };
+  const failCtx: FailStepContext = {
+    cwd,
+    workflow,
+    persistence,
+    state,
+    results,
+    defaultModel,
+    task,
+    hooks,
+    emitDetails,
   };
 
   if (runBeforeWorkflowHook) {
@@ -1479,7 +1577,7 @@ async function runWorkflowWithPreparedState(options: {
       : undefined;
     const currentProjection = projectWorkItems(state.shared.workItems);
     if (!currentProjection.ok) {
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1506,7 +1604,7 @@ async function runWorkflowWithPreparedState(options: {
       });
       workOrder = mergeBeforeStepPatch(workOrder, beforeStepPatch ?? undefined);
     } catch (error) {
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1538,6 +1636,8 @@ async function runWorkflowWithPreparedState(options: {
         stepId: step.id,
         objective: workOrder.objective,
         signal,
+        stepTimeoutMs,
+        sharedResources,
         onUpdate: onUpdate
           ? (partialResult) => {
               partialResult.profile = profile;
@@ -1548,7 +1648,7 @@ async function runWorkflowWithPreparedState(options: {
         toolsOverride: workOrder.allowedTools,
       });
     } catch (error) {
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1569,7 +1669,7 @@ async function runWorkflowWithPreparedState(options: {
       primaryResult.stopReason === "error" ||
       primaryResult.stopReason === "aborted"
     ) {
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1609,6 +1709,8 @@ async function runWorkflowWithPreparedState(options: {
           stepId: step.id,
           objective: `${workOrder.objective} (repair structured output)`,
           signal,
+          stepTimeoutMs,
+          sharedResources,
           onUpdate: onUpdate
             ? (partialResult) => {
                 partialResult.parseError = parseError;
@@ -1622,7 +1724,7 @@ async function runWorkflowWithPreparedState(options: {
           toolsOverride: [],
         });
       } catch (error) {
-        return await failStep({
+        return await failStepAndReturn(failCtx, {
           index,
           step,
           agent,
@@ -1649,7 +1751,7 @@ async function runWorkflowWithPreparedState(options: {
         repairResult.stopReason === "error" ||
         repairResult.stopReason === "aborted"
       ) {
-        return await failStep({
+        return await failStepAndReturn(failCtx, {
           index,
           step,
           agent,
@@ -1676,7 +1778,7 @@ async function runWorkflowWithPreparedState(options: {
       finalResultRecord.repairAttempted = true;
       finalResultRecord.rawFinalText = rawFinalText;
       finalResultRecord.repairedFinalText = repairedFinalText;
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1712,7 +1814,7 @@ async function runWorkflowWithPreparedState(options: {
       finalResultRecord.repairedFinalText = repairedFinalText;
       finalResultRecord.parseError = parseError;
       finalResultRecord.repairAttempted = Boolean(parseError);
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1820,7 +1922,7 @@ async function runWorkflowWithPreparedState(options: {
         "Promotion denied because the combined work-item batch failed validation.",
         0,
       );
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -1844,7 +1946,7 @@ async function runWorkflowWithPreparedState(options: {
         "Promotion denied because the worker reported a non-success step outcome.",
         0,
       );
-      return await failStep({
+      return await failStepAndReturn(failCtx, {
         index,
         step,
         agent,
@@ -2074,6 +2176,7 @@ export async function runWorkflowByName(
     task,
     state: createWorkflowState(workflow, task, runId),
     defaultModel,
+    stepTimeoutMs: resolveStepTimeoutMs(),
     signal,
     onUpdate,
     runtimeHooks,
@@ -2198,6 +2301,7 @@ export async function resumeWorkflowRun(
     runBeforeWorkflowHook: false,
     emitInitialDetails: true,
     defaultModel,
+    stepTimeoutMs: resolveStepTimeoutMs(),
     signal,
     onUpdate,
     runtimeHooks,

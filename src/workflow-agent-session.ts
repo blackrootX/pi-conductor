@@ -33,6 +33,27 @@ export interface WorkflowAgentSessionOptions {
   onUpdate?: (result: SingleResult) => void;
   systemPromptOverride?: string;
   toolsOverride?: string[];
+  sharedResources?: SharedSessionResources;
+}
+
+export interface SharedSessionResources {
+  agentDir: string;
+  settingsManager: SettingsManager;
+  authStorage: AuthStorage;
+  modelRegistry: ModelRegistry;
+}
+
+export function createSharedSessionResources(cwd: string): SharedSessionResources {
+  const agentDir = getAgentDir();
+  return {
+    agentDir,
+    settingsManager: SettingsManager.create(cwd, agentDir),
+    authStorage: AuthStorage.create(path.join(agentDir, "auth.json")),
+    modelRegistry: new ModelRegistry(
+      AuthStorage.create(path.join(agentDir, "auth.json")),
+      path.join(agentDir, "models.json"),
+    ),
+  };
 }
 
 interface UsageStats {
@@ -142,11 +163,11 @@ function createToolPolicyExtension(allowedToolNames: string[]): ExtensionFactory
 export async function runWorkflowAgentSession(
   options: WorkflowAgentSessionOptions,
 ): Promise<SingleResult> {
-  const agentDir = getAgentDir();
-  const settingsManager = SettingsManager.create(options.cwd, agentDir);
-  const authStorage = AuthStorage.create(path.join(agentDir, "auth.json"));
-  const modelRegistry = new ModelRegistry(
-    authStorage,
+  const shared = options.sharedResources;
+  const agentDir = shared?.agentDir ?? getAgentDir();
+  const settingsManager = shared?.settingsManager ?? SettingsManager.create(options.cwd, agentDir);
+  const modelRegistry = shared?.modelRegistry ?? new ModelRegistry(
+    shared?.authStorage ?? AuthStorage.create(path.join(agentDir, "auth.json")),
     path.join(agentDir, "models.json"),
   );
   const resolvedModelLabel = options.agent.model ?? options.defaultModel;

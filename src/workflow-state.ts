@@ -527,30 +527,43 @@ export function markStepFailure(
   step.finishedAt = finishedAt;
 }
 
-export function mergeAgentResultIntoState(
-  state: WorkflowState,
-  stepIndex: number,
-  result: AgentResult,
-  rawFinalText: string,
-  repairedFinalText?: string,
-  parseError?: string,
+interface MergeResultOptions {
+  state: WorkflowState;
+  stepIndex: number;
+  result: AgentResult;
+  rawFinalText: string;
+  repairedFinalText?: string;
+  parseError?: string;
+  stepStatus: "done" | "blocked";
   workItemUpdate?: {
     workItems: WorkItem[];
     projection: WorkItemProjection;
-  },
-): void {
+  };
+}
+
+function mergeResultCore(options: MergeResultOptions): void {
+  const {
+    state,
+    stepIndex,
+    result,
+    rawFinalText,
+    repairedFinalText,
+    parseError,
+    stepStatus,
+    workItemUpdate,
+  } = options;
   const step = state.steps[stepIndex];
   if (!step) return;
   const finishedAt = nowIso();
-  const touchedWorkProgression =
-    Boolean(result.newWorkItems?.length) ||
-    Boolean(result.resolvedWorkItems?.length);
 
   const summary = result.summary.trim();
   if (summary) state.shared.summary = summary;
   if (result.focusSummary?.trim()) {
     state.shared.focus = result.focusSummary.trim();
-  } else if (touchedWorkProgression) {
+  } else if (
+    stepStatus === "done" &&
+    (Boolean(result.newWorkItems?.length) || Boolean(result.resolvedWorkItems?.length))
+  ) {
     state.shared.focus = undefined;
   }
 
@@ -592,6 +605,7 @@ export function mergeAgentResultIntoState(
       ...normalizedVerification,
     ];
   }
+
   if (workItemUpdate) {
     state.shared.workItems = workItemUpdate.workItems.map((item) => ({
       ...item,
@@ -613,11 +627,45 @@ export function mergeAgentResultIntoState(
   step.rawFinalText = rawFinalText;
   step.repairedFinalText = repairedFinalText;
   step.parseError = parseError;
-  step.blockedWorkSummary =
-    workItemUpdate?.projection.blockedWorkSummary.map((item) => ({ ...item })) ??
-    undefined;
-  step.status = "done";
+  step.status = stepStatus;
   step.finishedAt = finishedAt;
+
+  if (stepStatus === "done") {
+    step.blockedWorkSummary =
+      workItemUpdate?.projection.blockedWorkSummary.map((item) => ({ ...item })) ??
+      undefined;
+  } else {
+    step.blockedWorkSummary = getProjectedWorkItems(state).blockedWorkSummary.map((item) => ({
+      ...item,
+      blockedByTitles: item.blockedByTitles ? [...item.blockedByTitles] : undefined,
+    }));
+    state.status = "blocked";
+    state.finishedAt = finishedAt;
+  }
+}
+
+export function mergeAgentResultIntoState(
+  state: WorkflowState,
+  stepIndex: number,
+  result: AgentResult,
+  rawFinalText: string,
+  repairedFinalText?: string,
+  parseError?: string,
+  workItemUpdate?: {
+    workItems: WorkItem[];
+    projection: WorkItemProjection;
+  },
+): void {
+  mergeResultCore({
+    state,
+    stepIndex,
+    result,
+    rawFinalText,
+    repairedFinalText,
+    parseError,
+    stepStatus: "done",
+    workItemUpdate,
+  });
 }
 
 export function mergeBlockedAgentResultIntoState(
@@ -628,77 +676,15 @@ export function mergeBlockedAgentResultIntoState(
   repairedFinalText?: string,
   parseError?: string,
 ): void {
-  const step = state.steps[stepIndex];
-  if (!step) return;
-  const finishedAt = nowIso();
-
-  const summary = result.summary.trim();
-  if (summary) state.shared.summary = summary;
-  if (result.focusSummary?.trim()) {
-    state.shared.focus = result.focusSummary.trim();
-  }
-
-  const normalizedDecisions = normalizeDecisions(result.decisions);
-  const normalizedArtifacts = normalizeArtifacts(result.artifacts);
-  const normalizedLearnings = normalizeLearnings(result.learnings);
-  const normalizedBlockers = normalizeBlockers(result.blockers);
-  const normalizedVerification = normalizeVerification(result.verification);
-  const normalizedEvidenceHints = normalizeEvidenceHints(result.evidenceHints);
-
-  if (normalizedDecisions?.length) {
-    state.shared.decisions = uniqueBy(
-      [...state.shared.decisions, ...normalizedDecisions],
-      (item: DecisionItem) => `${item.topic}\u0000${item.decision}`,
-    );
-  }
-
-  if (normalizedArtifacts?.length) {
-    state.shared.artifacts = uniqueBy(
-      [...state.shared.artifacts, ...normalizedArtifacts],
-      (item: ArtifactItem) => `${item.kind}\u0000${item.path ?? ""}\u0000${item.text ?? ""}`,
-    );
-  }
-
-  if (normalizedLearnings?.length) {
-    state.shared.learnings = uniqueBy(
-      [...state.shared.learnings, ...normalizedLearnings],
-      (item) => item,
-    );
-  }
-
-  if (normalizedBlockers?.length) {
-    state.shared.blockers = [...state.shared.blockers, ...normalizedBlockers];
-  }
-
-  if (normalizedVerification?.length) {
-    state.shared.verification = [
-      ...state.shared.verification,
-      ...normalizedVerification,
-    ];
-  }
-
-  step.result = {
-    ...result,
-    decisions: normalizedDecisions,
-    artifacts: normalizedArtifacts,
-    learnings: normalizedLearnings,
-    blockers: normalizedBlockers,
-    verification: normalizedVerification,
-    evidenceHints: normalizedEvidenceHints,
-  };
-  step.provisionalResult = step.provisionalResult ?? step.result;
-  step.evidenceHints = normalizedEvidenceHints;
-  step.rawFinalText = rawFinalText;
-  step.repairedFinalText = repairedFinalText;
-  step.parseError = parseError;
-  step.blockedWorkSummary = getProjectedWorkItems(state).blockedWorkSummary.map((item) => ({
-    ...item,
-    blockedByTitles: item.blockedByTitles ? [...item.blockedByTitles] : undefined,
-  }));
-  step.status = "blocked";
-  step.finishedAt = finishedAt;
-  state.status = "blocked";
-  state.finishedAt = finishedAt;
+  mergeResultCore({
+    state,
+    stepIndex,
+    result,
+    rawFinalText,
+    repairedFinalText,
+    parseError,
+    stepStatus: "blocked",
+  });
 }
 
 export function deriveProvisionalResult(result: AgentResult): AgentResult {
@@ -761,9 +747,16 @@ export function buildCanonicalStepSnapshot(
     blockedWorkSummary: step.blockedWorkSummary,
     verifyStatus: step.verifyStatus,
     verifySummary: step.verifySummary,
+    verifyChecks: step.verifyChecks,
+    verifyAttemptCount: step.verifyAttemptCount,
     startedAt: step.startedAt,
     finishedAt: step.finishedAt,
     summary: step.result?.summary,
+    rawFinalText: step.rawFinalText,
+    repairedFinalText: step.repairedFinalText,
+    parseError: step.parseError,
+    diagnostics: step.diagnostics,
+    evidenceHints: step.evidenceHints,
   };
 }
 
