@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import {
@@ -10,6 +13,35 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { discoverAgents } from "./agents.js";
+import {
+  buildTeamCardPayload,
+  renderTeamCardLines,
+  type TeamCardPayload,
+} from "./team-cards.js";
+import {
+  runTeamByName,
+  type TeamMemberResult,
+  type TeamRunDetails,
+} from "./team-runtime.js";
+import type { TeamConfig } from "./teams.js";
+import { DEFAULT_TEAM_NAME, discoverTeams } from "./teams.js";
+import {
+  runMeetingByName,
+  type MeetingRunResult,
+  type MeetingProgressUpdate,
+} from "./meeting-runtime.js";
+import {
+  buildMeetingCardPayload,
+  renderMeetingCardLines,
+  renderMeetingResult,
+  type MeetingCardPayload,
+} from "./meeting-cards.js";
+import {
+  DEFAULT_MEETING_NAME,
+  discoverMeetings,
+  type MeetingConfig,
+} from "./meetings.js";
 import type { WorkflowConfig } from "./workflows.js";
 import { DEFAULT_WORKFLOW_NAME, discoverWorkflows } from "./workflows.js";
 import {
@@ -58,6 +90,11 @@ import type { SharedState } from "./workflow-types.js";
 const COLLAPSED_ITEM_COUNT = 10;
 const TOOL_POLICY_ENV = "PI_CONDUCTOR_ENFORCE_TOOLS";
 const ALLOWED_TOOLS_ENV = "PI_CONDUCTOR_ALLOWED_TOOLS";
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ZELLIJ_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "workflow-pane.mjs");
+const TEAM_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "team-pane.mjs");
+const TEAM_WORKER_PANE_SCRIPT = path.join(PACKAGE_ROOT, "scripts", "team-worker-pane.mjs");
+const TEAM_STATUS_TIMEOUT_MS = 30 * 60 * 1000;
 
 const ConductorParams = Type.Object({
   workflow: Type.String({
@@ -69,6 +106,39 @@ const ConductorParams = Type.Object({
   cwd: Type.Optional(
     Type.String({
       description: "Working directory for the workflow run",
+    }),
+  ),
+});
+
+const TeamConductorParams = Type.Object({
+  team: Type.String({
+    description: "Name of the team to run",
+  }),
+  task: Type.String({
+    description: "Runtime task input for the team",
+  }),
+  cwd: Type.Optional(
+    Type.String({
+      description: "Working directory for the team run",
+    }),
+  ),
+});
+
+const MeetingConductorParams = Type.Object({
+  meeting: Type.String({
+    description: "Name of the meeting to run",
+  }),
+  task: Type.String({
+    description: "Runtime task input or topic for the meeting",
+  }),
+  artifact: Type.Optional(
+    Type.String({
+      description: "Path to an artifact file for refine/debate meetings",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description: "Working directory for the meeting run",
     }),
   ),
 });
@@ -211,7 +281,18 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
   return items;
 }
 
-function aggregateUsage(results: SingleResult[]) {
+function aggregateUsage(
+  results: Array<{
+    usage: {
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      cost: number;
+      turns: number;
+    };
+  }>,
+) {
   const total = {
     input: 0,
     output: 0,
@@ -293,6 +374,18 @@ function getWorkflowArgumentCompletions(
   return completions.length > 0 ? completions : null;
 }
 
+function isInsideTmux(): boolean {
+  return Boolean(process.env.TMUX);
+}
+
+function isInsideZellij(): boolean {
+  return Boolean(
+    process.env.ZELLIJ ||
+      process.env.ZELLIJ_SESSION_NAME ||
+      process.env.ZELLIJ_PANE_ID,
+  );
+}
+
 function buildConductorInstruction(workflowName: string, task: string): string {
   return [
     "Use the `conductor` tool immediately.",
@@ -365,10 +458,115 @@ function getResumeWorkflowCwd(
   return ctx.cwd;
 }
 
+function buildTeamConductorInstruction(teamName: string, task: string): string {
+  return [
+    "Use the `team-conductor` tool immediately.",
+    `Run the team named "${teamName}".`,
+    "Pass the following task exactly as the tool's `task` argument.",
+    "",
+    task,
+  ].join("\n");
+}
+
 function getCurrentModelLabel(ctx: ExtensionContext): string | undefined {
   return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
+async function launchWorkflowInZellijPane(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflowName: string,
+  task: string,
+): Promise<{ launched: boolean; progressFile?: string; statusFile?: string }> {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-zellij-"));
+  const statusFile = path.join(tempDir, "workflow-status.json");
+  const progressFile = path.join(tempDir, "workflow-progress.json");
+  const paneName = `workflow:${workflowName}`;
+
+  try {
+    await pi.exec(
+      "zellij",
+      [
+        "run",
+        "--direction",
+        "right",
+        "--name",
+        paneName,
+        "--cwd",
+        ctx.cwd,
+        "--",
+        process.execPath,
+        ZELLIJ_PANE_SCRIPT,
+        "--workflow",
+        workflowName,
+        "--task",
+        task,
+        "--cwd",
+        ctx.cwd,
+        "--default-model",
+        getCurrentModelLabel(ctx) ?? "",
+        "--progress-file",
+        progressFile,
+        "--status-file",
+        statusFile,
+      ],
+      { cwd: ctx.cwd },
+    );
+    return { launched: true, progressFile, statusFile };
+  } catch {
+    return { launched: false };
+  }
+}
+
+async function launchTeamInTmuxPane(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  teamName: string,
+  task: string,
+): Promise<{
+  launched: boolean;
+  progressFile?: string;
+  statusFile?: string;
+  abortFile?: string;
+}> {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-tmux-"));
+  const statusFile = path.join(tempDir, "team-status.json");
+  const progressFile = path.join(tempDir, "team-progress.json");
+  const abortFile = path.join(tempDir, "team-abort");
+
+  try {
+    await pi.exec(
+      "tmux",
+      [
+        "split-window",
+        "-h",
+        "-d",
+        "-c",
+        ctx.cwd,
+        process.execPath,
+        TEAM_PANE_SCRIPT,
+        "--team",
+        teamName,
+        "--task",
+        task,
+        "--cwd",
+        ctx.cwd,
+        "--default-model",
+        getCurrentModelLabel(ctx) ?? "",
+        "--progress-file",
+        progressFile,
+        "--status-file",
+        statusFile,
+        "--abort-file",
+        abortFile,
+      ],
+      { cwd: ctx.cwd },
+    );
+    return { launched: true, progressFile, statusFile, abortFile };
+  } catch {
+    return { launched: false };
+  }
+}
 function setWorkflowCardsWidget(
   ctx: ExtensionContext,
   payload: WorkflowCardPayload | undefined,
@@ -411,7 +609,6 @@ function setWorkflowCardsWidget(
   );
 }
 
-
 type WorkflowProgressTracker = {
   previousDetails?: WorkflowDetails;
 };
@@ -424,6 +621,132 @@ function buildWorkflowSessionName(workflowName: string, task: string): string {
       ? `${normalizedTask.slice(0, 45).trimEnd()}...`
       : normalizedTask;
   return `workflow:${workflowName} - ${preview}`;
+}
+
+function setTeamCardsWidget(
+  ctx: ExtensionContext,
+  payload: TeamCardPayload | undefined,
+) {
+  if (!payload || !ctx.hasUI) return;
+
+  ctx.ui.setWidget(
+    "team-cards",
+    (_tui, theme) => {
+      const text = new Text("", 0, 0);
+      const isAnimated = payload.phases.some((phase) =>
+        phase.members.some((member) => member.status === "running"),
+      );
+      const interval = isAnimated
+        ? setInterval(() => {
+            text.invalidate();
+          }, 250)
+        : undefined;
+
+      return {
+        render(width: number) {
+          text.setText(
+            renderTeamCardLines(payload, width, theme, {
+              animationTick: Date.now(),
+            }).join("\n"),
+          );
+          return text.render(width);
+        },
+        invalidate() {
+          text.invalidate();
+        },
+        dispose() {
+          if (interval) clearInterval(interval);
+        },
+      };
+    },
+    { placement: "aboveEditor" },
+  );
+}
+
+function setMeetingCardsWidget(
+  ctx: ExtensionContext,
+  payload: MeetingCardPayload | undefined,
+) {
+  if (!payload || !ctx.hasUI) return;
+
+  ctx.ui.setWidget(
+    "meeting-cards",
+    (_tui, theme) => {
+      const text = new Text("", 0, 0);
+      const isAnimated = !payload.isFinished;
+      const interval = isAnimated
+        ? setInterval(() => { text.invalidate(); }, 250)
+        : undefined;
+
+      return {
+        render(width: number) {
+          text.setText(renderMeetingCardLines(payload, false, theme).join("\n"));
+          return text.render(width);
+        },
+        invalidate() { text.invalidate(); },
+        dispose() { if (interval) clearInterval(interval); },
+      };
+    },
+    { placement: "aboveEditor" },
+  );
+}
+
+function tryReadWorkflowCardPayload(progressFile: string): WorkflowCardPayload | undefined {
+  try {
+    const content = fs.readFileSync(progressFile, "utf8");
+    return JSON.parse(content) as WorkflowCardPayload;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForWorkflowStatusFile(
+  statusFile: string,
+  progressFile: string | undefined,
+  onProgress?: (payload: WorkflowCardPayload) => void,
+): Promise<{
+  success: boolean;
+  message?: string;
+  summary?: string;
+  closedByUser?: boolean;
+}> {
+  let lastProgressContent = "";
+  while (true) {
+    if (progressFile) {
+      try {
+        const content = fs.readFileSync(progressFile, "utf8");
+        if (content !== lastProgressContent) {
+          lastProgressContent = content;
+          onProgress?.(JSON.parse(content) as WorkflowCardPayload);
+        }
+      } catch {
+        /* still waiting */
+      }
+    }
+
+    try {
+      const content = fs.readFileSync(statusFile, "utf8");
+      const data = JSON.parse(content) as {
+        done?: boolean;
+        success?: boolean;
+        message?: string;
+        summary?: string;
+        closedByUser?: boolean;
+      };
+      if (data.done) {
+        return {
+          success: Boolean(data.success),
+          message: data.message,
+          summary: data.summary,
+          closedByUser: data.closedByUser,
+        };
+      }
+    } catch {
+      /* still waiting */
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 function describeUnknownError(error: unknown): string {
@@ -485,7 +808,6 @@ function syncWorkflowProgress(
 
   tracker.previousDetails = details;
 }
-
 async function resumeBlockedWorkflowInSession(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -553,10 +875,171 @@ async function resumeBlockedWorkflowInSession(
     }
   }
 }
-
 function restoreWorkflowSummaryWidget(ctx: ExtensionContext): void {
   const snapshot = getLatestWorkflowSnapshot(ctx.sessionManager);
   setWorkflowCardsWidget(ctx, snapshot?.presentation);
+}
+
+async function waitForTeamStatusFile(
+  statusFile: string,
+  progressFile: string | undefined,
+  onProgress?: (payload: TeamCardPayload) => void,
+): Promise<{
+  success: boolean;
+  message?: string;
+  summary?: string;
+  closedByUser?: boolean;
+}> {
+  const startedAt = Date.now();
+  let lastProgressContent = "";
+
+  while (true) {
+    if (progressFile) {
+      try {
+        const content = fs.readFileSync(progressFile, "utf8");
+        if (content !== lastProgressContent) {
+          lastProgressContent = content;
+          onProgress?.(JSON.parse(content) as TeamCardPayload);
+        }
+      } catch {
+        /* still waiting */
+      }
+    }
+
+    try {
+      const content = fs.readFileSync(statusFile, "utf8");
+      const data = JSON.parse(content) as {
+        done?: boolean;
+        success?: boolean;
+        message?: string;
+        summary?: string;
+        closedByUser?: boolean;
+      };
+      if (data.done) {
+        return {
+          success: Boolean(data.success),
+          message: data.message,
+          summary: data.summary,
+          closedByUser: data.closedByUser,
+        };
+      }
+    } catch {
+      /* still waiting */
+    }
+
+    if (Date.now() - startedAt >= TEAM_STATUS_TIMEOUT_MS) {
+      console.error("Team run timed out waiting for pane status");
+      return {
+        success: false,
+        message: "Team run timed out waiting for pane status.",
+        summary: "Team run timed out waiting for pane status.",
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+function blockMainSessionInput(ctx: ExtensionCommandContext): () => void {
+  if (!ctx.hasUI) return () => {};
+
+  const restoreInput = ctx.ui.onTerminalInput(() => ({ consume: true }));
+  ctx.ui.setWorkingMessage("Workflow running in Zellij. Input is blocked until it finishes.");
+
+  return () => {
+    restoreInput();
+    ctx.ui.setWorkingMessage();
+  };
+}
+
+function blockTeamMainSessionInput(
+  ctx: ExtensionCommandContext,
+  abortFile: string,
+): () => void {
+  if (!ctx.hasUI) return () => {};
+
+  let abortRequested = false;
+  const restoreInput = ctx.ui.onTerminalInput((data) => {
+    if (data === "\u0003" && !abortRequested) {
+      abortRequested = true;
+      try {
+        fs.writeFileSync(abortFile, "", "utf8");
+      } catch {
+        /* ignore */
+      }
+      ctx.ui.notify("Abort requested. Waiting for the team pane to stop workers...", "warning");
+      return { consume: true };
+    }
+    return { consume: true };
+  });
+  ctx.ui.setWorkingMessage("Team running in tmux. Input is blocked; press Ctrl+C to abort.");
+
+  return () => {
+    restoreInput();
+    ctx.ui.setWorkingMessage();
+  };
+}
+
+function blockTeamRunInput(
+  ctx: ExtensionCommandContext,
+  abortRun: () => void,
+): () => void {
+  if (!ctx.hasUI) return () => {};
+
+  let abortRequested = false;
+  const restoreInput = ctx.ui.onTerminalInput((data) => {
+    if (data === "\u0003" && !abortRequested) {
+      abortRequested = true;
+      abortRun();
+      ctx.ui.notify("Abort requested. Waiting for team workers to stop...", "warning");
+      return { consume: true };
+    }
+    return { consume: true };
+  });
+  ctx.ui.setWorkingMessage("Team running. Input is blocked; press Ctrl+C to abort.");
+
+  return () => {
+    restoreInput();
+    ctx.ui.setWorkingMessage();
+  };
+}
+
+function buildMainSessionSummary(
+  noun: string,
+  runName: string,
+  status: {
+    success: boolean;
+    message?: string;
+    summary?: string;
+    closedByUser?: boolean;
+  },
+): { text: string; type: "info" | "warning" | "error" } {
+  const summary = status.summary?.trim() || status.message?.trim();
+  const title = `${noun} ${runName}`;
+  if (status.success) {
+    return {
+      text: summary
+        ? `${title} finished.\n\n${summary}`
+        : `${title} finished.`,
+      type: "info",
+    };
+  }
+
+  if (status.closedByUser) {
+    return {
+      text: summary
+        ? `${title} pane was closed.\n\n${summary}`
+        : `${title} pane was closed.`,
+      type: "warning",
+    };
+  }
+
+  return {
+    text: summary
+      ? `${title} failed.\n\n${summary}`
+      : `${title} failed.`,
+    type: "error",
+  };
 }
 
 async function resolveWorkflowCommandInput(
@@ -611,6 +1094,64 @@ async function resolveWorkflowCommandInput(
 
   return {
     workflowName: DEFAULT_WORKFLOW_NAME,
+    task: tokens.join(" ").trim(),
+  };
+}
+
+function notifyDiscoveryWarnings(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  warnings: string[],
+) {
+  if (!ctx.hasUI || warnings.length === 0) return;
+  ctx.ui.notify(warnings.join("\n"), "warning");
+}
+
+async function resolveTeamCommandInput(
+  args: string,
+  ctx: ExtensionCommandContext,
+): Promise<{ teamName: string; task: string } | undefined> {
+  const { teams, warnings } = discoverTeams(ctx.cwd);
+  notifyDiscoveryWarnings(ctx, warnings);
+
+  const teamMap = new Map(teams.map((team) => [team.name, team]));
+  const tokens = tokenizeCommandArgs(args.trim());
+
+  if (tokens.length === 0) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(
+        "Provide a team name and task when no interactive UI is available.",
+        "error",
+      );
+      return undefined;
+    }
+
+    const options = teams.map((team) => `${team.name} (${team.source})`);
+    const choice = await ctx.ui.select("Select team", options);
+    if (!choice) return undefined;
+    const index = options.indexOf(choice);
+    const selected = teams[index];
+    const task = await ctx.ui.input(`Run team: ${selected.name}`, "implement auth");
+    if (!task?.trim()) return undefined;
+    return { teamName: selected.name, task: task.trim() };
+  }
+
+  const maybeTeam = teamMap.get(tokens[0]);
+  if (maybeTeam) {
+    const remainingTask = tokens.slice(1).join(" ").trim();
+    if (remainingTask) {
+      return { teamName: maybeTeam.name, task: remainingTask };
+    }
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Provide a task after the team name.", "error");
+      return undefined;
+    }
+    const task = await ctx.ui.input(`Run team: ${maybeTeam.name}`, "implement auth");
+    if (!task?.trim()) return undefined;
+    return { teamName: maybeTeam.name, task: task.trim() };
+  }
+
+  return {
+    teamName: DEFAULT_TEAM_NAME,
     task: tokens.join(" ").trim(),
   };
 }
@@ -927,6 +1468,351 @@ function renderWorkflowResult(
   return new Text(text, 0, 0);
 }
 
+function buildInitialTeamCardPayload(
+  cwd: string,
+  teamConfig: TeamConfig,
+  defaultModel: string | undefined,
+): TeamCardPayload {
+  const { agents } = discoverAgents(cwd);
+  return {
+    teamName: teamConfig.name,
+    phases: teamConfig.phases.map((phase) => ({
+      kind: phase.kind,
+      warningMessage: undefined,
+      members: phase.agentNames.map((agentName) => {
+        const agent = agents.find((item) => item.name === agentName);
+        return {
+          agent: agentName,
+          model: agent?.model ?? defaultModel,
+          status: "pending" as const,
+          elapsedMs: 0,
+          lastWork: "",
+        };
+      }),
+    })),
+  };
+}
+
+interface TeamWorkerPaneState {
+  title: string;
+  teamName: string;
+  slotIndex: number;
+  phaseIndex: number | null;
+  phaseKind?: "parallel" | "sequential";
+  agent?: string;
+  model?: string;
+  status: "idle" | "pending" | "running" | "done" | "error";
+  elapsedMs: number;
+  lastWork: string;
+  input: string;
+  finalMessage?: string;
+  done?: boolean;
+}
+
+function getMaxParallelMembers(teamConfig: TeamConfig): number {
+  return Math.max(
+    1,
+    ...teamConfig.phases.map((phase) =>
+      phase.kind === "parallel" ? phase.agentNames.length : 1,
+    ),
+  );
+}
+
+function getActiveTeamPhaseIndex(details: TeamRunDetails): number {
+  const runningIndex = details.phases.findIndex((phase) =>
+    phase.members.some((member) => member.status === "running"),
+  );
+  if (runningIndex >= 0) return runningIndex;
+
+  for (let index = details.phases.length - 1; index >= 0; index--) {
+    const phase = details.phases[index];
+    if (phase.members.some((member) => member.status !== "pending")) return index;
+  }
+
+  return 0;
+}
+
+function findTeamMemberResult(
+  details: TeamRunDetails,
+  phaseIndex: number,
+  memberIndex: number,
+): TeamMemberResult | undefined {
+  return details.results.find(
+    (resultItem) =>
+      resultItem.phaseIndex === phaseIndex && resultItem.memberIndex === memberIndex,
+  );
+}
+
+function buildTeamWorkerPaneStates(
+  details: TeamRunDetails,
+  totalSlots: number,
+  finalMessage?: string,
+  done?: boolean,
+): TeamWorkerPaneState[] {
+  const activePhaseIndex = getActiveTeamPhaseIndex(details);
+  const activePhase = details.phases[activePhaseIndex];
+
+  return Array.from({ length: totalSlots }, (_, slotIndex) => {
+    if (slotIndex >= activePhase.members.length) {
+      return {
+        title: `${details.teamName} worker ${slotIndex + 1}`,
+        teamName: details.teamName,
+        slotIndex,
+        phaseIndex: null,
+        status: done ? "idle" : "pending",
+        elapsedMs: 0,
+        lastWork: "",
+        input: "",
+        finalMessage,
+        done,
+      };
+    }
+
+    const memberState = activePhase.members[slotIndex];
+    const memberResult = findTeamMemberResult(details, activePhaseIndex, slotIndex);
+
+    return {
+      title: `${details.teamName} worker ${slotIndex + 1}`,
+      teamName: details.teamName,
+      slotIndex,
+      phaseIndex: activePhaseIndex,
+      phaseKind: activePhase.kind,
+      agent: memberState.agent,
+      model: memberState.model,
+      status: memberState.status,
+      elapsedMs: memberState.elapsedMs,
+      lastWork: memberResult?.lastWork || memberState.lastWork,
+      input: memberResult?.task || "",
+      finalMessage,
+      done,
+    };
+  });
+}
+
+function writeTeamWorkerPaneStates(
+  stateFiles: string[],
+  details: TeamRunDetails,
+  finalMessage?: string,
+  done?: boolean,
+) {
+  const states = buildTeamWorkerPaneStates(details, stateFiles.length, finalMessage, done);
+  for (let index = 0; index < stateFiles.length; index++) {
+    fs.writeFileSync(stateFiles[index], JSON.stringify(states[index]), "utf8");
+  }
+}
+
+async function launchTeamWorkerPanes(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  teamName: string,
+  stateFiles: string[],
+): Promise<boolean> {
+  try {
+    const mainPaneId = (await pi.exec(
+      "tmux",
+      ["display-message", "-p", "#{pane_id}"],
+      { cwd: ctx.cwd },
+    )).stdout.trim();
+
+    if (!mainPaneId) return false;
+
+    const workerPaneIds: string[] = [];
+
+    for (let index = 0; index < stateFiles.length; index++) {
+      const targetPane = workerPaneIds[workerPaneIds.length - 1] ?? mainPaneId;
+      const args =
+        index === 0
+          ? [
+              "split-window",
+              "-h",
+              "-d",
+              "-p",
+              "50",
+              "-t",
+              targetPane,
+              "-c",
+              ctx.cwd,
+              "-P",
+              "-F",
+              "#{pane_id}",
+              process.execPath,
+              TEAM_WORKER_PANE_SCRIPT,
+              "--state-file",
+              stateFiles[index],
+              "--title",
+              `${teamName} worker ${index + 1}`,
+            ]
+          : [
+              "split-window",
+              "-v",
+              "-d",
+              "-t",
+              targetPane,
+              "-c",
+              ctx.cwd,
+              "-P",
+              "-F",
+              "#{pane_id}",
+              process.execPath,
+              TEAM_WORKER_PANE_SCRIPT,
+              "--state-file",
+              stateFiles[index],
+              "--title",
+              `${teamName} worker ${index + 1}`,
+            ];
+
+      const result = await pi.exec(
+        "tmux",
+        args,
+        { cwd: ctx.cwd },
+      );
+      const paneId = result.stdout.trim();
+      if (paneId) workerPaneIds.push(paneId);
+    }
+
+    await pi.exec(
+      "tmux",
+      ["set-window-option", "-t", mainPaneId, "main-pane-width", "50%"],
+      { cwd: ctx.cwd },
+    );
+    await pi.exec(
+      "tmux",
+      ["select-layout", "-t", mainPaneId, "main-vertical"],
+      { cwd: ctx.cwd },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function renderTeamResult(
+  result: AgentToolResult<TeamRunDetails>,
+  expanded: boolean,
+  theme: any,
+) {
+  const details = result.details;
+  if (!details || details.phases.length === 0) {
+    const text = result.content[0];
+    return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+  }
+
+  if (!expanded) {
+    return new Text(
+      renderTeamCardLines(buildTeamCardPayload(details), 100, theme, {
+        animationTick: Date.now(),
+      }).join("\n"),
+      0,
+      0,
+    );
+  }
+
+  const mdTheme = getMarkdownTheme();
+  const successCount = details.results.filter((item) => !item.errorMessage).length;
+  const icon =
+    successCount === details.results.length
+      ? theme.fg("success", "✓")
+      : theme.fg("error", "✗");
+
+  const container = new Container();
+  container.addChild(
+    new Text(
+      icon +
+        " " +
+        theme.fg("toolTitle", theme.bold("team ")) +
+        theme.fg("accent", details.teamName) +
+        theme.fg(
+          "muted",
+          ` (${details.teamSource}${details.teamFilePath ? `: ${details.teamFilePath}` : ""})`,
+        ),
+      0,
+      0,
+    ),
+  );
+  if (details.runDir) {
+    container.addChild(new Text(theme.fg("dim", `Run artifacts: ${details.runDir}`), 0, 0));
+  }
+
+  for (let phaseIndex = 0; phaseIndex < details.phases.length; phaseIndex++) {
+    const phase = details.phases[phaseIndex];
+    container.addChild(new Spacer(1));
+    container.addChild(
+      new Text(
+        `${theme.fg("muted", `─── Phase ${phaseIndex + 1}: `)}${theme.fg("accent", phase.kind)}`,
+        0,
+        0,
+      ),
+    );
+    if (phase.warningMessage) {
+      container.addChild(new Text(theme.fg("warning", `  ! ${phase.warningMessage}`), 0, 0));
+    }
+
+    for (let memberIndex = 0; memberIndex < phase.members.length; memberIndex++) {
+      const member = phase.members[memberIndex];
+      const memberResult = details.results.find(
+        (resultItem) =>
+          resultItem.phaseIndex === phaseIndex && resultItem.memberIndex === memberIndex,
+      );
+      const memberIcon =
+        member.status === "error"
+          ? theme.fg("error", "✗")
+          : member.status === "done"
+            ? theme.fg("success", "✓")
+            : theme.fg("muted", "○");
+
+      container.addChild(
+        new Text(
+          `${theme.fg("muted", "  • ")}${theme.fg("accent", member.agent)} ${memberIcon}`,
+          0,
+          0,
+        ),
+      );
+
+      if (!memberResult) continue;
+
+      container.addChild(
+        new Text(
+          theme.fg("muted", "    Input: ") + theme.fg("dim", memberResult.task),
+          0,
+          0,
+        ),
+      );
+
+      const displayItems = getDisplayItems(memberResult.messages);
+      for (const item of displayItems) {
+        if (item.type !== "toolCall") continue;
+        container.addChild(
+          new Text(
+            theme.fg("muted", "    → ") +
+              formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+            0,
+            0,
+          ),
+        );
+      }
+
+      const finalOutput = getFinalOutput(memberResult.messages);
+      if (finalOutput) {
+        container.addChild(new Spacer(1));
+        container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+      }
+
+      const usageText = formatUsageStats(memberResult.usage, memberResult.model);
+      if (usageText) {
+        container.addChild(new Text(theme.fg("dim", usageText), 0, 0));
+      }
+    }
+  }
+
+  const totalUsage = formatUsageStats(aggregateUsage(details.results));
+  if (totalUsage) {
+    container.addChild(new Spacer(1));
+    container.addChild(new Text(theme.fg("dim", `Total: ${totalUsage}`), 0, 0));
+  }
+
+  return container;
+}
+
 function buildWorkflowCallPreview(workflowName: string, task: string, theme: any) {
   const preview =
     task.length > 60 ? `${task.slice(0, 60)}...` : task || "(no task)";
@@ -937,6 +1823,90 @@ function buildWorkflowCallPreview(workflowName: string, task: string, theme: any
     0,
     0,
   );
+}
+
+function buildTeamCallPreview(teamName: string, task: string, theme: any) {
+  const preview =
+    task.length > 60 ? `${task.slice(0, 60)}...` : task || "(no task)";
+  return new Text(
+    theme.fg("toolTitle", theme.bold("team-conductor ")) +
+      theme.fg("accent", teamName) +
+      `\n  ${theme.fg("dim", preview)}`,
+    0,
+    0,
+  );
+}
+
+function buildMeetingCallPreview(meetingName: string, task: string, theme: any) {
+  const preview =
+    task.length > 60 ? `${task.slice(0, 60)}...` : task || "(no task)";
+  return new Text(
+    theme.fg("toolTitle", theme.bold("meeting-conductor ")) +
+      theme.fg("accent", meetingName) +
+      `\n  ${theme.fg("dim", preview)}`,
+    0,
+    0,
+  );
+}
+
+async function resolveMeetingCommandInput(
+  args: string,
+  ctx: ExtensionCommandContext,
+): Promise<{ meetingName: string; task: string; artifactPath?: string } | undefined> {
+  const rawArgs = args.trim();
+  const { meetings, warnings } = discoverMeetings(ctx.cwd);
+  notifyDiscoveryWarnings(ctx, warnings);
+  const meetingMap = new Map(meetings.map((m) => [m.name, m]));
+
+  const tokens = tokenizeCommandArgs(rawArgs);
+
+  if (tokens.length === 0) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Provide a meeting name and task when no interactive UI is available.", "error");
+      return undefined;
+    }
+    const options = meetings.map((m) => `${m.name} (${m.source})`);
+    const choice = await ctx.ui.select("Select meeting", options);
+    if (!choice) return undefined;
+    const index = options.indexOf(choice);
+    const selected = meetings[index];
+    const task = await ctx.ui.input(`Run meeting: ${selected.name}`, "implement auth");
+    if (!task?.trim()) return undefined;
+    return { meetingName: selected.name, task: task.trim() };
+  }
+
+  const maybeMeeting = meetingMap.get(tokens[0]);
+  if (maybeMeeting) {
+    const remaining = tokens.slice(1);
+    if (remaining.length === 0) {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Provide a task after the meeting name.", "error");
+        return undefined;
+      }
+      const task = await ctx.ui.input(`Run meeting: ${maybeMeeting.name}`, "implement auth");
+      if (!task?.trim()) return undefined;
+      return { meetingName: maybeMeeting.name, task: task.trim() };
+    }
+    if (remaining.length === 1) {
+      return { meetingName: maybeMeeting.name, task: remaining[0] };
+    }
+    if (remaining.length >= 2) {
+      const rawAfterName = rawArgs.slice(rawArgs.indexOf(tokens[0]) + tokens[0].length).trimStart();
+      const quoteChar = rawAfterName[0];
+      if (quoteChar !== '"' && quoteChar !== "'") {
+        ctx.ui.notify(
+          `Task must be quoted when a file path is provided. Example: /meeting ${maybeMeeting.name} "my topic" path/to/file.md`,
+          "error",
+        );
+        return undefined;
+      }
+      const task = remaining.slice(0, remaining.length - 1).join(" ");
+      const artifactPath = remaining[remaining.length - 1];
+      return { meetingName: maybeMeeting.name, task, artifactPath };
+    }
+  }
+
+  return { meetingName: DEFAULT_MEETING_NAME, task: tokens.join(" ").trim() };
 }
 
 function buildAvailableWorkflowText(workflows: WorkflowConfig[]): string {
@@ -1194,6 +2164,86 @@ export default function registerExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "team-conductor",
+    label: "Team Conductor",
+    description:
+      "Run a named multi-phase team using agents discovered from project, global, and built-in definitions.",
+    promptSnippet:
+      "team-conductor(team, task): run a named team from .pi/team.yaml or ~/.pi/agent/team.yaml",
+    promptGuidelines: [
+      "Use `team-conductor` when the user wants to run a named team such as `plan-build-parallel`.",
+      "Prefer `team-conductor` over manually recreating team phases yourself.",
+    ],
+    parameters: TeamConductorParams,
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runtimeCwd = params.cwd ?? ctx.cwd;
+      const { warnings } = discoverTeams(runtimeCwd);
+      notifyDiscoveryWarnings(ctx, warnings);
+
+      const result = await runTeamByName(
+        runtimeCwd,
+        params.team,
+        params.task,
+        getCurrentModelLabel(ctx),
+        signal,
+        onUpdate
+          ? (details) => {
+              setTeamCardsWidget(ctx, buildTeamCardPayload(details));
+              onUpdate({
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      details.results.length > 0
+                        ? details.results[details.results.length - 1].lastWork || "(running...)"
+                        : "(running...)",
+                  },
+                ],
+                details,
+              });
+            }
+          : undefined,
+        { sequentializeParallelPhases: !isInsideTmux() },
+      );
+
+      if (result.phases.length > 0) {
+        setTeamCardsWidget(ctx, buildTeamCardPayload(result));
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.isError ? result.errorMessage || "(team failed)" : result.finalText,
+          },
+        ],
+        details: {
+          teamName: result.teamName,
+          teamSource: result.teamSource,
+          teamFilePath: result.teamFilePath,
+          runDir: result.runDir,
+          phases: result.phases,
+          results: result.results,
+        },
+        isError: result.isError,
+      };
+    },
+
+    renderCall(args, theme) {
+      return buildTeamCallPreview(args.team, args.task, theme);
+    },
+
+    renderResult(result, options, theme) {
+      return renderTeamResult(
+        result as AgentToolResult<TeamRunDetails>,
+        options.expanded,
+        theme,
+      );
+    },
+  });
+
   pi.registerCommand("workflow", {
     description:
       'Run a workflow. Examples: `/workflow "implement auth"` or `/workflow plan-build "implement auth"`.',
@@ -1206,6 +2256,371 @@ export default function registerExtension(pi: ExtensionAPI) {
 
       const { workflowName, task } = resolved;
       const instruction = buildConductorInstruction(workflowName, task);
+
+      if (isInsideZellij()) {
+        const launched = await launchWorkflowInZellijPane(
+          pi,
+          ctx,
+          workflowName,
+          task,
+        );
+        if (launched.launched && launched.statusFile) {
+          const unblockInput = blockMainSessionInput(ctx);
+          const workflowConfig = discoverWorkflows(ctx.cwd).workflows.find(
+            (workflow) => workflow.name === workflowName,
+          );
+          if (workflowConfig) {
+            const initialDetails = createInitialWorkflowDetails(
+              workflowConfig,
+              task,
+              randomUUID(),
+            );
+            setWorkflowCardsWidget(
+              ctx,
+              buildWorkflowCardPayload(
+                initialDetails,
+                true,
+                getCurrentModelLabel(ctx),
+              ),
+            );
+          }
+          ctx.ui.setStatus("workflow", `Running ${workflowName} in Zellij...`);
+          try {
+            const status = await waitForWorkflowStatusFile(
+              launched.statusFile,
+              launched.progressFile,
+              (payload) => setWorkflowCardsWidget(ctx, payload),
+            );
+            const summary = buildMainSessionSummary("Workflow", workflowName, status);
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("workflow", undefined);
+            unblockInput();
+          }
+          return;
+        }
+        ctx.ui.notify(
+          "Could not open a Zellij pane. Running the workflow in the current Pi session instead.",
+          "warning",
+        );
+      }
+      await ctx.waitForIdle();
+      ctx.ui.setToolsExpanded(true);
+      pi.sendUserMessage(instruction);
+      await ctx.waitForIdle();
+    },
+  });
+
+  pi.registerCommand("team", {
+    description:
+      'Run a team. Examples: `/team "implement auth"` or `/team plan-build-parallel "implement auth"`.',
+    handler: async (args, ctx) => {
+      const resolved = await resolveTeamCommandInput(args, ctx);
+      if (!resolved) return;
+
+      const { teamName, task } = resolved;
+      const instruction = buildTeamConductorInstruction(teamName, task);
+
+      if (isInsideTmux()) {
+        const { teams, warnings } = discoverTeams(ctx.cwd);
+        notifyDiscoveryWarnings(ctx, warnings);
+        const teamConfig = teams.find((team) => team.name === teamName);
+
+        if (teamConfig) {
+          const workerPaneTempDir = fs.mkdtempSync(
+            path.join(os.tmpdir(), "pi-conductor-team-workers-"),
+          );
+          const workerCount = getMaxParallelMembers(teamConfig);
+          const workerStateFiles = Array.from(
+            { length: workerCount },
+            (_, index) => path.join(workerPaneTempDir, `worker-${index + 1}.json`),
+          );
+
+          const initialPayload = buildInitialTeamCardPayload(
+            ctx.cwd,
+            teamConfig,
+            getCurrentModelLabel(ctx),
+          );
+          setTeamCardsWidget(ctx, initialPayload);
+          writeTeamWorkerPaneStates(
+            workerStateFiles,
+            {
+              teamName,
+              teamSource: teamConfig.source,
+              teamFilePath: teamConfig.filePath ?? null,
+              runDir: "",
+              phases: initialPayload.phases,
+              results: [],
+            },
+          );
+
+          const launchedWorkerPanes = await launchTeamWorkerPanes(
+            pi,
+            ctx,
+            teamName,
+            workerStateFiles,
+          );
+          if (!launchedWorkerPanes) {
+            ctx.ui.notify(
+              "Could not open worker tmux panes. Running the team in the current session instead.",
+              "warning",
+            );
+          }
+
+          const abortController = new AbortController();
+          const unblockInput = blockTeamRunInput(ctx, () => abortController.abort());
+          ctx.ui.setStatus("team", `Running ${teamName} in tmux...`);
+
+          try {
+            const result = await runTeamByName(
+              ctx.cwd,
+              teamName,
+              task,
+              getCurrentModelLabel(ctx),
+              abortController.signal,
+              (details) => {
+                setTeamCardsWidget(ctx, buildTeamCardPayload(details));
+                writeTeamWorkerPaneStates(workerStateFiles, details);
+              },
+            );
+
+            setTeamCardsWidget(ctx, buildTeamCardPayload(result));
+            writeTeamWorkerPaneStates(
+              workerStateFiles,
+              result,
+              result.isError ? result.errorMessage : result.finalText,
+              true,
+            );
+
+            const summary = buildMainSessionSummary("Team", teamName, {
+              success: !result.isError,
+              message: result.isError ? result.errorMessage : result.finalText,
+              summary: result.isError ? result.errorMessage : result.finalText,
+            });
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("team", undefined);
+            unblockInput();
+          }
+          return;
+        }
+
+        ctx.ui.notify(
+          "Could not resolve the requested team. Running the team in the current session instead.",
+          "warning",
+        );
+      } else {
+        ctx.ui.notify(
+          "tmux not detected. Running team phases sequentially in the current session.",
+          "warning",
+        );
+      }
+
+      await ctx.waitForIdle();
+      ctx.ui.setToolsExpanded(true);
+      pi.sendUserMessage(instruction);
+      await ctx.waitForIdle();
+    },
+  });
+
+  pi.registerTool({
+    name: "meeting-conductor",
+    label: "Meeting Conductor",
+    description:
+      "Run a named meeting (execute, refine, or debate mode) using agents from .pi/meeting.yaml or built-in defaults.",
+    promptSnippet:
+      "meeting-conductor(meeting, task): run a named meeting from .pi/meeting.yaml",
+    promptGuidelines: [
+      "Use `meeting-conductor` when the user wants to run a meeting such as `plan-build-parallel`, `quick-critique`, or `proposal-review`.",
+      "For parallel execution use mode: execute meetings. For iterative review use mode: refine. For adversarial debate use mode: debate.",
+      "Prefer `meeting-conductor` over `team-conductor` for new meeting definitions.",
+    ],
+    parameters: MeetingConductorParams,
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runtimeCwd = params.cwd ?? ctx.cwd;
+      const { warnings } = discoverMeetings(runtimeCwd);
+      notifyDiscoveryWarnings(ctx, warnings);
+
+      const meetingUpdates: MeetingProgressUpdate[] = [];
+
+      const result = await runMeetingByName(
+        runtimeCwd,
+        params.meeting,
+        params.task,
+        params.artifact,
+        getCurrentModelLabel(ctx),
+        signal,
+        (update) => {
+          meetingUpdates.push(update);
+          const payload = buildMeetingCardPayload(params.meeting, update.mode, meetingUpdates);
+          setMeetingCardsWidget(ctx, payload);
+          if (onUpdate) {
+            onUpdate({
+              content: [{ type: "text", text: update.lastWork || "(running...)" }],
+              details: undefined as any,
+            });
+          }
+        },
+        (warning) => ctx.ui.notify(warning, "warning"),
+      );
+
+      const finalPayload = buildMeetingCardPayload(
+        params.meeting,
+        result.mode,
+        meetingUpdates,
+        result.executeResult,
+        result,
+      );
+      setMeetingCardsWidget(ctx, finalPayload);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.isError ? result.errorMessage || "(meeting failed)" : result.finalText,
+          },
+        ],
+        details: result,
+        isError: result.isError,
+      };
+    },
+
+    renderCall(args, theme) {
+      return buildMeetingCallPreview(args.meeting, args.task, theme);
+    },
+
+    renderResult(result, options, theme) {
+      const meetingResult = (result as AgentToolResult<MeetingRunResult>).details;
+      if (!meetingResult) return new Text("(no meeting result)", 0, 0);
+      return new Text(renderMeetingResult(meetingResult, options.expanded, theme), 0, 0);
+    },
+  });
+
+  pi.registerCommand("meeting", {
+    description:
+      'Run a meeting. Examples: `/meeting "implement auth"` or `/meeting quick-critique "review this"` or `/meeting proposal-review "topic" "path/to/file.md"`.',
+    handler: async (args, ctx) => {
+      const resolved = await resolveMeetingCommandInput(args, ctx);
+      if (!resolved) return;
+
+      const { meetingName, task, artifactPath } = resolved;
+
+      if (isInsideTmux()) {
+        const { meetings } = discoverMeetings(ctx.cwd);
+        const meetingConfig = meetings.find((m) => m.name === meetingName);
+
+        if (meetingConfig && meetingConfig.mode === "execute") {
+          const workerPaneTempDir = fs.mkdtempSync(
+            path.join(os.tmpdir(), "pi-conductor-team-workers-"),
+          );
+          const { teams } = discoverTeams(ctx.cwd);
+          const asTeamConfig = {
+            name: meetingConfig.name,
+            phases: meetingConfig.phases,
+            source: meetingConfig.source,
+            filePath: meetingConfig.filePath,
+          } as TeamConfig;
+          const workerCount = getMaxParallelMembers(asTeamConfig);
+          const workerStateFiles = Array.from(
+            { length: workerCount },
+            (_, index) => path.join(workerPaneTempDir, `worker-${index + 1}.json`),
+          );
+
+          const initialPayload = buildInitialTeamCardPayload(ctx.cwd, asTeamConfig, getCurrentModelLabel(ctx));
+          setTeamCardsWidget(ctx, initialPayload);
+          writeTeamWorkerPaneStates(workerStateFiles, {
+            teamName: meetingName,
+            teamSource: asTeamConfig.source,
+            teamFilePath: asTeamConfig.filePath ?? null,
+            runDir: "",
+            phases: initialPayload.phases,
+            results: [],
+          });
+
+          const launchedWorkerPanes = await launchTeamWorkerPanes(pi, ctx, meetingName, workerStateFiles);
+          if (!launchedWorkerPanes) {
+            ctx.ui.notify("Could not open worker tmux panes. Running in the current session instead.", "warning");
+          }
+
+          const abortController = new AbortController();
+          const unblockInput = blockTeamRunInput(ctx, () => abortController.abort());
+          ctx.ui.setStatus("meeting", `Running ${meetingName} in tmux...`);
+
+          try {
+            const result = await runMeetingByName(
+              ctx.cwd,
+              meetingName,
+              task,
+              artifactPath,
+              getCurrentModelLabel(ctx),
+              abortController.signal,
+              undefined,
+              (warning) => ctx.ui.notify(warning, "warning"),
+            );
+
+            if (result.executeResult) {
+              setTeamCardsWidget(ctx, buildTeamCardPayload(result.executeResult));
+              writeTeamWorkerPaneStates(workerStateFiles, result.executeResult, result.isError ? result.errorMessage : result.finalText, true);
+            }
+
+            const summary = buildMainSessionSummary("Meeting", meetingName, {
+              success: !result.isError,
+              message: result.isError ? result.errorMessage : result.finalText,
+              summary: result.isError ? result.errorMessage : result.finalText,
+            });
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("meeting", undefined);
+          }
+          return;
+        }
+
+        if (meetingConfig && (meetingConfig.mode === "refine" || meetingConfig.mode === "debate")) {
+          const abortController = new AbortController();
+          const unblockInput = blockTeamRunInput(ctx, () => abortController.abort());
+          ctx.ui.setStatus("meeting", `Running ${meetingName}...`);
+
+          try {
+            const result = await runMeetingByName(
+              ctx.cwd,
+              meetingName,
+              task,
+              artifactPath,
+              getCurrentModelLabel(ctx),
+              abortController.signal,
+              undefined,
+              (warning) => ctx.ui.notify(warning, "warning"),
+            );
+            const summary = buildMainSessionSummary("Meeting", meetingName, {
+              success: !result.isError,
+              message: result.isError ? result.errorMessage : result.finalText,
+              summary: result.isError ? result.errorMessage : result.finalText,
+            });
+            ctx.ui.notify(summary.text, summary.type);
+          } finally {
+            ctx.ui.setStatus("meeting", undefined);
+            unblockInput();
+          }
+          return;
+        }
+      }
+
+      ctx.ui.notify(
+        meetingName
+          ? "Running meeting in the current session."
+          : "tmux not detected. Running meeting in the current session.",
+        "warning",
+      );
+
+      const instruction = [
+        "Use the `meeting-conductor` tool immediately.",
+        `Run the meeting named "${meetingName}".`,
+        "Pass the following task exactly as the tool's `task` argument.",
+        artifactPath ? `Pass "${artifactPath}" as the tool's \`artifact\` argument.` : "",
+        "",
+        task,
+      ].filter(Boolean).join("\n");
 
       await ctx.waitForIdle();
       ctx.ui.setToolsExpanded(true);
