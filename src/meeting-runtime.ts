@@ -395,9 +395,13 @@ async function runRefineMeeting(
       return { meetingName: config.name, meetingSource: config.source, meetingFilePath: config.filePath ?? null, mode: "refine", isError: false, finalText };
     }
 
-    if (round > 1 && verdict.blockers.length > 0 && verdict.blockers.join("\n") === prevBlockers.join("\n")) {
-      const stuckMsg = `Meeting "${config.name}" is stuck after round ${round}: same blockers as previous round. Needs human input.\n\nBlockers:\n${verdict.blockers.map((b) => `- ${b}`).join("\n")}`;
-      return { meetingName: config.name, meetingSource: config.source, meetingFilePath: config.filePath ?? null, mode: "refine", isError: false, errorMessage: stuckMsg, finalText };
+    if (round > 1 && verdict.blockers.length > 0) {
+      const normalize = (blockers: string[]) =>
+        blockers.map((b) => b.toLowerCase().trim()).sort().join("\n");
+      if (normalize(verdict.blockers) === normalize(prevBlockers)) {
+        const stuckMsg = `Meeting "${config.name}" is stuck after round ${round}: same blockers as previous round. Needs human input.\n\nBlockers:\n${verdict.blockers.map((b) => `- ${b}`).join("\n")}`;
+        return { meetingName: config.name, meetingSource: config.source, meetingFilePath: config.filePath ?? null, mode: "refine", isError: false, errorMessage: stuckMsg, finalText };
+      }
     }
     prevBlockers = [...verdict.blockers];
 
@@ -676,13 +680,14 @@ export async function runMeetingByName(
     }
     return runDebateMeeting(meeting as MeetingDebateConfig, task, artifactPath, cwd, agents, defaultModel, signal, onUpdate, onWarning);
   } catch (error) {
+    if (!(error instanceof Error)) throw error;
     return {
       meetingName: meeting.name,
       meetingSource: meeting.source,
       meetingFilePath: meeting.filePath ?? null,
       mode: meeting.mode,
       isError: true,
-      errorMessage: describeUnknownError(error),
+      errorMessage: error.message.trim() || error.name,
       finalText: "",
     };
   }

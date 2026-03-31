@@ -1,0 +1,15 @@
+self-intro:
+  phases:
+    - sequential:
+        - self-intro
+
+hello-world:
+  phases:
+    - sequential:
+        - hello-world
+
+parallel-demo:
+  phases:
+    - parallel:
+        - self-intro
+        - hello-world

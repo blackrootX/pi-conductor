@@ -75,15 +75,6 @@ const BUILT_IN_MEETINGS: MeetingConfig[] = [
     output: "session",
     source: "built-in",
   },
-  {
-    name: "proposal-review",
-    mode: "refine",
-    rounds: 3,
-    reviewer: { cli: "codex", reasoning: "xhigh" },
-    fixer: { cli: "opencode" },
-    output: "file",
-    source: "built-in",
-  },
 ];
 
 function fileExists(filePath: string): boolean {
@@ -185,7 +176,7 @@ function parseMeetingFromRaw(
 
   if (mode === "refine") {
     const rounds = typeof raw.rounds === "number" ? Math.min(Math.max(1, Math.round(raw.rounds)), 5) : 3;
-    const output: MeetingOutputTarget = raw.output === "session" ? "session" : "file";
+    const output: MeetingOutputTarget = raw.output === "file" ? "file" : "session";
     const reviewer = parseParticipantSpec(raw.reviewer, "reviewer", name, filePath, warnings);
     const fixer = parseParticipantSpec(raw.fixer, "fixer", name, filePath, warnings);
     if (!reviewer || !fixer) return undefined;
