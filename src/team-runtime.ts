@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig, AgentSource } from "./agents.js";
 import { discoverAgents } from "./agents.js";
+import {
+  runAgentSession,
+  createSharedSessionResources,
+  type AgentRunResult,
+  type SharedSessionResources,
+} from "./agent-runner.js";
 import {
   buildPhaseHandoff,
   createEmptyTeamSharedState,
@@ -70,237 +72,10 @@ export interface TeamRuntimeOptions {
 export type TeamUpdate = TeamRunDetails;
 export type TeamUpdateCallback = (details: TeamUpdate) => void;
 
-interface RpcResponseRecord {
-  id?: string;
-  type: "response";
-  command?: string;
-  success?: boolean;
-  error?: string;
-}
-
-interface RpcMessageEndRecord {
-  type: "message_end";
-  message?: Message;
-}
-
-interface RpcAgentEndRecord {
-  type: "agent_end";
-  messages?: Message[];
-}
-
 interface RpcWorkerHandle {
   result: TeamMemberResult;
   waitPromise: Promise<TeamMemberResult>;
   abort: (reason: string) => void;
-}
-
-export interface RpcProcessResult {
-  messages: Message[];
-  exitCode: number;
-  stderr: string;
-  usage: UsageStats;
-  model?: string;
-  stopReason?: string;
-  errorMessage?: string;
-  elapsedMs: number;
-  lastWork: string;
-}
-
-export interface RpcProcess {
-  run(task: string, signal?: AbortSignal): Promise<RpcProcessResult>;
-  abort(reason: string): void;
-}
-
-export function spawnRpcProcess(
-  cwd: string,
-  agent: AgentConfig,
-  defaultModel: string | undefined,
-): RpcProcess {
-  const args: string[] = ["--mode", "rpc", "--no-session"];
-  const effectiveModel = getEffectiveModel(agent, defaultModel);
-  if (effectiveModel) args.push("--model", effectiveModel);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  }
-
-  let tempPromptDir: string | null = null;
-  let tempPromptPath: string | null = null;
-  if (agent.systemPrompt.trim()) {
-    const tempPrompt = writePromptToTempFile(agent.name, agent.systemPrompt);
-    tempPromptDir = tempPrompt.dir;
-    tempPromptPath = tempPrompt.filePath;
-    args.push("--append-system-prompt", tempPromptPath);
-  }
-
-  const proc = spawn("pi", args, {
-    cwd,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  let abortReason: string | undefined;
-  let killTimer: NodeJS.Timeout | undefined;
-  let forceKillTimer: NodeJS.Timeout | undefined;
-
-  const cleanupTempFiles = () => {
-    if (tempPromptPath) {
-      try { fs.unlinkSync(tempPromptPath); } catch { /* ignore */ }
-    }
-    if (tempPromptDir) {
-      try { fs.rmdirSync(tempPromptDir); } catch { /* ignore */ }
-    }
-  };
-
-  const clearKillTimers = () => {
-    if (killTimer) clearTimeout(killTimer);
-    if (forceKillTimer) clearTimeout(forceKillTimer);
-  };
-
-  const doAbort = (reason: string) => {
-    if (proc.exitCode !== null) return;
-    abortReason = reason;
-    try {
-      proc.stdin.write(JSON.stringify({ type: "abort" }) + "\n");
-    } catch { /* ignore */ }
-    killTimer = setTimeout(() => {
-      if (proc.exitCode === null) proc.kill("SIGTERM");
-    }, 3000);
-    forceKillTimer = setTimeout(() => {
-      if (proc.exitCode === null) proc.kill("SIGKILL");
-    }, 4000);
-  };
-
-  return {
-    run(task: string, signal?: AbortSignal): Promise<RpcProcessResult> {
-      const usage: UsageStats = createEmptyUsage();
-      const messages: Message[] = [];
-      let stderr = "";
-      let model: string | undefined = effectiveModel;
-      let stopReason: string | undefined;
-      let errorMessage: string | undefined;
-      let commandFailed = false;
-      let promptResponded = false;
-      let agentEnded = false;
-      let buffer = "";
-      const startTime = Date.now();
-      const promptId = `prompt-${randomUUID()}`;
-
-      const onSignalAbort = () => doAbort("Meeting run was aborted.");
-      if (signal) {
-        if (signal.aborted) {
-          onSignalAbort();
-        } else {
-          signal.addEventListener("abort", onSignalAbort, { once: true });
-        }
-      }
-
-      const updateUsage = (message: Message) => {
-        if (message.role !== "assistant") return;
-        usage.turns++;
-        const u = message.usage;
-        if (!u) return;
-        usage.input += u.input || 0;
-        usage.output += u.output || 0;
-        usage.cacheRead += u.cacheRead || 0;
-        usage.cacheWrite += u.cacheWrite || 0;
-        usage.cost += u.cost?.total || 0;
-        usage.contextTokens = u.totalTokens || 0;
-      };
-
-      const handleLine = (line: string) => {
-        const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
-        if (!normalized.trim()) return;
-        let parsed: unknown;
-        try { parsed = JSON.parse(normalized); } catch { return; }
-
-        if (isRpcResponseRecord(parsed)) {
-          if (parsed.id !== promptId || parsed.command !== "prompt") return;
-          promptResponded = true;
-          if (parsed.success === false) {
-            commandFailed = true;
-            errorMessage = parsed.error || "RPC prompt command failed.";
-            stopReason = "error";
-            try { proc.stdin.end(); } catch { /* ignore */ }
-            proc.kill("SIGTERM");
-          }
-          return;
-        }
-        if (isRpcMessageEndRecord(parsed) && parsed.message) {
-          messages.push(parsed.message);
-          if (parsed.message.role === "assistant") {
-            updateUsage(parsed.message);
-            if (!model && parsed.message.model) model = parsed.message.model;
-            if (parsed.message.stopReason) stopReason = parsed.message.stopReason;
-            if (parsed.message.errorMessage) errorMessage = parsed.message.errorMessage;
-          }
-          return;
-        }
-        if (isRpcAgentEndRecord(parsed)) {
-          agentEnded = true;
-          if (messages.length === 0 && Array.isArray(parsed.messages)) {
-            for (const m of parsed.messages) {
-              messages.push(m);
-              updateUsage(m);
-            }
-          }
-          try { proc.stdin.end(); } catch { /* ignore */ }
-        }
-      };
-
-      return new Promise<RpcProcessResult>((resolve) => {
-        proc.stdout.on("data", (data: Buffer) => {
-          buffer += data.toString();
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) handleLine(line);
-        });
-        proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
-        proc.on("close", (code) => {
-          if (signal) signal.removeEventListener("abort", onSignalAbort);
-          clearKillTimers();
-          if (buffer.trim()) handleLine(buffer);
-          const exitCode = code ?? 0;
-          if (!errorMessage && abortReason) { errorMessage = abortReason; stopReason = "aborted"; }
-          if (!promptResponded && !errorMessage) { errorMessage = "RPC worker exited before prompt response."; stopReason = "error"; }
-          if (!agentEnded && (commandFailed || exitCode !== 0) && !errorMessage) {
-            errorMessage = stderr.trim() || `RPC worker exited with code ${exitCode}.`;
-            stopReason = "error";
-          }
-          const lastWork = getFinalOutput(messages);
-          if (!lastWork.trim() && !errorMessage) { errorMessage = "Agent produced no text output."; stopReason = "error"; }
-          if (!stopReason && errorMessage) stopReason = "error";
-          cleanupTempFiles();
-          resolve({
-            messages,
-            exitCode: commandFailed && exitCode === 0 ? 1 : exitCode,
-            stderr,
-            usage,
-            model,
-            stopReason,
-            errorMessage,
-            elapsedMs: Date.now() - startTime,
-            lastWork,
-          });
-        });
-        proc.on("error", (error: Error) => {
-          errorMessage = error.message;
-          stopReason = "error";
-        });
-
-        try {
-          proc.stdin.write(JSON.stringify({ id: promptId, type: "prompt", message: task }) + "\n");
-        } catch (error) {
-          errorMessage = error instanceof Error ? error.message : String(error);
-          stopReason = "error";
-          commandFailed = true;
-        }
-      });
-    },
-
-    abort(reason: string) {
-      doAbort(reason);
-    },
-  };
 }
 
 type TeamPhaseRunResult =
@@ -310,27 +85,8 @@ type TeamPhaseRunResult =
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const PHASE_WARNING_PREFIX = "agents claimed file changes but no files were modified";
 
-function writePromptToTempFile(
-  agentName: string,
-  prompt: string,
-): { dir: string; filePath: string } {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-conductor-team-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tempDir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-  return { dir: tempDir, filePath };
-}
-
 function createEmptyUsage(): UsageStats {
-  return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    cost: 0,
-    contextTokens: 0,
-    turns: 0,
-  };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 }
 
 function cloneMessage(message: Message): Message {
@@ -378,55 +134,6 @@ function makeInitialPhaseStates(
   }));
 }
 
-function updateUsageFromMessage(result: TeamMemberResult, message: Message): void {
-  if (message.role !== "assistant") return;
-
-  result.usage.turns++;
-  const usage = message.usage;
-  if (!usage) return;
-
-  result.usage.input += usage.input || 0;
-  result.usage.output += usage.output || 0;
-  result.usage.cacheRead += usage.cacheRead || 0;
-  result.usage.cacheWrite += usage.cacheWrite || 0;
-  result.usage.cost += usage.cost?.total || 0;
-  result.usage.contextTokens = usage.totalTokens || 0;
-}
-
-function rebuildUsage(result: TeamMemberResult): void {
-  result.usage = createEmptyUsage();
-  for (const message of result.messages) {
-    updateUsageFromMessage(result, message);
-  }
-}
-
-function isRpcResponseRecord(value: unknown): value is RpcResponseRecord {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      "type" in value &&
-      (value as Record<string, unknown>).type === "response",
-  );
-}
-
-function isRpcMessageEndRecord(value: unknown): value is RpcMessageEndRecord {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      "type" in value &&
-      (value as Record<string, unknown>).type === "message_end",
-  );
-}
-
-function isRpcAgentEndRecord(value: unknown): value is RpcAgentEndRecord {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      "type" in value &&
-      (value as Record<string, unknown>).type === "agent_end",
-  );
-}
-
 function isFailedMember(result: TeamMemberResult): boolean {
   return (
     result.exitCode !== 0 ||
@@ -447,9 +154,7 @@ function formatMemberFailure(result: TeamMemberResult): string {
 }
 
 function describeUnknownError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message.trim() || error.name;
-  }
+  if (error instanceof Error) return error.message.trim() || error.name;
   return typeof error === "string" ? error.trim() || "Unknown error" : "Unknown error";
 }
 
@@ -465,9 +170,11 @@ function createWorker(
   phaseIndex: number,
   memberIndex: number,
   defaultModel: string | undefined,
+  sharedResources: SharedSessionResources,
   onUpdate: ((result: TeamMemberResult) => void) | undefined,
 ): RpcWorkerHandle {
-  const effectiveModel = getEffectiveModel(agent, defaultModel);
+  const controller = new AbortController();
+
   const result: TeamMemberResult = {
     agent: agent.name,
     agentSource: agent.source,
@@ -480,21 +187,38 @@ function createWorker(
     messages: [],
     stderr: "",
     usage: createEmptyUsage(),
-    model: effectiveModel,
+    model: agent.model ?? defaultModel,
   };
 
-  const rpc = spawnRpcProcess(cwd, agent, defaultModel);
-
-  const waitPromise = rpc.run(task).then((proc) => {
-    result.messages = proc.messages;
-    result.exitCode = proc.exitCode;
-    result.stderr = proc.stderr;
-    result.usage = proc.usage;
-    result.model = proc.model;
-    result.stopReason = proc.stopReason;
-    result.errorMessage = proc.errorMessage;
-    result.elapsedMs = proc.elapsedMs;
-    result.lastWork = proc.lastWork;
+  const waitPromise = runAgentSession({
+    cwd,
+    agent,
+    task,
+    defaultModel,
+    signal: controller.signal,
+    sharedResources,
+    onUpdate: onUpdate
+      ? (partial: AgentRunResult) => {
+          result.elapsedMs = partial.elapsedMs;
+          result.lastWork = partial.lastWork;
+          result.messages = partial.messages;
+          result.usage = partial.usage;
+          result.model = partial.model;
+          result.stopReason = partial.stopReason;
+          result.errorMessage = partial.errorMessage;
+          onUpdate({ ...result, usage: { ...result.usage }, messages: result.messages.map(cloneMessage) });
+        }
+      : undefined,
+  }).then((agentResult: AgentRunResult) => {
+    result.messages = agentResult.messages;
+    result.exitCode = agentResult.exitCode;
+    result.stderr = "";
+    result.usage = agentResult.usage;
+    result.model = agentResult.model;
+    result.stopReason = agentResult.stopReason;
+    result.errorMessage = agentResult.errorMessage;
+    result.elapsedMs = agentResult.elapsedMs;
+    result.lastWork = agentResult.lastWork;
     onUpdate?.({ ...result, usage: { ...result.usage }, messages: result.messages.map(cloneMessage) });
     return result;
   });
@@ -502,8 +226,8 @@ function createWorker(
   return {
     result,
     waitPromise,
-    abort(reason: string) {
-      rpc.abort(reason);
+    abort(_reason: string) {
+      controller.abort();
     },
   };
 }
@@ -516,6 +240,7 @@ async function runSequentialPhase(
   task: string,
   agents: AgentConfig[],
   defaultModel: string | undefined,
+  sharedResources: SharedSessionResources,
   phaseStates: TeamPhaseState[],
   results: TeamMemberResult[],
   activeWorkers: Set<RpcWorkerHandle>,
@@ -546,7 +271,8 @@ async function runSequentialPhase(
       phaseIndex,
       memberIndex,
       defaultModel,
-      (partial) => {
+      sharedResources,
+      (partial: TeamMemberResult) => {
         phaseStates[phaseIndex].members[memberIndex] = {
           agent: partial.agent,
           model: partial.model,
@@ -598,6 +324,7 @@ async function runParallelPhase(
   task: string,
   agents: AgentConfig[],
   defaultModel: string | undefined,
+  sharedResources: SharedSessionResources,
   phaseStates: TeamPhaseState[],
   results: TeamMemberResult[],
   activeWorkers: Set<RpcWorkerHandle>,
@@ -619,7 +346,8 @@ async function runParallelPhase(
       phaseIndex,
       memberIndex,
       defaultModel,
-      (partial) => {
+      sharedResources,
+      (partial: TeamMemberResult) => {
         phaseStates[phaseIndex].members[memberIndex] = {
           agent: partial.agent,
           model: partial.model,
@@ -752,6 +480,7 @@ export async function runTeamPhases(
   let terminalStatus: TeamRunStatus = "failed";
   let terminalErrorMessage: string | null = null;
   let finalText = "";
+  const sharedResources = createSharedSessionResources(cwd);
 
   try {
     lock = acquireTeamLock(cwd, runId);
@@ -850,6 +579,7 @@ export async function runTeamPhases(
               currentInput,
               agents,
               defaultModel,
+              sharedResources,
               phaseStates,
               results,
               activeWorkers,
@@ -865,6 +595,7 @@ export async function runTeamPhases(
               currentInput,
               agents,
               defaultModel,
+              sharedResources,
               phaseStates,
               results,
               activeWorkers,

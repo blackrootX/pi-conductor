@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentConfig } from "./agents.js";
 import { discoverAgents } from "./agents.js";
+import {
+  runAgentSession,
+  type AgentRunResult,
+} from "./agent-runner.js";
 import type {
   MeetingConfig,
   MeetingDebateConfig,
@@ -15,9 +18,7 @@ import type {
 } from "./meetings.js";
 import { discoverMeetings } from "./meetings.js";
 import {
-  spawnRpcProcess,
   runTeamPhases,
-  type RpcProcessResult,
   type TeamRunResult,
 } from "./team-runtime.js";
 import type { TeamConfig } from "./teams.js";
@@ -116,7 +117,7 @@ function describeUnknownError(error: unknown): string {
   return typeof error === "string" ? error.trim() || "Unknown error" : "Unknown error";
 }
 
-function isRpcFailed(result: RpcProcessResult): boolean {
+function isRpcFailed(result: AgentRunResult): boolean {
   return (
     result.exitCode !== 0 ||
     result.stopReason === "error" ||
@@ -139,7 +140,7 @@ async function runExternalCli(
   prompt: string,
   reasoning?: string,
   signal?: AbortSignal,
-): Promise<RpcProcessResult> {
+): Promise<AgentRunResult> {
   const { spawn } = await import("node:child_process");
   const startTime = Date.now();
 
@@ -161,7 +162,7 @@ async function runExternalCli(
     };
   }
 
-  return new Promise<RpcProcessResult>((resolve) => {
+  return new Promise<AgentRunResult>((resolve) => {
     const proc = spawn(cli === "codex" ? "codex" : "opencode", args, {
       shell: false,
       env,
@@ -189,9 +190,11 @@ async function runExternalCli(
         ? (stderr.trim() || `External CLI "${cli}" exited with code ${exitCode}.`)
         : undefined;
       resolve({
+        agent: cli,
+        agentSource: "unknown",
+        task: prompt,
         messages: [],
         exitCode,
-        stderr,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
         model: undefined,
         stopReason: exitCode !== 0 ? "error" : undefined,
@@ -204,9 +207,11 @@ async function runExternalCli(
     proc.on("error", (error: Error) => {
       if (signal) signal.removeEventListener("abort", onAbort);
       resolve({
+        agent: cli,
+        agentSource: "unknown",
+        task: prompt,
         messages: [],
         exitCode: 1,
-        stderr: error.message,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
         model: undefined,
         stopReason: "error",
@@ -225,12 +230,11 @@ async function runParticipant(
   agents: AgentConfig[],
   defaultModel: string | undefined,
   signal?: AbortSignal,
-): Promise<RpcProcessResult> {
+): Promise<AgentRunResult> {
   if (typeof spec === "string") {
     const agent = agents.find((a) => a.name === spec);
     if (!agent) throw new Error(`Meeting participant agent not found: "${spec}".`);
-    const rpc = spawnRpcProcess(cwd, agent, defaultModel);
-    return rpc.run(prompt, signal);
+    return runAgentSession({ cwd, agent, task: prompt, defaultModel, signal });
   }
   return runExternalCli(spec.cli, prompt, spec.reasoning, signal);
 }
